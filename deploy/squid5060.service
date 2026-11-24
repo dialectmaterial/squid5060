@@ -1,0 +1,32 @@
+[Unit]
+Description=squid5060 Inkling-2-Mini 8 GB Inference Engine & OpenAI API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/squid5060
+Environment="LD_LIBRARY_PATH=/opt/cuda/lib64:/usr/local/cuda/lib64"
+# Optional: require Authorization: Bearer <key>
+# Environment="SQUID_API_KEY=your-secret-key"
+
+# Default 8 GB RTX 5060 profile: native NVFP4 + Q4 global KV + auto unified VRAM expert cache (~7.47 GiB peak VRAM).
+# Pass --mtp 2 for code-heavy workloads (peaks ~66.9 tok/s) or --ctx 65536 / 131072 for deeper context.
+ExecStart=/opt/squid5060/zig-out/bin/squid5060 serve /opt/models/inkling-2-mini \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --mode nvfp4 \
+    --kv q4 \
+    --ctx 32768 \
+    --mtp 0
+
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

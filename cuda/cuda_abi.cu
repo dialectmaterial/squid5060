@@ -246,6 +246,10 @@ struct CExpertBank {
     uint8_t* data;
     uint8_t* scales;
     float* expert_scale;
+    uint8_t* cache_pool;
+    uint8_t* host_pool;
+    int32_t* slot_map;
+    uint32_t* touch_counts;
 };
 
 struct CControllerWeights {
@@ -314,6 +318,10 @@ static ExpertBank to_eb(const CExpertBank& c) {
     eb.data = c.data;
     eb.scales = c.scales;
     eb.expert_scale = c.expert_scale;
+    eb.cache_pool = c.cache_pool;
+    eb.host_pool = c.host_pool;
+    eb.slot_map = c.slot_map;
+    eb.touch_counts = c.touch_counts;
     return eb;
 }
 
@@ -368,6 +376,9 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
 
 int32_t squid_cuda_malloc(void** ptr, size_t bytes) { return (int32_t)cudaMalloc(ptr, bytes); }
 int32_t squid_cuda_free(void* ptr) { return (int32_t)cudaFree(ptr); }
+int32_t squid_cuda_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    return (int32_t)cudaMemGetInfo(free_bytes, total_bytes);
+}
 int32_t squid_cuda_malloc_host_pinned(void** ptr, size_t bytes, uint8_t mapped) {
     return (int32_t)cudaHostAlloc(ptr, bytes, mapped ? cudaHostAllocMapped : cudaHostAllocDefault);
 }

@@ -27,8 +27,22 @@ pub const conv_tap_count: u32 = 4;
 pub const sconv_ring_slots: u32 = 16;
 
 pub const expert_count: u32 = 128;
+pub const total_physical_experts: u32 = layer_count * expert_count; // 3072
 pub const top_k_experts: u32 = 8;
 pub const intermediate_dim: u32 = 1152;
+
+// Unified physical NVFP4 expert slot layout (identical in VRAM cache & zero-copy pinned host RAM).
+// Every sub-section is an exact multiple of 256 bytes so 1 single DMA transfers w13 + w2 together.
+pub const expert_w13_data_bytes: u64 = @as(u64, 2 * intermediate_dim) * (hidden_dim / 2); // 2,654,208
+pub const expert_w13_scale_bytes: u64 = @as(u64, 2 * intermediate_dim) * (hidden_dim / 16); // 331,776
+pub const expert_w2_data_bytes: u64 = @as(u64, hidden_dim) * (intermediate_dim / 2); // 1,327,104
+pub const expert_w2_scale_bytes: u64 = @as(u64, hidden_dim) * (intermediate_dim / 16); // 165,888
+pub const expert_w13_data_off: u64 = 0;
+pub const expert_w13_scale_off: u64 = expert_w13_data_bytes;
+pub const expert_w2_data_off: u64 = expert_w13_scale_off + expert_w13_scale_bytes;
+pub const expert_w2_scale_off: u64 = expert_w2_data_off + expert_w2_data_bytes;
+pub const expert_slot_bytes: u64 = expert_w2_scale_off + expert_w2_scale_bytes; // 4,478,976 B (4.2715 MiB)
+
 pub const vocab_padded_count: u32 = 201024;
 pub const vocab_unpadded_count: u32 = 200058;
 pub const eos_token_id: i32 = 200006;

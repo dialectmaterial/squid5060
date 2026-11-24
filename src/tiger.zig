@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 
 comptime {
     if (builtin.os.tag == .linux and builtin.cpu.arch != .x86_64) {
-        @compileError("squid5090-zig POSIX ABI constants are verified for linux x86_64");
+        @compileError("squid5060 POSIX ABI constants are verified for linux x86_64");
     }
 }
 

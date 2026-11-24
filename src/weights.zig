@@ -48,8 +48,12 @@ pub const LayerWeights = struct {
 
 pub const ModelWeights = struct {
     mode: constants.QuantMode = .nvfp4,
+    use_expert_cache: bool = false,
     arena: vram_arena.VRAMArena = .{},
     pinned_host_embed: ?*anyopaque = null,
+    pinned_host_markov_w1: ?*anyopaque = null,
+    host_experts_h: [constants.layer_count]?[*]u8 = @splat(null),
+    host_experts_dev: [constants.layer_count]?[*]u8 = @splat(null),
 
     embed: ?*anyopaque = null,
     embed_norm: ?*anyopaque = null,
@@ -71,6 +75,16 @@ pub const ModelWeights = struct {
             tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
             self.pinned_host_embed = null;
         }
+        if (self.pinned_host_markov_w1) |host_ptr| {
+            tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
+            self.pinned_host_markov_w1 = null;
+        }
+        for (&self.host_experts_h) |*hp| {
+            if (hp.*) |ptr| {
+                tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(ptr)));
+                hp.* = null;
+            }
+        }
         self.* = .{};
     }
 
@@ -79,13 +93,19 @@ pub const ModelWeights = struct {
         model_directory: []const u8,
         quant_mode: constants.QuantMode,
         load_mtp: bool,
-        embed_on_host: bool,
+        embed_on_host_in: bool,
+        use_expert_cache: bool,
     ) bool {
         tiger.assert(model_directory.len > 0);
         tiger.assert(self.arena.base_ptr == null);
+        if (use_expert_cache) {
+            tiger.assert(quant_mode == .nvfp4);
+        }
 
         const start_ns: u64 = tiger.clock_monotonic_ns();
         self.mode = quant_mode;
+        self.use_expert_cache = use_expert_cache;
+        const embed_on_host: bool = embed_on_host_in or use_expert_cache;
 
         var main_path_buf: [1024]u8 = undefined;
         const main_path_z = tiger.format_path_z(&main_path_buf, model_directory, "/model-00001-of-00001.safetensors");
@@ -130,6 +150,7 @@ pub const ModelWeights = struct {
             dense_kind,
             mtp_kind,
             embed_on_host,
+            use_expert_cache,
             has_mtp,
             has_pruned_draft_vocab,
             draft_vocab_count,
@@ -321,8 +342,12 @@ pub const ModelWeights = struct {
             lw.router_bias = self.upload_f32(&sf_main, rb_name, constants.expert_count);
 
             // MoE Expert Banks (w13 and w2)
-            lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode, d_stage);
-            lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode, d_stage);
+            if (use_expert_cache) {
+                self.load_layer_experts_host_cached(&sf_main, layer_idx, lw, d_stage);
+            } else {
+                lw.w13 = self.load_expert_bank(&sf_main, layer_idx, "w13", 2 * constants.intermediate_dim, constants.hidden_dim, quant_mode, d_stage);
+                lw.w2 = self.load_expert_bank(&sf_main, layer_idx, "w2", constants.hidden_dim, constants.intermediate_dim, quant_mode, d_stage);
+            }
         }
 
         // Load DSpark MTP weights if available
@@ -331,6 +356,7 @@ pub const ModelWeights = struct {
                 &sf_main,
                 &sf_mtp,
                 mtp_kind,
+                embed_on_host,
                 d_stage,
                 d_amax,
                 has_pruned_draft_vocab,
@@ -345,10 +371,18 @@ pub const ModelWeights = struct {
 
         const elapsed_sec: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - start_ns)) / 1_000_000_000.0;
         const vram_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
-        tiger.print_stdout(
-            "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s}\n",
-            .{ quant_mode.name(), elapsed_sec, vram_gib, self.arena.allocation_count, if (self.dspark.loaded != 0) "on" else "off" },
-        );
+        if (use_expert_cache) {
+            const host_exp_gib: f64 = @as(f64, @floatFromInt(constants.total_physical_experts * constants.expert_slot_bytes)) / (1024.0 * 1024.0 * 1024.0);
+            tiger.print_stdout(
+                "[weights] Loaded mode={s} (8GB cached) in {d:.2}s | resident VRAM={d:.2} GiB ({d} tensors) | pinned host experts={d:.2} GiB | MTP={s}\n",
+                .{ quant_mode.name(), elapsed_sec, vram_gib, self.arena.allocation_count, host_exp_gib, if (self.dspark.loaded != 0) "on" else "off" },
+            );
+        } else {
+            tiger.print_stdout(
+                "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s}\n",
+                .{ quant_mode.name(), elapsed_sec, vram_gib, self.arena.allocation_count, if (self.dspark.loaded != 0) "on" else "off" },
+            );
+        }
         return true;
     }
 
@@ -498,11 +532,178 @@ pub const ModelWeights = struct {
         return eb;
     }
 
+    fn load_layer_experts_host_cached(
+        self: *ModelWeights,
+        sf: *const safetensors.SafetensorsFile,
+        layer_idx: u32,
+        lw: *LayerWeights,
+        d_stage: *anyopaque,
+    ) void {
+        const slot_bytes: usize = @intCast(constants.expert_slot_bytes);
+        const bank_bytes: usize = constants.expert_count * slot_bytes;
+        var h_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_raw, bank_bytes, 1));
+        tiger.assert(h_raw != null);
+        var d_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&d_raw, h_raw.?));
+        tiger.assert(d_raw != null);
+
+        const h_bank: [*]u8 = @ptrCast(h_raw.?);
+        const d_bank: [*]u8 = @ptrCast(d_raw.?);
+        self.host_experts_h[layer_idx] = h_bank;
+        self.host_experts_dev[layer_idx] = d_bank;
+
+        lw.w13 = .{
+            .is_nvfp4 = 1,
+            .n_experts = constants.expert_count,
+            .rows = 2 * constants.intermediate_dim,
+            .cols = constants.hidden_dim,
+            .expert_scale = self.arena.alloc_many(f32, constants.expert_count),
+            .host_pool = d_bank,
+        };
+        lw.w2 = .{
+            .is_nvfp4 = 1,
+            .n_experts = constants.expert_count,
+            .rows = constants.hidden_dim,
+            .cols = constants.intermediate_dim,
+            .expert_scale = self.arena.alloc_many(f32, constants.expert_count),
+            .host_pool = d_bank,
+        };
+
+        var nbuf: [128]u8 = undefined;
+        if (constants.is_nvfp4_expert_layer(layer_idx)) {
+            const w13_w = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.w13_weight", .{layer_idx}) catch unreachable));
+            const w13_s = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.w13_weight_scale", .{layer_idx}) catch unreachable));
+            const w2_w = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.w2_weight", .{layer_idx}) catch unreachable));
+            const w2_s = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.w2_weight_scale", .{layer_idx}) catch unreachable));
+
+            const w13_db: usize = @intCast(constants.expert_w13_data_bytes);
+            const w13_sb: usize = @intCast(constants.expert_w13_scale_bytes);
+            const w2_db: usize = @intCast(constants.expert_w2_data_bytes);
+            const w2_sb: usize = @intCast(constants.expert_w2_scale_bytes);
+            tiger.assert(w13_w.len == constants.expert_count * w13_db);
+            tiger.assert(w13_s.len == constants.expert_count * w13_sb);
+            tiger.assert(w2_w.len == constants.expert_count * w2_db);
+            tiger.assert(w2_s.len == constants.expert_count * w2_sb);
+
+            var e: usize = 0;
+            while (e < constants.expert_count) : (e += 1) {
+                const dst = h_bank + e * slot_bytes;
+                @memcpy((dst + @as(usize, @intCast(constants.expert_w13_data_off)))[0..w13_db], w13_w[e * w13_db ..][0..w13_db]);
+                @memcpy((dst + @as(usize, @intCast(constants.expert_w13_scale_off)))[0..w13_sb], w13_s[e * w13_sb ..][0..w13_sb]);
+                @memcpy((dst + @as(usize, @intCast(constants.expert_w2_data_off)))[0..w2_db], w2_w[e * w2_db ..][0..w2_db]);
+                @memcpy((dst + @as(usize, @intCast(constants.expert_w2_scale_off)))[0..w2_sb], w2_s[e * w2_sb ..][0..w2_sb]);
+            }
+
+            // Upload precomputed per-expert scales (24 KiB total across all 24 layers)
+            const names: [2][]const u8 = .{ "w13", "w2" };
+            const scale_dsts: [2][*]f32 = .{ lw.w13.expert_scale.?, lw.w2.expert_scale.? };
+            var idx: usize = 0;
+            while (idx < 2) : (idx += 1) {
+                const an = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_amax", .{ layer_idx, names[idx] }) catch unreachable;
+                const amax_slice = sf.data_slice(sf.lookup(an));
+                const dn = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_outer_scale_denominator", .{ layer_idx, names[idx] }) catch unreachable;
+                const denom_slice = sf.data_slice(sf.lookup(dn));
+                const denom: f32 = @bitCast(std.mem.readInt(u32, denom_slice[0..4], .little));
+                const inv_denom: f32 = 1.0 / denom;
+                var h_scales: [constants.expert_count]f32 = undefined;
+                var ei: u32 = 0;
+                while (ei < constants.expert_count) : (ei += 1) {
+                    const amax_val: f32 = @bitCast(std.mem.readInt(u32, amax_slice[ei * 4 ..][0..4], .little));
+                    h_scales[ei] = amax_val * inv_denom;
+                }
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(scale_dsts[idx]), @ptrCast(&h_scales), @sizeOf(@TypeOf(h_scales))));
+            }
+        } else {
+            // Physical layers 20..23: MXFP8 -> NVFP4 on GPU in 32-expert chunks using d_stage (no extra VRAM!)
+            const specs = [_]struct {
+                wname: []const u8,
+                rows: u32,
+                cols: u32,
+                data_off: usize,
+                scale_off: usize,
+                exp_scale_dst: [*]f32,
+            }{
+                .{
+                    .wname = "w13",
+                    .rows = 2 * constants.intermediate_dim,
+                    .cols = constants.hidden_dim,
+                    .data_off = @intCast(constants.expert_w13_data_off),
+                    .scale_off = @intCast(constants.expert_w13_scale_off),
+                    .exp_scale_dst = lw.w13.expert_scale.?,
+                },
+                .{
+                    .wname = "w2",
+                    .rows = constants.hidden_dim,
+                    .cols = constants.intermediate_dim,
+                    .data_off = @intCast(constants.expert_w2_data_off),
+                    .scale_off = @intCast(constants.expert_w2_scale_off),
+                    .exp_scale_dst = lw.w2.expert_scale.?,
+                },
+            };
+
+            const chunk_e: u32 = 32;
+            const stage_base: [*]u8 = @ptrCast(d_stage);
+            for (specs) |sp| {
+                const mx_w_src = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight", .{ layer_idx, sp.wname }) catch unreachable));
+                const mx_s_src = sf.data_slice(sf.lookup(std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.experts.{s}_weight_scale", .{ layer_idx, sp.wname }) catch unreachable));
+                const mx_w_per_e: usize = @as(usize, sp.rows) * sp.cols;
+                const mx_s_per_e: usize = @as(usize, sp.rows) * (sp.cols / 32);
+                const nv_w_per_e: usize = @as(usize, sp.rows) * (sp.cols / 2);
+                const nv_s_per_e: usize = @as(usize, sp.rows) * (sp.cols / 16);
+
+                const d_mx_w: [*]u8 = stage_base;
+                const d_mx_s: [*]u8 = stage_base + chunk_e * mx_w_per_e;
+                const d_nv_w: [*]u8 = stage_base + (256 * 1024 * 1024);
+                const d_nv_s: [*]u8 = d_nv_w + chunk_e * nv_w_per_e;
+
+                var e0: u32 = 0;
+                while (e0 < constants.expert_count) : (e0 += chunk_e) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(
+                        @ptrCast(d_mx_w),
+                        @ptrCast(mx_w_src.ptr + @as(usize, e0) * mx_w_per_e),
+                        chunk_e * mx_w_per_e,
+                    ));
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(
+                        @ptrCast(d_mx_s),
+                        @ptrCast(mx_s_src.ptr + @as(usize, e0) * mx_s_per_e),
+                        chunk_e * mx_s_per_e,
+                    ));
+                    cuda.squid_convert_mxfp8_to_nvfp4_experts(
+                        d_mx_w,
+                        d_mx_s,
+                        d_nv_w,
+                        d_nv_s,
+                        sp.exp_scale_dst + e0,
+                        @intCast(chunk_e),
+                        @intCast(sp.rows),
+                        @intCast(sp.cols),
+                    );
+                    var k: u32 = 0;
+                    while (k < chunk_e) : (k += 1) {
+                        const dst = h_bank + @as(usize, e0 + k) * slot_bytes;
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(
+                            @ptrCast(dst + sp.data_off),
+                            @ptrCast(d_nv_w + @as(usize, k) * nv_w_per_e),
+                            nv_w_per_e,
+                        ));
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(
+                            @ptrCast(dst + sp.scale_off),
+                            @ptrCast(d_nv_s + @as(usize, k) * nv_s_per_e),
+                            nv_s_per_e,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn load_dspark(
         self: *ModelWeights,
         sf_main: *const safetensors.SafetensorsFile,
         sf_mtp: *const safetensors.SafetensorsFile,
         mtp_kind: constants.WeightKind,
+        embed_on_host: bool,
         d_stage: *anyopaque,
         d_amax: *f32,
         has_pruned_draft_vocab: bool,
@@ -542,7 +743,20 @@ pub const ModelWeights = struct {
         self.dspark.mask_embed = self.upload_bf16(sf_mtp, "mask_embed", constants.hidden_dim);
         self.dspark.norm_w = self.upload_bf16(sf_mtp, "norm.weight", constants.hidden_dim);
         self.dspark.markov_dflare_norm = self.upload_bf16(sf_mtp, "markov_head.dflare_norm.weight", constants.hidden_dim);
-        self.dspark.markov_w1 = self.upload_bf16(sf_mtp, "markov_head.markov_w1.weight", @as(u64, constants.vocab_padded_count) * constants.mtp_markov_rank);
+        if (embed_on_host) {
+            const mw1_info = sf_mtp.lookup("markov_head.markov_w1.weight");
+            const mw1_bytes: usize = @as(usize, constants.vocab_padded_count) * constants.mtp_markov_rank * 2;
+            tiger.assert(mw1_info.byte_length == mw1_bytes);
+            var h_ptr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ptr, mw1_bytes, 1));
+            self.pinned_host_markov_w1 = h_ptr;
+            @memcpy(@as([*]u8, @ptrCast(h_ptr.?))[0..mw1_bytes], sf_mtp.data_slice(mw1_info));
+            var dev_ptr: ?*anyopaque = null;
+            tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&dev_ptr, h_ptr.?));
+            self.dspark.markov_w1 = dev_ptr;
+        } else {
+            self.dspark.markov_w1 = self.upload_bf16(sf_mtp, "markov_head.markov_w1.weight", @as(u64, constants.vocab_padded_count) * constants.mtp_markov_rank);
+        }
         self.dspark.rnn_bias = self.upload_bf16(sf_mtp, "markov_head.rnn_proj.bias", 3 * constants.mtp_markov_rank);
         self.dspark.hidden_out_w = self.upload_bf16(sf_mtp, "markov_head.hidden_out.weight", @as(u64, constants.hidden_dim) * constants.mtp_markov_rank);
         self.dspark.hidden_out_b = self.upload_bf16(sf_mtp, "markov_head.hidden_out.bias", constants.hidden_dim);
@@ -719,6 +933,7 @@ fn compute_total_vram_bytes(
     dense_kind: constants.WeightKind,
     mtp_kind: constants.WeightKind,
     embed_on_host: bool,
+    use_expert_cache: bool,
     has_mtp: bool,
     has_pruned_draft_vocab: bool,
     draft_vocab_count: u32,
@@ -793,21 +1008,26 @@ fn compute_total_vram_bytes(
         total += tiger.align_up_u64(constants.expert_count * 4, a); // router_bias
 
         // Expert banks w13 [2304, 2304] and w2 [2304, 1152]
-        const dims: [2][2]u32 = .{
-            .{ 2 * constants.intermediate_dim, constants.hidden_dim },
-            .{ constants.hidden_dim, constants.intermediate_dim },
-        };
-        const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode == .nvfp4;
-        for (dims) |d| {
-            const rows: u64 = d[0];
-            const cols: u64 = d[1];
-            if (is_nvfp4_bank) {
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 2), a);
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 16), a);
-                total += tiger.align_up_u64(constants.expert_count * 4, a);
-            } else {
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * cols, a);
-                total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 32), a);
+        if (use_expert_cache) {
+            // Only per-expert scale vectors (24 KiB total) live in weights.arena; weights live in pinned host + unified VRAM cache!
+            total += 2 * tiger.align_up_u64(constants.expert_count * 4, a);
+        } else {
+            const dims: [2][2]u32 = .{
+                .{ 2 * constants.intermediate_dim, constants.hidden_dim },
+                .{ constants.hidden_dim, constants.intermediate_dim },
+            };
+            const is_nvfp4_bank: bool = constants.is_nvfp4_expert_layer(l) or quant_mode == .nvfp4;
+            for (dims) |d| {
+                const rows: u64 = d[0];
+                const cols: u64 = d[1];
+                if (is_nvfp4_bank) {
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 2), a);
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 16), a);
+                    total += tiger.align_up_u64(constants.expert_count * 4, a);
+                } else {
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * cols, a);
+                    total += tiger.align_up_u64(@as(u64, constants.expert_count) * rows * (cols / 32), a);
+                }
             }
         }
     }
@@ -817,7 +1037,9 @@ fn compute_total_vram_bytes(
         total += tiger.align_up_u64(constants.hidden_dim * 2, a); // mask_embed
         total += tiger.align_up_u64(constants.hidden_dim * 2, a); // norm_w
         total += tiger.align_up_u64(constants.hidden_dim * 2, a); // markov_dflare_norm
-        total += tiger.align_up_u64(@as(u64, constants.vocab_padded_count) * constants.mtp_markov_rank * 2, a); // markov_w1
+        if (!embed_on_host) {
+            total += tiger.align_up_u64(@as(u64, constants.vocab_padded_count) * constants.mtp_markov_rank * 2, a); // markov_w1
+        }
         total += tiger.align_up_u64(3 * constants.mtp_markov_rank * 2, a); // rnn_bias
         total += tiger.align_up_u64(@as(u64, constants.hidden_dim) * constants.mtp_markov_rank * 2, a); // hidden_out_w
         total += tiger.align_up_u64(constants.hidden_dim * 2, a); // hidden_out_b

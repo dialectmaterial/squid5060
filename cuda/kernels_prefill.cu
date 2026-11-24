@@ -1455,6 +1455,324 @@ p_flash_attn_prefill_tc_kernel(
     }
 }
 
+// BLACKWELL FP16 TENSOR CORE Multi-Token NVFP4 MoE Gate+Up (Unified VRAM Cache + Zero-Copy Host Fallback)
+__global__ void __launch_bounds__(128)
+p_moe_gate_up_nvfp4_tc_cached_kernel(
+    const uint8_t* __restrict__ cache_pool,
+    const uint8_t* __restrict__ host_pool,
+    const int32_t* __restrict__ slot_map,
+    uint32_t* __restrict__ touch_counts,
+    const float* __restrict__ exp_scales,
+    const __half* __restrict__ x_h,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ sorted_tok,
+    const int32_t* __restrict__ sorted_slot,
+    __half* __restrict__ out_act_h) {
+    int tile_id = blockIdx.y;
+    if (tile_id >= expert_offsets[129]) return;
+    int expert = expert_offsets[130 + tile_id];
+    int t0 = expert_offsets[386 + tile_id];
+    int end = expert_offsets[642 + tile_id];
+    int cnt = end - t0;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && touch_counts) {
+        atomicAdd(&touch_counts[expert], static_cast<uint32_t>(cnt));
+    }
+
+    int cslot = __ldg(slot_map + expert);
+    const uint8_t* exp_base = (cslot >= 0)
+        ? (cache_pool + (size_t)cslot * EXPERT_SLOT_BYTES)
+        : (host_pool  + (size_t)expert * EXPERT_SLOT_BYTES);
+    const uint8_t* w_data   = exp_base + EXPERT_W13_DATA_OFF;
+    const uint8_t* w_scales = exp_base + EXPERT_W13_SCALE_OFF;
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp = lane >> 2;
+    int tid4 = lane & 3;
+
+    int j_base = blockIdx.x * 64 + warp * 16;
+    int j0 = j_base + grp;
+    int j1 = j_base + grp + 8;
+
+    constexpr int W_STRIDE = HIDDEN >> 1;
+    constexpr int S_STRIDE = HIDDEN >> 4;
+    constexpr int K_ITERS = HIDDEN >> 6;
+    size_t rg0 = (size_t)j0 * 2;
+    size_t ru0 = rg0 + 1;
+    size_t rg1 = (size_t)j1 * 2;
+    size_t ru1 = rg1 + 1;
+    const uint2* wg0 = reinterpret_cast<const uint2*>(w_data + rg0 * W_STRIDE);
+    const uint2* wu0 = reinterpret_cast<const uint2*>(w_data + ru0 * W_STRIDE);
+    const uint2* wg1 = reinterpret_cast<const uint2*>(w_data + rg1 * W_STRIDE);
+    const uint2* wu1 = reinterpret_cast<const uint2*>(w_data + ru1 * W_STRIDE);
+    const uint32_t* sg0 = reinterpret_cast<const uint32_t*>(w_scales + rg0 * S_STRIDE);
+    const uint32_t* su0 = reinterpret_cast<const uint32_t*>(w_scales + ru0 * S_STRIDE);
+    const uint32_t* sg1 = reinterpret_cast<const uint32_t*>(w_scales + rg1 * S_STRIDE);
+    const uint32_t* su1 = reinterpret_cast<const uint32_t*>(w_scales + ru1 * S_STRIDE);
+    float es = exp_scales[expert];
+
+    __shared__ __half s_x[32][72];
+    __shared__ int s_tok[32];
+    __shared__ int s_slot[32];
+
+    int load_t0 = tid >> 3;
+    int load_t1 = 16 + load_t0;
+    int load_c = (tid & 7) << 3;
+
+    if (tid < 32) {
+        s_tok[tid] = (tid < cnt) ? sorted_tok[t0 + tid] : 0;
+        s_slot[tid] = (tid < cnt) ? sorted_slot[t0 + tid] : 0;
+    }
+    __syncthreads();
+
+    float dg0[4] = {0, 0, 0, 0}, dg1[4] = {0, 0, 0, 0}, dg2[4] = {0, 0, 0, 0}, dg3[4] = {0, 0, 0, 0};
+    float du0[4] = {0, 0, 0, 0}, du1[4] = {0, 0, 0, 0}, du2[4] = {0, 0, 0, 0}, du3[4] = {0, 0, 0, 0};
+    int my_tok0 = s_tok[load_t0];
+    int my_tok1 = s_tok[load_t1];
+
+    for (int blk4 = 0; blk4 < K_ITERS; ++blk4) {
+        int koff = blk4 << 6;
+        int woff = (blk4 << 2) + tid4;
+        uint2 wg0_r = __ldg(wg0 + woff), wg1_r = __ldg(wg1 + woff);
+        uint2 wu0_r = __ldg(wu0 + woff), wu1_r = __ldg(wu1 + woff);
+        uint32_t sg0_r = __ldg(sg0 + blk4), sg1_r = __ldg(sg1 + blk4);
+        uint32_t su0_r = __ldg(su0 + blk4), su1_r = __ldg(su1 + blk4);
+
+        if (load_t0 < cnt) {
+            *reinterpret_cast<uint4*>(&s_x[load_t0][load_c]) =
+                __ldg(reinterpret_cast<const uint4*>(x_h + (size_t)my_tok0 * HIDDEN + koff + load_c));
+        } else {
+            *reinterpret_cast<uint4*>(&s_x[load_t0][load_c]) = make_uint4(0, 0, 0, 0);
+        }
+        if (load_t1 < cnt) {
+            *reinterpret_cast<uint4*>(&s_x[load_t1][load_c]) =
+                __ldg(reinterpret_cast<const uint4*>(x_h + (size_t)my_tok1 * HIDDEN + koff + load_c));
+        } else if (cnt > 16) {
+            *reinterpret_cast<uint4*>(&s_x[load_t1][load_c]) = make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            int km = (m << 4) + (tid4 << 1);
+            uint32_t b0_0 = *reinterpret_cast<const uint32_t*>(&s_x[grp][km]);
+            uint32_t b1_0 = *reinterpret_cast<const uint32_t*>(&s_x[grp][km + 8]);
+            uint32_t b0_1 = 0, b1_1 = 0, b0_2 = 0, b1_2 = 0, b0_3 = 0, b1_3 = 0;
+            if (cnt > 8) {
+                b0_1 = *reinterpret_cast<const uint32_t*>(&s_x[8 + grp][km]);
+                b1_1 = *reinterpret_cast<const uint32_t*>(&s_x[8 + grp][km + 8]);
+            }
+            if (cnt > 16) {
+                b0_2 = *reinterpret_cast<const uint32_t*>(&s_x[16 + grp][km]);
+                b1_2 = *reinterpret_cast<const uint32_t*>(&s_x[16 + grp][km + 8]);
+            }
+            if (cnt > 24) {
+                b0_3 = *reinterpret_cast<const uint32_t*>(&s_x[24 + grp][km]);
+                b1_3 = *reinterpret_cast<const uint32_t*>(&s_x[24 + grp][km + 8]);
+            }
+
+            uint32_t ag0, ag1, ag2, ag3;
+            nvfp4_shfl_a_frag(wg0_r, wg1_r, pick_e4m3_scale_h2(sg0_r, m), pick_e4m3_scale_h2(sg1_r, m), grp, tid4, m, ag0, ag1, ag2, ag3);
+            mma_m16n8k16(dg0, ag0, ag1, ag2, ag3, b0_0, b1_0);
+            if (cnt > 8)  mma_m16n8k16(dg1, ag0, ag1, ag2, ag3, b0_1, b1_1);
+            if (cnt > 16) mma_m16n8k16(dg2, ag0, ag1, ag2, ag3, b0_2, b1_2);
+            if (cnt > 24) mma_m16n8k16(dg3, ag0, ag1, ag2, ag3, b0_3, b1_3);
+
+            uint32_t au0, au1, au2, au3;
+            nvfp4_shfl_a_frag(wu0_r, wu1_r, pick_e4m3_scale_h2(su0_r, m), pick_e4m3_scale_h2(su1_r, m), grp, tid4, m, au0, au1, au2, au3);
+            mma_m16n8k16(du0, au0, au1, au2, au3, b0_0, b1_0);
+            if (cnt > 8)  mma_m16n8k16(du1, au0, au1, au2, au3, b0_1, b1_1);
+            if (cnt > 16) mma_m16n8k16(du2, au0, au1, au2, au3, b0_2, b1_2);
+            if (cnt > 24) mma_m16n8k16(du3, au0, au1, au2, au3, b0_3, b1_3);
+        }
+        __syncthreads();
+    }
+
+    auto write_act = [&](int local_t, int j, float gv, float uv) {
+        if (local_t >= cnt) return;
+        gv *= es;
+        uv *= es;
+        float g_cap = fast_tanh(gv * (1.0f / GATE_SOFTCAP)) * GATE_SOFTCAP;
+        float u_cap = fast_tanh(uv * (1.0f / UP_SOFTCAP)) * UP_SOFTCAP;
+        int tok = s_tok[local_t];
+        int slot = s_slot[local_t];
+        out_act_h[((size_t)tok * TOP_K + slot) * INTERMEDIATE + j] = __float2half((g_cap * fast_sigmoid(gv)) * u_cap);
+    };
+
+    int n0 = tid4 * 2;
+    write_act(n0,     j0, dg0[0], du0[0]);
+    write_act(n0 + 1, j0, dg0[1], du0[1]);
+    write_act(n0,     j1, dg0[2], du0[2]);
+    write_act(n0 + 1, j1, dg0[3], du0[3]);
+    if (cnt > 8) {
+        write_act(8 + n0,     j0, dg1[0], du1[0]);
+        write_act(8 + n0 + 1, j0, dg1[1], du1[1]);
+        write_act(8 + n0,     j1, dg1[2], du1[2]);
+        write_act(8 + n0 + 1, j1, dg1[3], du1[3]);
+    }
+    if (cnt > 16) {
+        write_act(16 + n0,     j0, dg2[0], du2[0]);
+        write_act(16 + n0 + 1, j0, dg2[1], du2[1]);
+        write_act(16 + n0,     j1, dg2[2], du2[2]);
+        write_act(16 + n0 + 1, j1, dg2[3], du2[3]);
+    }
+    if (cnt > 24) {
+        write_act(24 + n0,     j0, dg3[0], du3[0]);
+        write_act(24 + n0 + 1, j0, dg3[1], du3[1]);
+        write_act(24 + n0,     j1, dg3[2], du3[2]);
+        write_act(24 + n0 + 1, j1, dg3[3], du3[3]);
+    }
+}
+
+// BLACKWELL FP16 TENSOR CORE Multi-Token NVFP4 MoE Down (Unified VRAM Cache + Zero-Copy Host Fallback)
+__global__ void __launch_bounds__(128)
+p_moe_down_nvfp4_tc_cached_kernel(
+    const uint8_t* __restrict__ cache_pool,
+    const uint8_t* __restrict__ host_pool,
+    const int32_t* __restrict__ slot_map,
+    const float* __restrict__ exp_scales,
+    const __half* __restrict__ act_h,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ sorted_tok,
+    const int32_t* __restrict__ sorted_slot,
+    const float* __restrict__ sorted_w,
+    float* __restrict__ out_slots) {
+    int tile_id = blockIdx.y;
+    if (tile_id >= expert_offsets[129]) return;
+    int expert = expert_offsets[130 + tile_id];
+    int t0 = expert_offsets[386 + tile_id];
+    int end = expert_offsets[642 + tile_id];
+    int cnt = end - t0;
+
+    int cslot = __ldg(slot_map + expert);
+    const uint8_t* exp_base = (cslot >= 0)
+        ? (cache_pool + (size_t)cslot * EXPERT_SLOT_BYTES)
+        : (host_pool  + (size_t)expert * EXPERT_SLOT_BYTES);
+    const uint8_t* w_data   = exp_base + EXPERT_W2_DATA_OFF;
+    const uint8_t* w_scales = exp_base + EXPERT_W2_SCALE_OFF;
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp = lane >> 2;
+    int tid4 = lane & 3;
+
+    int r_base = blockIdx.x * 64 + warp * 16;
+    int r0 = r_base + grp;
+    int r1 = r_base + grp + 8;
+
+    constexpr int W_STRIDE = INTERMEDIATE >> 1;
+    constexpr int S_STRIDE = INTERMEDIATE >> 4;
+    constexpr int K_ITERS = INTERMEDIATE >> 6;
+    size_t row0 = (size_t)r0;
+    size_t row1 = (size_t)r1;
+    const uint2* wr0 = reinterpret_cast<const uint2*>(w_data + row0 * W_STRIDE);
+    const uint2* wr1 = reinterpret_cast<const uint2*>(w_data + row1 * W_STRIDE);
+    const uint32_t* sr0 = reinterpret_cast<const uint32_t*>(w_scales + row0 * S_STRIDE);
+    const uint32_t* sr1 = reinterpret_cast<const uint32_t*>(w_scales + row1 * S_STRIDE);
+    float es = exp_scales[expert];
+
+    __shared__ __half s_x[32][72];
+    __shared__ int s_base[32];
+    __shared__ float s_rw[32];
+
+    int load_t0 = tid >> 3;
+    int load_t1 = 16 + load_t0;
+    int load_c = (tid & 7) << 3;
+
+    if (tid < 32) {
+        if (tid < cnt) {
+            s_base[tid] = sorted_tok[t0 + tid] * TOP_K + sorted_slot[t0 + tid];
+            s_rw[tid] = sorted_w[t0 + tid] * es;
+        } else {
+            s_base[tid] = 0;
+            s_rw[tid] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float d0[4] = {0, 0, 0, 0}, d1[4] = {0, 0, 0, 0}, d2[4] = {0, 0, 0, 0}, d3[4] = {0, 0, 0, 0};
+    int my_base0 = s_base[load_t0];
+    int my_base1 = s_base[load_t1];
+
+    for (int blk4 = 0; blk4 < K_ITERS; ++blk4) {
+        int koff = blk4 << 6;
+        int woff = (blk4 << 2) + tid4;
+        uint2 w0_r = __ldg(wr0 + woff), w1_r = __ldg(wr1 + woff);
+        uint32_t s0_r = __ldg(sr0 + blk4), s1_r = __ldg(sr1 + blk4);
+
+        if (load_t0 < cnt) {
+            *reinterpret_cast<uint4*>(&s_x[load_t0][load_c]) =
+                __ldg(reinterpret_cast<const uint4*>(act_h + (size_t)my_base0 * INTERMEDIATE + koff + load_c));
+        } else {
+            *reinterpret_cast<uint4*>(&s_x[load_t0][load_c]) = make_uint4(0, 0, 0, 0);
+        }
+        if (load_t1 < cnt) {
+            *reinterpret_cast<uint4*>(&s_x[load_t1][load_c]) =
+                __ldg(reinterpret_cast<const uint4*>(act_h + (size_t)my_base1 * INTERMEDIATE + koff + load_c));
+        } else if (cnt > 16) {
+            *reinterpret_cast<uint4*>(&s_x[load_t1][load_c]) = make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            int km = (m << 4) + (tid4 << 1);
+            uint32_t b0_0 = *reinterpret_cast<const uint32_t*>(&s_x[grp][km]);
+            uint32_t b1_0 = *reinterpret_cast<const uint32_t*>(&s_x[grp][km + 8]);
+            uint32_t a0, a1, a2, a3;
+            nvfp4_shfl_a_frag(w0_r, w1_r, pick_e4m3_scale_h2(s0_r, m), pick_e4m3_scale_h2(s1_r, m), grp, tid4, m, a0, a1, a2, a3);
+            mma_m16n8k16(d0, a0, a1, a2, a3, b0_0, b1_0);
+            if (cnt > 8) {
+                uint32_t b0_1 = *reinterpret_cast<const uint32_t*>(&s_x[8 + grp][km]);
+                uint32_t b1_1 = *reinterpret_cast<const uint32_t*>(&s_x[8 + grp][km + 8]);
+                mma_m16n8k16(d1, a0, a1, a2, a3, b0_1, b1_1);
+            }
+            if (cnt > 16) {
+                uint32_t b0_2 = *reinterpret_cast<const uint32_t*>(&s_x[16 + grp][km]);
+                uint32_t b1_2 = *reinterpret_cast<const uint32_t*>(&s_x[16 + grp][km + 8]);
+                mma_m16n8k16(d2, a0, a1, a2, a3, b0_2, b1_2);
+            }
+            if (cnt > 24) {
+                uint32_t b0_3 = *reinterpret_cast<const uint32_t*>(&s_x[24 + grp][km]);
+                uint32_t b1_3 = *reinterpret_cast<const uint32_t*>(&s_x[24 + grp][km + 8]);
+                mma_m16n8k16(d3, a0, a1, a2, a3, b0_3, b1_3);
+            }
+        }
+        __syncthreads();
+    }
+
+    auto write_out = [&](int local_t, int r, float val) {
+        if (local_t >= cnt) return;
+        out_slots[(size_t)s_base[local_t] * HIDDEN + r] = val * s_rw[local_t];
+    };
+    int n0 = tid4 * 2;
+    write_out(n0,     r0, d0[0]);
+    write_out(n0 + 1, r0, d0[1]);
+    write_out(n0,     r1, d0[2]);
+    write_out(n0 + 1, r1, d0[3]);
+    if (cnt > 8) {
+        write_out(8 + n0,     r0, d1[0]);
+        write_out(8 + n0 + 1, r0, d1[1]);
+        write_out(8 + n0,     r1, d1[2]);
+        write_out(8 + n0 + 1, r1, d1[3]);
+    }
+    if (cnt > 16) {
+        write_out(16 + n0,     r0, d2[0]);
+        write_out(16 + n0 + 1, r0, d2[1]);
+        write_out(16 + n0,     r1, d2[2]);
+        write_out(16 + n0 + 1, r1, d2[3]);
+    }
+    if (cnt > 24) {
+        write_out(24 + n0,     r0, d3[0]);
+        write_out(24 + n0 + 1, r0, d3[1]);
+        write_out(24 + n0,     r1, d3[2]);
+        write_out(24 + n0 + 1, r1, d3[3]);
+    }
+}
+
 } // namespace
 
 void launch_prefill_warmup_cublas(cudaStream_t stream) {
@@ -1657,7 +1975,11 @@ void launch_prefill_moe_gate_up_h(
     __half* out_act_h, cudaStream_t stream) {
     // Pigeonhole bound for B <= 512, TOP_K=8, NUM_EXPERTS=128, TILE_N=32: max_tiles <= 256!
     dim3 grid(INTERMEDIATE / 64, 256);
-    if (w13.is_nvfp4) {
+    if (w13.cache_pool != nullptr) {
+        p_moe_gate_up_nvfp4_tc_cached_kernel<<<grid, 128, 0, stream>>>(
+            w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale,
+            x_h, expert_offsets, sorted_tok, sorted_slot, out_act_h);
+    } else if (w13.is_nvfp4) {
         p_moe_gate_up_nvfp4_tc_kernel<<<grid, 128, 0, stream>>>(
             w13.data, w13.scales, w13.expert_scale, x_h, expert_offsets, sorted_tok, sorted_slot, out_act_h);
     } else {
@@ -1671,7 +1993,11 @@ void launch_prefill_moe_down_h(
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
     const float* sorted_w, float* out_slots, cudaStream_t stream) {
     dim3 grid(HIDDEN / 64, 256);
-    if (w2.is_nvfp4) {
+    if (w2.cache_pool != nullptr) {
+        p_moe_down_nvfp4_tc_cached_kernel<<<grid, 128, 0, stream>>>(
+            w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale,
+            act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_slots);
+    } else if (w2.is_nvfp4) {
         p_moe_down_nvfp4_tc_kernel<<<grid, 128, 0, stream>>>(
             w2.data, w2.scales, w2.expert_scale, act_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_slots);
     } else {

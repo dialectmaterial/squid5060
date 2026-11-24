@@ -1,8 +1,9 @@
-// squid5090-zig — TigerStyle Zig + Blackwell sm_120a CUDA Inference Engine & OpenAI Server.
+// squid5060 — TigerStyle Zig + Blackwell sm_120a CUDA Inference Engine & OpenAI Server (8 GB VRAM).
 // Zero dynamic allocations post-init(), single-arena VRAM weights & runtime, always-on assertions.
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
@@ -25,7 +26,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var tokens_csv: []const u8 = "1,2,3";
     var tokens_file: []const u8 = "";
     var prompt_text: []const u8 = "";
-    var mode_str: []const u8 = if (std.mem.eql(u8, command, "serve")) "nvfp4" else "exact";
+    var mode_str: []const u8 = "auto";
     var kv_str: []const u8 = "auto";
     var host: []const u8 = "0.0.0.0";
     var model_name: []const u8 = "inkling-2-mini";
@@ -35,11 +36,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var port: u16 = 8000;
     var mtp: u32 = if (std.mem.eql(u8, command, "serve")) 3 else 0;
+    var has_mtp_arg: bool = false;
     var max_tokens: u32 = 128;
     var runs: u32 = 6;
-    var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
+    var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 32768 else 8192;
     var use_graphs: bool = true;
     var embed_on_host: bool = false;
+    var cache_mib: u32 = 0; // 0 = auto-size from remaining free VRAM minus headroom
+    var cache_headroom_mib: u32 = 180;
+    var force_no_expert_cache: bool = false;
+    var force_expert_cache: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
     var has_tokens_arg: bool = false;
@@ -82,6 +88,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--mtp") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mtp = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
+            has_mtp_arg = true;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
             max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
@@ -91,6 +98,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--ctx") and arg_i + 1 < argv.len) {
             arg_i += 1;
             ctx = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 8192;
+        } else if (std.mem.eql(u8, arg, "--cache-mib") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            cache_mib = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
+            force_expert_cache = true;
+        } else if (std.mem.eql(u8, arg, "--cache-headroom-mib") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            cache_headroom_mib = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 400;
+        } else if (std.mem.eql(u8, arg, "--expert-cache")) {
+            force_expert_cache = true;
+        } else if (std.mem.eql(u8, arg, "--no-expert-cache")) {
+            force_no_expert_cache = true;
         } else if (std.mem.eql(u8, arg, "--embed-host")) {
             embed_on_host = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
@@ -137,12 +155,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     defer if (need_tokenizer) tokenizer.deinit();
 
-    const quant_mode: constants.QuantMode = parse_mode(mode_str);
+    var free_vram_init: usize = 0;
+    var total_vram_init: usize = 0;
+    tiger.assert_cuda(cuda.squid_cuda_mem_get_info(&free_vram_init, &total_vram_init));
+    const low_vram_gpu: bool = (total_vram_init < 15 * 1024 * 1024 * 1024);
+    const use_expert_cache: bool = if (force_no_expert_cache) false else (force_expert_cache or low_vram_gpu);
+    if (!has_mtp_arg and use_expert_cache and std.mem.eql(u8, command, "serve")) {
+        // On 8 GB PCIe-cached GPUs, mtp=0 maximizes mixed-workload decode (+52 cached experts, zero rejected-draft PCIe misses).
+        // Pass --mtp 2 explicitly for code-heavy workloads (peaks ~66.9 tok/s).
+        mtp = 0;
+    }
+
+    const quant_mode: constants.QuantMode = if (std.mem.eql(u8, mode_str, "auto"))
+        (if (use_expert_cache or std.mem.eql(u8, command, "serve")) constants.QuantMode.nvfp4 else constants.QuantMode.exact)
+    else
+        parse_mode(mode_str);
+
     const kv_format: constants.KVFormat = if (std.mem.eql(u8, kv_str, "bf16"))
         .bf16
     else if (std.mem.eql(u8, kv_str, "fp8"))
         .fp8
     else if (std.mem.eql(u8, kv_str, "q4"))
+        .q4
+    else if (use_expert_cache)
         .q4
     else if (quant_mode == .exact)
         .bf16
@@ -151,7 +186,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     else
         .fp8;
 
-    if (ctx > 524_288 and quant_mode != .exact) {
+    if (use_expert_cache or (ctx > 524_288 and quant_mode != .exact)) {
         embed_on_host = true;
     }
 
@@ -187,12 +222,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     var model_weights: weights_mod.ModelWeights = .{};
-    const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
-    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host)) return 1;
+    const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "longctx"));
+    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, use_expert_cache)) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
-    engine.init(&model_weights, ctx, use_graphs, kv_format);
+    engine.init(&model_weights, ctx, use_graphs, kv_format, cache_mib, cache_headroom_mib);
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
@@ -242,6 +277,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             "[gen] prompt={d} gen={d} prefill={d:.2}ms decode={d:.2}ms speed={d:.2} tok/s | mtp={d} acc={d:.1}% dl={d:.2}\n",
             .{ st.prompt_tokens, st.generated_tokens, st.prefill_ms, st.decode_ms, tps, mtp, acc_pct, dl },
         );
+        engine.expert_cache.print_stats("gen");
         print_token_csv("TOKENS:", out_tokens_buf[0..st.generated_tokens]);
         if (need_tokenizer) print_decoded(&tokenizer, out_tokens_buf[0..st.generated_tokens]);
         return 0;
@@ -249,8 +285,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (std.mem.eql(u8, command, "bench")) {
         const clamped_runs: usize = @min(@max(runs, 1), bench_runs_max);
-        // 1 warmup run (also captures CUDA Graph)
-        _ = engine.generate(prompt_ids_buf[0..prompt_len], @min(32, max_tokens), mtp, out_tokens_buf, null, null);
+        // 1 warmup run (also captures CUDA Graph and warms expert cache)
+        _ = engine.generate(prompt_ids_buf[0..prompt_len], @min(64, max_tokens), mtp, out_tokens_buf, null, null);
+        engine.expert_cache.reset_stats();
 
         var speeds: [bench_runs_max]f64 = undefined;
         var last_acc: f64 = 0.0;
@@ -298,6 +335,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             "MEDIAN: {d:.2} tok/s | min={d:.2} max={d:.2} | prefill={d:.2}ms | acc={d:.1}% dl={d:.2} | mode={s} mtp={d} graph={d}\n",
             .{ median, speeds[0], speeds[clamped_runs - 1], last_prefill, last_acc, last_dl, quant_mode.name(), mtp, @as(u8, if (use_graphs) 1 else 0) },
         );
+        engine.expert_cache.print_stats("bench");
         print_token_csv("TOKENS:", sample_tokens[0..sample_len]);
         if (need_tokenizer) print_decoded(&tokenizer, sample_tokens[0..sample_len]);
         return 0;
@@ -375,12 +413,12 @@ fn print_decoded(tok: *const tokenizer_mod.Tokenizer, tokens: []const i32) void 
 
 fn print_usage() void {
     tiger.write_fd_all(2,
-        "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
+        "squid5060 — TigerStyle Zig + Blackwell CUDA 8 GB Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 3] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
-            "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
+            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 32768] [--mtp 0|2|3] [--cache-mib 0] [--cache-headroom-mib 180] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5060 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 0..7] [--cache-mib 0] [--max-tokens 512] [--ctx 8192]\n" ++
+            "  squid5060 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 0..7] [--cache-mib 0] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5060 longctx  <model_dir> [--mode nvfp4] [--kv q4|fp8|bf16] [--ctx 131072]\n" ++
+            "  squid5060 tokenize <model_dir> --prompt TEXT [--raw]\n",
     );
 }

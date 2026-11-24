@@ -24,8 +24,8 @@ pub fn build(b: *std.Build) void {
     const cuda_path = b.option(
         []const u8,
         "cuda-path",
-        "CUDA toolkit root directory (default: /usr/local/cuda)",
-    ) orelse "/usr/local/cuda";
+        "CUDA toolkit root directory (default: /opt/cuda)",
+    ) orelse "/opt/cuda";
 
     const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
     const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
     }
 
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
+    root_module.addRPath(.{ .cwd_relative = cuda_lib });
     root_module.linkSystemLibrary("cudart", .{});
     root_module.linkSystemLibrary("cublas", .{});
     root_module.linkSystemLibrary("stdc++", .{});
@@ -85,7 +86,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("pthread", .{});
 
     const exe = b.addExecutable(.{
-        .name = "squid5090",
+        .name = "squid5060",
         .root_module = root_module,
     });
     b.installArtifact(exe);
@@ -94,7 +95,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
-    const run_step = b.step("run", "Run squid5090 with arbitrary CLI arguments");
+    const run_step = b.step("run", "Run squid5060 with arbitrary CLI arguments");
     run_step.dependOn(&run_cmd.step);
 
     // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 3 ...]`

@@ -27,9 +27,15 @@ struct ExpertBank {
     int n_experts = NUM_EXPERTS;
     int rows = 0; // w13: 2*INTERMEDIATE=2304, w2: HIDDEN=2304
     int cols = 0; // w13: HIDDEN=2304, w2: INTERMEDIATE=1152
-    uint8_t* data = nullptr;    // NVFP4: U8 [E, rows, cols/2], MXFP8: F8_E4M3 [E, rows, cols]
-    uint8_t* scales = nullptr;  // NVFP4: F8_E4M3 [E, rows, cols/16], MXFP8: U8 UE8M0 [E, rows, cols/32]
-    float* expert_scale = nullptr; // NVFP4: precomputed F32 [E] = amax[e] / denom[0]
+    uint8_t* data = nullptr;    // All-VRAM mode: U8 [E, rows, cols/2], Cache mode: nullptr
+    uint8_t* scales = nullptr;  // All-VRAM mode: F8_E4M3 [E, rows, cols/16], Cache mode: nullptr
+    float* expert_scale = nullptr; // NVFP4: precomputed F32 [E] = amax[e] / denom[0] (always in VRAM)
+
+    // Unified 8 GB VRAM Expert Cache + Zero-Copy Mapped Host Fallback (active when cache_pool != nullptr)
+    uint8_t* cache_pool = nullptr;    // Unified VRAM cache [num_slots * EXPERT_SLOT_BYTES]
+    uint8_t* host_pool = nullptr;     // Layer's pinned mapped host bank [128 * EXPERT_SLOT_BYTES]
+    int32_t* slot_map = nullptr;      // Layer's VRAM slot map [128]: >=0 = VRAM slot, -1 = host zero-copy
+    uint32_t* touch_counts = nullptr; // Layer's VRAM touch counter [128] (incremented per visit/token)
 };
 
 struct ControllerWeights {

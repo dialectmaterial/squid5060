@@ -33,6 +33,20 @@ constexpr int CONV_TAPS = 4;
 constexpr int NUM_EXPERTS = 128;
 constexpr int TOP_K = 8;
 constexpr int INTERMEDIATE = 1152;
+constexpr int TOTAL_PHYSICAL_EXPERTS = NUM_LAYERS * NUM_EXPERTS; // 3072
+
+// Unified physical NVFP4 expert slot layout (identical in VRAM cache & pinned host RAM).
+// Every sub-section is an exact multiple of 256 bytes so 1 single DMA uploads w13 + w2!
+constexpr size_t EXPERT_W13_DATA_BYTES  = (size_t)(2 * INTERMEDIATE) * (HIDDEN / 2);       // 2,654,208 B
+constexpr size_t EXPERT_W13_SCALE_BYTES = (size_t)(2 * INTERMEDIATE) * (HIDDEN / 16);      //   331,776 B
+constexpr size_t EXPERT_W2_DATA_BYTES   = (size_t)HIDDEN * (INTERMEDIATE / 2);             // 1,327,104 B
+constexpr size_t EXPERT_W2_SCALE_BYTES  = (size_t)HIDDEN * (INTERMEDIATE / 16);            //   165,888 B
+constexpr size_t EXPERT_W13_DATA_OFF    = 0;
+constexpr size_t EXPERT_W13_SCALE_OFF   = EXPERT_W13_DATA_BYTES;                           // 2,654,208
+constexpr size_t EXPERT_W2_DATA_OFF     = EXPERT_W13_SCALE_OFF + EXPERT_W13_SCALE_BYTES;   // 2,985,984
+constexpr size_t EXPERT_W2_SCALE_OFF    = EXPERT_W2_DATA_OFF + EXPERT_W2_DATA_BYTES;       // 4,313,088
+constexpr size_t EXPERT_SLOT_BYTES      = EXPERT_W2_SCALE_OFF + EXPERT_W2_SCALE_BYTES;     // 4,478,976 B (4.2715 MiB)
+
 constexpr int VOCAB_PADDED = 201024;
 constexpr int VOCAB_UNPADDED = 200058;
 constexpr int EOS_TOKEN = 200006;

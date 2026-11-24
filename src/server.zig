@@ -489,7 +489,7 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"engine\":\"squid5090\"}}", .{ config.context_tokens_max, config.default_mtp });
+        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"engine\":\"squid5060\"}}", .{ config.context_tokens_max, config.default_mtp });
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -507,7 +507,7 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"object\":\"list\",\"data\":[{\"id\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"object\":\"model\",\"created\":{d},\"owned_by\":\"squid5090\",\"max_model_len\":{d}}}]}}", .{ tiger.epoch_seconds(), config.context_tokens_max });
+        bw.append_fmt(",\"object\":\"model\",\"created\":{d},\"owned_by\":\"squid5060\",\"max_model_len\":{d}}}]}}", .{ tiger.epoch_seconds(), config.context_tokens_max });
         send_json_response(fd, 200, bw.slice());
         return;
     }
