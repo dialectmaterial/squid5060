@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" width="1200" height="675">
+  <defs>
+    <style>
+      .sans { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .title { font-size: 26px; font-weight: 700; fill: #f3f4f6; letter-spacing: -0.4px; }
+      .subtitle { font-size: 13.5px; font-weight: 400; fill: #9ca3af; }
+      .panel-title { font-size: 15px; font-weight: 600; fill: #e5e7eb; letter-spacing: 0.2px; }
+      .panel-unit { font-size: 12px; font-weight: 500; fill: #6b7280; }
+      .group-label { font-size: 13.5px; font-weight: 600; fill: #d1d5db; }
+      .group-sub { font-size: 11.5px; font-weight: 400; fill: #6b7280; }
+      .val-muted { font-size: 12.5px; font-weight: 500; fill: #9ca3af; }
+      .val-v1 { font-size: 12.5px; font-weight: 600; fill: #93c5fd; }
+      .val-v2 { font-size: 13.5px; font-weight: 700; fill: #ecfdf5; }
+      .pill-text { font-size: 11.5px; font-weight: 700; fill: #6ee7b7; }
+      .legend-text { font-size: 12.5px; font-weight: 500; fill: #d1d5db; }
+      .axis-label { font-size: 11px; font-weight: 500; fill: #4b5563; }
+      .footer-text { font-size: 12px; font-weight: 500; fill: #9ca3af; }
+      .footer-strong { font-size: 12px; font-weight: 600; fill: #e5e7eb; }
+    </style>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1200" height="675" fill="#0b0f14"/>
+
+  <!-- Top Header -->
+  <text x="36" y="48" class="sans title">squid5060 — Inkling-2-Mini (26.4B MoE) on 8 GB RTX 5060 Laptop</text>
+  <text x="36" y="72" class="sans subtitle">Single-stream (c=1) · 32K context · 7.47 GiB peak VRAM · exact same bench.py harness · native NVFP4 vs. UD-Q3_K_XL</text>
+
+  <!-- Legend Row -->
+  <g transform="translate(36, 94)">
+    <rect x="0" y="0" width="12" height="12" rx="3" fill="#4b5563"/>
+    <text x="20" y="10.5" class="sans legend-text">llama.cpp (tuned + loop fix)</text>
+
+    <rect x="215" y="0" width="12" height="12" rx="3" fill="#60a5fa"/>
+    <text x="235" y="10.5" class="sans legend-text">squid5060 v1 (mtp=0)</text>
+
+    <rect x="400" y="0" width="12" height="12" rx="3" fill="#34d399"/>
+    <text x="420" y="10.5" class="sans legend-text">squid5060 v2.1 (adaptive {1,2,4,8} + hybrid prefill + shared-loop &amp; FP8 KV)</text>
+  </g>
+
+  <!-- ====================================================================== -->
+  <!-- LEFT PANEL: DECODE THROUGHPUT (tok/s)                                  -->
+  <!-- Scale: x0 = 64, 3.8 px / tok/s (90 tok/s -> 342px -> x=406)            -->
+  <!-- ====================================================================== -->
+  <rect x="36" y="124" width="552" height="482" rx="12" fill="#11161d" stroke="#1f2937" stroke-width="1"/>
+  <text x="64" y="156" class="sans panel-title">Decode Speed (Single Stream, c=1)</text>
+  <text x="560" y="156" text-anchor="end" class="mono panel-unit">tok/s (higher is better)</text>
+  <line x1="64" y1="170" x2="560" y2="170" stroke="#1f2937" stroke-width="1"/>
+
+  <!-- Vertical Gridlines (0, 30, 60, 90 tok/s -> x = 64, 178, 292, 406) -->
+  <g stroke="#1c232e" stroke-width="1">
+    <line x1="64"  y1="184" x2="64"  y2="572"/>
+    <line x1="178" y1="184" x2="178" y2="572" stroke-dasharray="3 4"/>
+    <line x1="292" y1="184" x2="292" y2="572" stroke-dasharray="3 4"/>
+    <line x1="406" y1="184" x2="406" y2="572" stroke-dasharray="3 4"/>
+  </g>
+  <text x="64"  y="590" text-anchor="middle" class="mono axis-label">0</text>
+  <text x="178" y="590" text-anchor="middle" class="mono axis-label">30</text>
+  <text x="292" y="590" text-anchor="middle" class="mono axis-label">60</text>
+  <text x="406" y="590" text-anchor="middle" class="mono axis-label">90</text>
+
+  <!-- Group D1: 6-Prompt Median (T=0.6 exact llama.cpp match) -->
+  <g transform="translate(0, 198)">
+    <text x="64" y="0" class="sans group-label">6-Prompt Median (T=0.6)</text>
+    <text x="234" y="0" class="sans group-sub">sequential · 512 tok each (60.0 at T=0)</text>
+
+    <!-- llama.cpp: 37.2 -> 141.4px -->
+    <rect x="64" y="14" width="141.4" height="20" rx="4" fill="#4b5563"/>
+    <text x="214" y="28.5" class="mono val-muted">37.2</text>
+
+    <!-- v1: 55.0 -> 209.0px -->
+    <rect x="64" y="40" width="209.0" height="20" rx="4" fill="#60a5fa"/>
+    <text x="282" y="54.5" class="mono val-v1">55.0</text>
+
+    <!-- v2.1: 58.6 -> 222.7px -->
+    <rect x="64" y="66" width="222.7" height="22" rx="4" fill="#34d399"/>
+    <text x="296" y="81.5" class="mono val-v2">58.6 tok/s</text>
+    <rect x="394" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="424" y="81" text-anchor="middle" class="mono pill-text">+58%</text>
+  </g>
+
+  <!-- Group D2: Long-Context Decode (3/3 Needle PASS) -->
+  <g transform="translate(0, 326)">
+    <text x="64" y="0" class="sans group-label">Long-Context Decode</text>
+    <text x="218" y="0" class="sans group-sub">23.9K–30.5K context · 3/3 needle PASS</text>
+
+    <!-- llama.cpp: 32.1 -> 122.0px -->
+    <rect x="64" y="14" width="122.0" height="20" rx="4" fill="#4b5563"/>
+    <text x="195" y="28.5" class="mono val-muted">32.1</text>
+
+    <!-- v1: 49.0 -> 186.2px -->
+    <rect x="64" y="40" width="186.2" height="20" rx="4" fill="#60a5fa"/>
+    <text x="259" y="54.5" class="mono val-v1">49.0</text>
+
+    <!-- v2.1: 71.1 -> 270.2px -->
+    <rect x="64" y="66" width="270.2" height="22" rx="4" fill="#34d399"/>
+    <text x="344" y="81.5" class="mono val-v2">71.1 tok/s</text>
+    <rect x="442" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="472" y="81" text-anchor="middle" class="mono pill-text">2.22×</text>
+  </g>
+
+  <!-- Group D3: Warm Peak Decode -->
+  <g transform="translate(0, 454)">
+    <text x="64" y="0" class="sans group-label">Warm Peak Decode</text>
+    <text x="200" y="0" class="sans group-sub">best single-prompt throughput (T=0.0)</text>
+
+    <!-- llama.cpp: 37.9 -> 144.0px -->
+    <rect x="64" y="14" width="144.0" height="20" rx="4" fill="#4b5563"/>
+    <text x="217" y="28.5" class="mono val-muted">37.9</text>
+
+    <!-- v1: 63.9 -> 242.8px -->
+    <rect x="64" y="40" width="242.8" height="20" rx="4" fill="#60a5fa"/>
+    <text x="316" y="54.5" class="mono val-v1">63.9</text>
+
+    <!-- v2.1: 83.3 -> 316.5px -->
+    <rect x="64" y="66" width="316.5" height="22" rx="4" fill="#34d399"/>
+    <text x="390" y="81.5" class="mono val-v2">83.3 tok/s</text>
+    <rect x="488" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="518" y="81" text-anchor="middle" class="mono pill-text">2.20×</text>
+  </g>
+
+  <!-- ====================================================================== -->
+  <!-- RIGHT PANEL: COLD PROMPT PREFILL (tok/s)                               -->
+  <!-- Scale: x0 = 640, 0.205 px / tok/s (1500 tok/s -> 307.5px -> x=947.5)   -->
+  <!-- ====================================================================== -->
+  <rect x="612" y="124" width="552" height="482" rx="12" fill="#11161d" stroke="#1f2937" stroke-width="1"/>
+  <text x="640" y="156" class="sans panel-title">Cold Prompt Prefill (bench.py)</text>
+  <text x="1136" y="156" text-anchor="end" class="mono panel-unit">tok/s (higher is better)</text>
+  <line x1="640" y1="170" x2="1136" y2="170" stroke="#1f2937" stroke-width="1"/>
+
+  <!-- Vertical Gridlines (0, 500, 1000, 1500 tok/s -> x = 640, 742.5, 845, 947.5) -->
+  <g stroke="#1c232e" stroke-width="1">
+    <line x1="640"   y1="184" x2="640"   y2="572"/>
+    <line x1="742.5" y1="184" x2="742.5" y2="572" stroke-dasharray="3 4"/>
+    <line x1="845"   y1="184" x2="845"   y2="572" stroke-dasharray="3 4"/>
+    <line x1="947.5" y1="184" x2="947.5" y2="572" stroke-dasharray="3 4"/>
+  </g>
+  <text x="640"   y="590" text-anchor="middle" class="mono axis-label">0</text>
+  <text x="742.5" y="590" text-anchor="middle" class="mono axis-label">500</text>
+  <text x="845"   y="590" text-anchor="middle" class="mono axis-label">1000</text>
+  <text x="947.5" y="590" text-anchor="middle" class="mono axis-label">1500</text>
+
+  <!-- Group P1: 3.3K Cold Prefill -->
+  <g transform="translate(0, 198)">
+    <text x="640" y="0" class="sans group-label">3.3K Random Prompt</text>
+    <text x="790" y="0" class="sans group-sub">cold cache · 19.0s → 3.2s wait</text>
+
+    <!-- llama.cpp: 174 -> 35.7px -->
+    <rect x="640" y="14" width="35.7" height="20" rx="4" fill="#4b5563"/>
+    <text x="685" y="28.5" class="mono val-muted">174</text>
+
+    <!-- v1: 255 -> 52.3px -->
+    <rect x="640" y="40" width="52.3" height="20" rx="4" fill="#60a5fa"/>
+    <text x="701" y="54.5" class="mono val-v1">255</text>
+
+    <!-- v2.1: 1031 -> 211.4px -->
+    <rect x="640" y="66" width="211.4" height="22" rx="4" fill="#34d399"/>
+    <text x="861" y="81.5" class="mono val-v2">1,031 tok/s</text>
+    <rect x="968" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="998" y="81" text-anchor="middle" class="mono pill-text">5.92×</text>
+  </g>
+
+  <!-- Group P2: 12.9K Cold Prefill -->
+  <g transform="translate(0, 326)">
+    <text x="640" y="0" class="sans group-label">12.9K Random Prompt</text>
+    <text x="800" y="0" class="sans group-sub">hybrid VRAM/PCIe B=1024 prefill</text>
+
+    <!-- llama.cpp: 168 -> 34.4px -->
+    <rect x="640" y="14" width="34.4" height="20" rx="4" fill="#4b5563"/>
+    <text x="684" y="28.5" class="mono val-muted">168</text>
+
+    <!-- v1: 625 -> 128.1px -->
+    <rect x="640" y="40" width="128.1" height="20" rx="4" fill="#60a5fa"/>
+    <text x="777" y="54.5" class="mono val-v1">625</text>
+
+    <!-- v2.1: 1319 -> 270.4px -->
+    <rect x="640" y="66" width="270.4" height="22" rx="4" fill="#34d399"/>
+    <text x="920" y="81.5" class="mono val-v2">1,319 tok/s</text>
+    <rect x="1028" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="1058" y="81" text-anchor="middle" class="mono pill-text">7.86×</text>
+  </g>
+
+  <!-- Group P3: Long-Context Needle Haystack Prefill -->
+  <g transform="translate(0, 454)">
+    <text x="640" y="0" class="sans group-label">Long-Context Needle</text>
+    <text x="794" y="0" class="sans group-sub">204s → 17.1s wait · 3/3 recall</text>
+
+    <!-- llama.cpp: 149 -> 30.5px -->
+    <rect x="640" y="14" width="30.5" height="20" rx="4" fill="#4b5563"/>
+    <text x="680" y="28.5" class="mono val-muted">149 (204s)</text>
+
+    <!-- v1: 1095 -> 224.5px -->
+    <rect x="640" y="40" width="224.5" height="20" rx="4" fill="#60a5fa"/>
+    <text x="874" y="54.5" class="mono val-v1">1,095 (21.8s)</text>
+
+    <!-- v2.1: 1398 -> 286.6px -->
+    <rect x="640" y="66" width="286.6" height="22" rx="4" fill="#34d399"/>
+    <text x="936" y="81.5" class="mono val-v2">1,398 tok/s</text>
+    <rect x="1044" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="1074" y="81" text-anchor="middle" class="mono pill-text">9.37×</text>
+  </g>
+
+  <!-- Footer Bar -->
+  <line x1="36" y1="628" x2="1164" y2="628" stroke="#1f2937" stroke-width="1"/>
+  <text x="36" y="654" class="sans footer-text">
+    <tspan class="footer-strong">Hardware:</tspan> RTX 5060 Laptop 8 GB (sm_120a, 26 SMs) · 30 GB RAM · PCIe Gen5 ×8 · 256K context verified
+  </text>
+  <text x="1164" y="654" text-anchor="end" class="mono footer-strong">github.com/dialectmaterial/squid5060</text>
+</svg>
