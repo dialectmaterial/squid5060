@@ -1,6 +1,8 @@
 // TigerStyle Unified 8 GB VRAM MoE Expert Cache + Zero-Copy Pinned Host Fallback Manager.
 // Deduplicates all 48 logical visits onto the 24 physical layers (3,072 physical experts total).
-// Loop layers (6..17, visited 3x per token) naturally accumulate 3x touch weight and higher CLOCK priority.
+// Loop layers (6..17, visited 3x per token) naturally accumulate 3x touch weight and higher LRFU priority.
+// Supports Phase 2A Prefill-Scratch Tail Aliasing: prefill borrows tail slots from d_cache_pool and
+// returns them to a zero-eviction free list immediately after prefill so decode gets 100% of VRAM!
 // Zero dynamic allocations post-init(); zero CUDA Graph invalidations on slot updates!
 
 const std = @import("std");
@@ -29,6 +31,7 @@ pub const ExpertCache = struct {
     use_lrfu: bool = true, // Exact global-min Aging-LFU with hysteresis (vs CLOCK)
     num_slots: u32 = 0,
     capacity_bytes: u64 = 0,
+    prefill_reserved_tail: u32 = 0,
 
     // Device allocations (1 contiguous cache pool + 12 KiB slot map + 12 KiB touch counts)
     d_cache_pool: ?[*]u8 = null,
@@ -46,7 +49,9 @@ pub const ExpertCache = struct {
     // Host replacement state (static Startup-allocated slices)
     slot_owner: []i32 = &.{},
     clock_bits: []u8 = &.{},
-    slot_reserved: []bool = &.{}, // true if in ready_free / inflight / quarantine (skip in eviction!)
+    slot_reserved: []bool = &.{}, // true if in ready_free / inflight / quarantine / prefill tail
+    free_list: []u32 = &.{}, // unreserved, unowned slots returned from prefill tail (zero-eviction refill!)
+    free_list_len: usize = 0,
     ewma_score: [total_experts]f32 = @splat(0.0),
     recent_misses: [total_experts]u16 = @splat(0),
     is_inflight: [total_experts]bool = @splat(false),
@@ -109,11 +114,9 @@ pub const ExpertCache = struct {
         if (parse_env_u32("SQUID_CACHE_MAX_PROMOTE")) |v| self.max_promotes_per_decode = @min(v, 256);
         if (parse_env_u32("SQUID_CACHE_ASYNC")) |v| self.async_promote = (v != 0);
         if (parse_env_u32("SQUID_CACHE_DECAY")) |v| {
-            // e.g. 995 -> 0.995, 998 -> 0.998, 990 -> 0.990
             if (v >= 800 and v <= 1000) self.lrfu_decay = @as(f32, @floatFromInt(v)) / 1000.0;
         }
         if (parse_env_u32("SQUID_CACHE_HYST")) |v| {
-            // e.g. 115 -> 1.15, 100 -> 1.00, 150 -> 1.50
             if (v >= 100 and v <= 500) self.lrfu_hysteresis = @as(f32, @floatFromInt(v)) / 100.0;
         }
         if (tiger.getenv("SQUID_CACHE_POLICY")) |p| {
@@ -136,13 +139,13 @@ pub const ExpertCache = struct {
 
         const slot_bytes: u64 = constants.expert_slot_bytes;
         const slots: u32 = @intCast(@min(total_experts, budget_bytes / slot_bytes));
-        if (slots < 16) {
+        if (slots < 32) {
             tiger.print_stderr(
-                "[cache] WARNING: low free VRAM ({d:.1} MiB free, headroom={d} MiB) -> clamping cache to {d} slots\n",
+                "[cache] ERROR: insufficient VRAM for expert cache ({d:.1} MiB free, headroom={d} MiB -> {d} slots, need >= 32 slots / 137 MiB). Increase --cache-mib or reduce --ctx.\n",
                 .{ @as(f64, @floatFromInt(free_vram)) / (1024.0 * 1024.0), headroom_mib, slots },
             );
+            std.process.exit(1);
         }
-        tiger.assert(slots >= 1);
 
         const pool_bytes: u64 = @as(u64, slots) * slot_bytes;
         var raw_pool: ?*anyopaque = null;
@@ -168,6 +171,8 @@ pub const ExpertCache = struct {
         self.slot_owner = tiger.alloc_host_zeroed(i32, slots);
         self.clock_bits = tiger.alloc_host_zeroed(u8, slots);
         self.slot_reserved = tiger.alloc_host_zeroed(bool, slots);
+        self.free_list = tiger.alloc_host_zeroed(u32, slots);
+        self.free_list_len = 0;
         for (self.slot_owner) |*o| o.* = -1;
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.copy_stream));
@@ -176,7 +181,6 @@ pub const ExpertCache = struct {
             self.async_promote = false;
         }
         if (self.async_promote) {
-            // Reserve the last `async_staging_slots` slots as zero-race async staging pool
             var k: usize = 0;
             while (k < async_staging_slots) : (k += 1) {
                 const s: u32 = slots - 1 - @as(u32, @intCast(k));
@@ -208,11 +212,11 @@ pub const ExpertCache = struct {
 
         self.num_slots = slots;
         self.capacity_bytes = pool_bytes;
+        self.prefill_reserved_tail = 0;
         self.clock_hand = 0;
         self.free_slots_used = 0;
         self.enabled = true;
 
-        // Bind unified cache pool + per-layer slot_map & touch_counts slices into all 24 layers!
         var l: u32 = 0;
         while (l < constants.layer_count) : (l += 1) {
             const base_off: usize = @as(usize, l) * constants.expert_count;
@@ -222,7 +226,7 @@ pub const ExpertCache = struct {
             lw.w13.touch_counts = self.d_touch_counts.? + base_off;
             lw.w2.cache_pool = self.d_cache_pool;
             lw.w2.slot_map = self.d_slot_map.? + base_off;
-            lw.w2.touch_counts = null; // w13 already counts each routed expert once per visit!
+            lw.w2.touch_counts = null;
         }
 
         const pool_mib: f64 = @as(f64, @floatFromInt(pool_bytes)) / (1024.0 * 1024.0);
@@ -254,10 +258,106 @@ pub const ExpertCache = struct {
         if (self.slot_owner.len > 0) tiger.free_host_slice(i32, self.slot_owner);
         if (self.clock_bits.len > 0) tiger.free_host_slice(u8, self.clock_bits);
         if (self.slot_reserved.len > 0) tiger.free_host_slice(bool, self.slot_reserved);
+        if (self.free_list.len > 0) tiger.free_host_slice(u32, self.free_list);
         self.* = .{};
     }
 
-    /// Wait for any in-flight async promotions on copy_stream and publish them cleanly before prefill.
+    /// Borrow the last `n_tail` slots of `d_cache_pool` as temporary prefill scratch.
+    /// Unmaps any experts currently residing in those tail slots and uploads `d_slot_map` before returning.
+    pub fn acquire_prefill_scratch(self: *ExpertCache, n_tail: u32, stream: ?*anyopaque) [*]u8 {
+        tiger.assert(self.enabled);
+        tiger.assert(n_tail > 0 and n_tail + 16 < self.num_slots);
+        const slot_bytes: usize = @intCast(constants.expert_slot_bytes);
+        if (self.prefill_reserved_tail == n_tail) {
+            const tail_start: u32 = self.num_slots - n_tail;
+            return self.d_cache_pool.? + @as(usize, tail_start) * slot_bytes;
+        }
+        tiger.assert(self.prefill_reserved_tail == 0);
+
+        // Drain all async promotions/quarantines and sync stream before reclaiming tail memory!
+        self.flush_async(stream);
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
+
+        const tail_start: u32 = self.num_slots - n_tail;
+        const smap = self.h_slot_map.?;
+        var map_dirty: bool = false;
+
+        // Compact ready_free to drop any staging slots inside [tail_start .. num_slots)
+        var rf_out: usize = 0;
+        var rf_i: usize = 0;
+        while (rf_i < self.ready_free_len) : (rf_i += 1) {
+            if (self.ready_free[rf_i] < tail_start) {
+                self.ready_free[rf_out] = self.ready_free[rf_i];
+                rf_out += 1;
+            }
+        }
+        self.ready_free_len = rf_out;
+
+        // Compact free_list to drop any free slots inside [tail_start .. num_slots)
+        var fl_out: usize = 0;
+        var fl_i: usize = 0;
+        while (fl_i < self.free_list_len) : (fl_i += 1) {
+            if (self.free_list[fl_i] < tail_start) {
+                self.free_list[fl_out] = self.free_list[fl_i];
+                fl_out += 1;
+            }
+        }
+        self.free_list_len = fl_out;
+
+        // Clamp bump watermark to tail_start so prefill promotions never enter the tail
+        if (self.free_slots_used > tail_start) {
+            self.free_slots_used = tail_start;
+        }
+
+        // Unmap and reserve every slot in [tail_start .. num_slots)
+        var s: u32 = tail_start;
+        while (s < self.num_slots) : (s += 1) {
+            const owner = self.slot_owner[s];
+            if (owner >= 0) {
+                smap[@intCast(owner)] = -1;
+                self.slot_owner[s] = -1;
+                map_dirty = true;
+            }
+            self.slot_reserved[s] = true;
+        }
+        self.prefill_reserved_tail = n_tail;
+
+        if (map_dirty) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                @ptrCast(self.d_slot_map.?),
+                @ptrCast(smap),
+                total_experts * @sizeOf(i32),
+                stream,
+            ));
+        }
+
+        return self.d_cache_pool.? + @as(usize, tail_start) * slot_bytes;
+    }
+
+    /// Release borrowed prefill scratch tail slots back to decode (zero-eviction refill via free_list!).
+    pub fn release_prefill_scratch(self: *ExpertCache, stream: ?*anyopaque, already_synced: bool) void {
+        if (!self.enabled or self.prefill_reserved_tail == 0) return;
+        if (!already_synced) {
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
+        }
+        const tail_start: u32 = self.num_slots - self.prefill_reserved_tail;
+        var s: u32 = tail_start;
+        while (s < self.num_slots) : (s += 1) {
+            tiger.assert(self.slot_owner[s] == -1);
+            tiger.assert(self.slot_reserved[s]);
+            if (self.async_promote and self.ready_free_len < async_staging_slots) {
+                self.ready_free[self.ready_free_len] = s;
+                self.ready_free_len += 1;
+            } else {
+                self.slot_reserved[s] = false;
+                self.free_list[self.free_list_len] = s;
+                self.free_list_len += 1;
+            }
+        }
+        self.prefill_reserved_tail = 0;
+    }
+
+    /// Wait for any in-flight async promotions on copy_stream and publish them cleanly before prefill/reset.
     pub fn flush_async(self: *ExpertCache, main_stream: ?*anyopaque) void {
         if (!self.enabled or !self.async_promote) return;
         var map_dirty: bool = false;
@@ -335,8 +435,34 @@ pub const ExpertCache = struct {
         ));
     }
 
-    /// Process touch counts after a decode step (host has already synced `stream`) and promote hot misses.
-    pub fn process_decode_step(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque) void {
+    inline fn has_unassigned_slot(self: *const ExpertCache) bool {
+        if (self.free_list_len > 0) return true;
+        const usable: u32 = self.num_slots - self.prefill_reserved_tail;
+        var cur: u32 = self.free_slots_used;
+        while (cur < usable) : (cur += 1) {
+            if (!self.slot_reserved[cur]) return true;
+        }
+        return false;
+    }
+
+    inline fn pop_unassigned_slot(self: *ExpertCache) ?u32 {
+        if (self.free_list_len > 0) {
+            self.free_list_len -= 1;
+            const s = self.free_list[self.free_list_len];
+            tiger.assert(!self.slot_reserved[s] and self.slot_owner[s] == -1);
+            return s;
+        }
+        const usable: u32 = self.num_slots - self.prefill_reserved_tail;
+        while (self.free_slots_used < usable) {
+            const s = self.free_slots_used;
+            self.free_slots_used += 1;
+            if (!self.slot_reserved[s] and self.slot_owner[s] == -1) return s;
+        }
+        return null;
+    }
+
+    /// Process touch counts after a decode step (host has already synced `stream` or `done_event`) and promote hot misses.
+    pub fn process_decode_step(self: *ExpertCache, weights: *const weights_mod.ModelWeights, n_tokens: u32, stream: ?*anyopaque) void {
         if (!self.enabled) return;
         self.step_counter += 1;
 
@@ -344,8 +470,6 @@ pub const ExpertCache = struct {
         var map_dirty: bool = false;
 
         // Async Phase A: publish promotions launched at step t-1 & release quarantined victim slots!
-        // Because caller JUST synced `stream` after token t finished, any victim unmapped before token t
-        // is 100% guaranteed not to be read by any active kernel!
         if (self.async_promote) {
             if (self.inflight_len > 0) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(stream, self.copy_done_event));
@@ -377,11 +501,16 @@ pub const ExpertCache = struct {
 
         const touches = self.h_touch_counts.?;
         var n_cands: usize = 0;
-        const active_cap: u32 = if (self.async_promote) (self.num_slots - @as(u32, async_staging_slots)) else self.num_slots;
+        const has_free: bool = self.has_unassigned_slot();
 
-        // Global Aging-LFU decay across all 3,072 physical experts (~1.5 us in L1 cache!)
+        // Global Aging-LFU decay scaled by accepted token count (so spec decode ages identically to B=1!)
         if (self.use_lrfu) {
-            const dec = self.lrfu_decay;
+            var dec: f32 = self.lrfu_decay;
+            const nt: u32 = @max(n_tokens, 1);
+            if (nt > 1) {
+                var k: u32 = 1;
+                while (k < nt) : (k += 1) dec *= self.lrfu_decay;
+            }
             var i: usize = 0;
             while (i < total_experts) : (i += 1) {
                 self.ewma_score[i] *= dec;
@@ -419,9 +548,7 @@ pub const ExpertCache = struct {
                 self.decode_misses += cnt;
                 if (self.is_inflight[eid]) continue;
 
-                const has_free: bool = (self.free_slots_used < active_cap);
                 if (self.use_lrfu) {
-                    // For LRFU, record every missed expert; hysteresis check happens against exact global min!
                     const scaled: u32 = @intFromFloat(@min(self.ewma_score[eid] * 1000.0, 4_000_000_000.0));
                     self.cand_buf[n_cands] = .{
                         .eid = @intCast(eid),
@@ -446,17 +573,18 @@ pub const ExpertCache = struct {
         }
 
         if (n_cands > 0) {
-            if (self.async_promote and self.free_slots_used >= active_cap) {
-                const max_p: usize = @min(n_cands, @min(self.max_promotes_per_decode, self.ready_free_len));
+            const cold_startup: bool = (self.free_slots_used < (self.num_slots - self.prefill_reserved_tail) / 2);
+            if (self.async_promote and !cold_startup) {
+                const max_p: usize = @min(n_cands, @min(self.max_promotes_per_decode, async_staging_slots));
                 if (self.launch_async_promotions(weights, n_cands, max_p)) {
                     map_dirty = true;
                 }
             } else {
-                const max_p: usize = if (self.free_slots_used < active_cap)
+                const max_p: usize = if (has_free)
                     @min(n_cands, @max(self.max_promotes_per_decode, 64))
                 else
                     @min(n_cands, self.max_promotes_per_decode);
-                if (self.promote_top_candidates(weights, n_cands, max_p, true, stream, active_cap)) {
+                if (self.promote_top_candidates(weights, n_cands, max_p, true, stream)) {
                     map_dirty = true;
                 }
             }
@@ -471,7 +599,6 @@ pub const ExpertCache = struct {
             ));
         }
 
-        // Periodic exponential decay of miss counters so one-off past bursts age out
         if ((self.step_counter & 63) == 0) {
             var i: usize = 0;
             while (i < total_experts) : (i += 1) {
@@ -487,10 +614,9 @@ pub const ExpertCache = struct {
 
         const touches = self.h_touch_counts.?;
         const smap = self.h_slot_map.?;
-        const active_cap: u32 = if (self.async_promote) (self.num_slots - @as(u32, async_staging_slots)) else self.num_slots;
         var n_cands: usize = 0;
 
-        // Normalize prefill chunk touches so a 512-token prefill chunk doesn't dwarf decode's +1..+3 EWMA scale!
+        // Normalize prefill chunk touches so a 512/1024-token prefill chunk doesn't dwarf decode's +1..+3 EWMA scale!
         const pf_scale: f32 = 12.0 / @as(f32, @floatFromInt(@max(chunk_len, 1)));
         if (self.use_lrfu) {
             var i: usize = 0;
@@ -529,12 +655,13 @@ pub const ExpertCache = struct {
         }
 
         if (n_cands > 0) {
-            const free_rem: usize = active_cap - self.free_slots_used;
-            const max_p: usize = if (free_rem > 0)
-                @min(n_cands, free_rem)
+            const usable: u32 = self.num_slots - self.prefill_reserved_tail;
+            const free_approx: usize = self.free_list_len + (if (self.free_slots_used < usable) (usable - self.free_slots_used) else 0);
+            const max_p: usize = if (free_approx > 0)
+                @min(n_cands, @max(free_approx, self.max_promotes_per_prefill_warm))
             else
                 @min(n_cands, self.max_promotes_per_prefill_warm);
-            if (self.promote_top_candidates(weights, n_cands, max_p, false, stream, active_cap)) {
+            if (self.promote_top_candidates(weights, n_cands, max_p, false, stream)) {
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
                     @ptrCast(self.d_slot_map.?),
                     @ptrCast(smap),
@@ -562,27 +689,32 @@ pub const ExpertCache = struct {
         var map_dirty: bool = false;
 
         var idx: usize = 0;
-        while (idx < max_promote and self.ready_free_len > 0) : (idx += 1) {
+        while (idx < max_promote and self.inflight_len < async_staging_slots) : (idx += 1) {
             const eid: usize = cands[idx].eid;
             if (smap[eid] >= 0 or self.is_inflight[eid]) continue;
 
-            // Check LRFU hysteresis BEFORE evicting! Stop immediately if best candidate can't beat global min.
-            const vic_slot: u32 = if (self.use_lrfu)
-                (self.find_lrfu_victim(eid, true) orelse break)
-            else
-                self.evict_clock_slot(true);
+            // Prefer zero-eviction async refill from free_list / unused slots (e.g., released prefill tail)!
+            var dst_slot: u32 = 0;
+            if (self.pop_unassigned_slot()) |empty_slot| {
+                dst_slot = empty_slot;
+                self.slot_reserved[dst_slot] = true;
+            } else {
+                if (self.ready_free_len == 0) break;
+                const vic_slot: u32 = if (self.use_lrfu)
+                    (self.find_lrfu_victim(eid, true) orelse break)
+                else
+                    self.evict_clock_slot(true);
 
-            // Pop a guaranteed-unreferenced staging slot for copy_stream!
-            self.ready_free_len -= 1;
-            const dst_slot: u32 = self.ready_free[self.ready_free_len];
-            tiger.assert(self.slot_reserved[dst_slot]);
+                self.ready_free_len -= 1;
+                dst_slot = self.ready_free[self.ready_free_len];
+                tiger.assert(self.slot_reserved[dst_slot]);
 
-            // Quarantine evicted victim for 1 token (unmapped before token t+1!)
-            self.slot_reserved[vic_slot] = true;
-            tiger.assert(self.quarantine_len < async_staging_slots);
-            self.quarantine[self.quarantine_len] = vic_slot;
-            self.quarantine_len += 1;
-            map_dirty = true;
+                self.slot_reserved[vic_slot] = true;
+                tiger.assert(self.quarantine_len < async_staging_slots);
+                self.quarantine[self.quarantine_len] = vic_slot;
+                self.quarantine_len += 1;
+                map_dirty = true;
+            }
 
             const layer: usize = eid / constants.expert_count;
             const expert: usize = eid % constants.expert_count;
@@ -638,7 +770,6 @@ pub const ExpertCache = struct {
         max_promote: usize,
         is_decode: bool,
         stream: ?*anyopaque,
-        active_cap: u32,
     ) bool {
         if (max_promote == 0 or n_cands == 0) return false;
         self.sort_top_candidates(n_cands, max_promote);
@@ -654,7 +785,7 @@ pub const ExpertCache = struct {
             const eid: usize = cands[idx].eid;
             if (smap[eid] >= 0) continue;
 
-            const dst_slot: u32 = self.acquire_slot(eid, is_decode, active_cap) orelse break;
+            const dst_slot: u32 = self.acquire_slot(eid, is_decode) orelse break;
             const layer: usize = eid / constants.expert_count;
             const expert: usize = eid % constants.expert_count;
             const is_loop: bool = (layer >= constants.loop_start_layer and layer < constants.loop_end_layer);
@@ -683,12 +814,8 @@ pub const ExpertCache = struct {
         return false;
     }
 
-    fn acquire_slot(self: *ExpertCache, cand_eid: usize, is_decode: bool, active_cap: u32) ?u32 {
-        if (self.free_slots_used < active_cap) {
-            const s = self.free_slots_used;
-            self.free_slots_used += 1;
-            return s;
-        }
+    fn acquire_slot(self: *ExpertCache, cand_eid: usize, is_decode: bool) ?u32 {
+        if (self.pop_unassigned_slot()) |s| return s;
         if (self.use_lrfu) {
             return self.find_lrfu_victim(cand_eid, is_decode);
         }
@@ -696,11 +823,12 @@ pub const ExpertCache = struct {
     }
 
     fn find_lrfu_victim(self: *ExpertCache, cand_eid: usize, is_decode: bool) ?u32 {
+        const usable: u32 = self.num_slots - self.prefill_reserved_tail;
         const cand_score: f32 = self.ewma_score[cand_eid];
         var min_score: f32 = 1e30;
         var min_slot: ?u32 = null;
         var s: u32 = 0;
-        while (s < self.num_slots) : (s += 1) {
+        while (s < usable) : (s += 1) {
             if (self.slot_reserved[s]) continue;
             const owner = self.slot_owner[s];
             if (owner < 0) continue;
@@ -711,7 +839,6 @@ pub const ExpertCache = struct {
             }
         }
         const vic = min_slot orelse return null;
-        // Strict hysteresis: only evict if candidate meaningfully beats the weakest resident expert!
         if (cand_score <= min_score * self.lrfu_hysteresis) return null;
 
         const old_eid = self.slot_owner[vic];
@@ -724,9 +851,9 @@ pub const ExpertCache = struct {
     }
 
     fn evict_clock_slot(self: *ExpertCache, is_decode: bool) u32 {
-        // CLOCK sweep skipping reserved async staging slots
-        const n: u32 = self.num_slots;
+        const n: u32 = self.num_slots - self.prefill_reserved_tail;
         const smap = self.h_slot_map.?;
+        if (self.clock_hand >= n) self.clock_hand = 0;
         var steps: u32 = 0;
         const max_steps: u32 = n * 16;
         while (steps < max_steps) : (steps += 1) {
@@ -744,7 +871,6 @@ pub const ExpertCache = struct {
             }
             self.clock_bits[s] -= 1;
         }
-        // Fallback: pick first unreserved slot (bounded loop per TigerStyle)
         var fb: u32 = 0;
         while (fb < n) : (fb += 1) {
             const s = self.clock_hand;
@@ -758,7 +884,7 @@ pub const ExpertCache = struct {
             }
             return s;
         }
-        unreachable;
+        @panic("expert_cache: no evictable slot available");
     }
 
     fn load_warm_snapshot(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque) void {
@@ -809,8 +935,7 @@ pub const ExpertCache = struct {
         var idx: usize = 0;
         while (idx < to_load) : (idx += 1) {
             const e_id: usize = self.cand_buf[idx].eid;
-            const dst_slot: u32 = self.free_slots_used;
-            self.free_slots_used += 1;
+            const dst_slot: u32 = self.pop_unassigned_slot() orelse break;
             const layer: usize = e_id / constants.expert_count;
             const expert: usize = e_id % constants.expert_count;
             const is_loop: bool = (layer >= constants.loop_start_layer and layer < constants.loop_end_layer);
@@ -850,7 +975,6 @@ pub const ExpertCache = struct {
         while (eid < total_experts) : (eid += 1) {
             if (self.ewma_score[eid] > max_sc) max_sc = self.ewma_score[eid];
         }
-        // Normalize saved scores to [0..100] so restored scores stay in decode's natural EWMA range!
         const norm: f32 = if (max_sc > 0.0) (100.0 / max_sc) else 0.0;
         eid = 0;
         while (eid < total_experts) : (eid += 1) {
@@ -879,6 +1003,7 @@ pub const ExpertCache = struct {
                 z_slots[z] += 1;
             }
         }
+        const resident_slots: u32 = z_slots[0] + z_slots[1] + z_slots[2];
         const z0: f64 = if (self.zone_accesses[0] > 0) 100.0 * @as(f64, @floatFromInt(self.zone_hits[0])) / @as(f64, @floatFromInt(self.zone_accesses[0])) else 0.0;
         const z1: f64 = if (self.zone_accesses[1] > 0) 100.0 * @as(f64, @floatFromInt(self.zone_hits[1])) / @as(f64, @floatFromInt(self.zone_accesses[1])) else 0.0;
         const z2: f64 = if (self.zone_accesses[2] > 0) 100.0 * @as(f64, @floatFromInt(self.zone_hits[2])) / @as(f64, @floatFromInt(self.zone_accesses[2])) else 0.0;
@@ -886,7 +1011,7 @@ pub const ExpertCache = struct {
             "[moe-cache {s}] slots={d}/{d} (pre={d}/768 loop={d}/1536 coda={d}/768) | decode hit={d:.2}%% (pre={d:.1}%% loop={d:.1}%% coda={d:.1}%%) prom={d} evict={d} | prefill hit={d:.2}%%\n",
             .{
                 tag,
-                self.free_slots_used,
+                resident_slots,
                 self.num_slots,
                 z_slots[0],
                 z_slots[1],

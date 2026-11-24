@@ -6,8 +6,115 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <utility>
 
 namespace squid {
+
+// ============================================================================
+// Blackwell Programmatic Dependent Launch (PDL) & Streaming Weight Load Primitives
+// Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
+// Note: L2::cache_hint is intentionally omitted on CUDA 13.1 due to ptxas 13.1 bug.
+// ============================================================================
+
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
+#if __CUDA_ARCH__ >= 900
+    #pragma unroll 1
+    for (uint32_t i = 0; i <= zero; ++i) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+#else
+    (void)zero;
+#endif
+}
+
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
+template <class... KArgs, class... Args>
+inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t stream, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(block);
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
+}
+
+__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint2 ld_stream_u2(const void* p) {
+    uint2 v;
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
+                 : "=r"(v.x), "=r"(v.y)
+                 : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint16_t ld_scale_u16(const void* p) {
+    uint16_t v;
+    asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ uint8_t ld_scale_u8(const void* p) {
+    uint16_t v;
+    asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+    return static_cast<uint8_t>(v);
+}
+
+// Coherent, non-hoistable loads for activations/indices produced by a PDL predecessor.
+__device__ __forceinline__ uint4 ld_dep_u4(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
+}
+
+__device__ __forceinline__ int32_t ld_dep_i32(const int32_t* p) {
+    int32_t v;
+    asm volatile("ld.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ float ld_dep_f32(const float* p) {
+    float v;
+    asm volatile("ld.global.f32 %0, [%1];" : "=f"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void mma_m16n8k16_f32_bf16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
 
 // Hardware Blackwell sm_120 PTX FP4 (e2m1x2) -> half2 conversion!
 // Single-instruction hardware decode on Blackwell (zero LUT / bitshift overhead).
@@ -220,7 +327,7 @@ __device__ __forceinline__ void store_kv_head_128(
         if (lane == 0) sm[warp] = wm;
         __syncthreads();
         float amax = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
-        float sc = fmaxf(amax / 448.0f, 1e-8f);
+        float sc = fmaxf(amax / 448.0f, 1e-7f);
         if (tid == 0) scales[(size_t)slot * NUM_KV_HEADS + h] = __float2half(sc);
         static_cast<uint8_t*>(cache)[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = float_to_e4m3(val / sc);
     } else {
@@ -231,7 +338,7 @@ __device__ __forceinline__ void store_kv_head_128(
         __syncthreads();
         int g = tid >> 6; // 0 (dims 0..63) or 1 (dims 64..127)
         float gmax = fmaxf(sm[g * 2], sm[g * 2 + 1]);
-        float sc = fmaxf(gmax / 7.0f, 1e-8f);
+        float sc = fmaxf(gmax / 7.0f, 1e-7f);
         if ((tid & 63) == 0) scales[(size_t)slot * KV_Q4_SCALES_PER_TOK + h * 2 + g] = __float2half(sc);
         int q = max(-7, min(7, __float2int_rn(val / sc))) + 7; // 0..14
         int q_odd = __shfl_xor_sync(0xffffffffu, q, 1);
@@ -573,6 +680,23 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
         }
         if (mt + 1 < NM) __syncthreads();
     }
+}
+
+// Stateless SplitMix64 uniform (0, 1) and Gumbel(0, 1) noise helpers for CUDA-graph sampling.
+// Strictly inside [2^-24, 1 - 2^-24] in float32 -> never produces 0.0f, 1.0f, NaN, or Inf.
+__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+    uint64_t h = seed ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ULL)
+                      ^ ((uint64_t)(uint32_t)tok * 0xBF58476D1CE4E5B9ULL);
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f);
+}
+
+__device__ __forceinline__ float hash_gumbel(uint64_t seed, int32_t pos, int32_t tok) {
+    return -__logf(-__logf(hash_u01(seed, pos, tok)));
 }
 
 } // namespace squid

@@ -223,6 +223,47 @@ __global__ void z_assemble_verify_tokens_kernel(
     else if (i <= num_drafts) d_tokens[i] = d_drafts[i - 1];
 }
 
+__global__ void z_adaptive_select_width_kernel(
+    const int32_t* __restrict__ d_anchor,
+    const int32_t* __restrict__ d_drafts,
+    const float* __restrict__ d_draft_conf,
+    float threshold,
+    int32_t* __restrict__ d_tokens,
+    int32_t* __restrict__ d_chosen_width,
+    cudaGraphConditionalHandle cond_handle) {
+    if (threadIdx.x != 0) return;
+    int n_conf = 0;
+    while (n_conf < MTP_MAX_DRAFTS && d_draft_conf[n_conf] >= threshold) {
+        ++n_conf;
+    }
+    unsigned int case_idx;
+    int width;
+    if (n_conf == 0 && d_draft_conf[0] < threshold * 0.55f) {
+        case_idx = 0u;
+        width = 1;
+    } else if (n_conf <= 1) {
+        case_idx = 1u;
+        width = 2;
+    } else if (n_conf <= 3) {
+        case_idx = 2u;
+        width = 4;
+    } else {
+        case_idx = 3u;
+        width = 8;
+    }
+    d_tokens[0] = *d_anchor;
+    for (int i = 0; i < width - 1; ++i) d_tokens[1 + i] = d_drafts[i];
+    *d_chosen_width = width;
+    cudaGraphSetConditional(cond_handle, case_idx);
+}
+
+struct CAdaptiveGraph {
+    cudaGraph_t root_graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphConditionalHandle handle{};
+    cudaGraph_t bodies[4] = {nullptr, nullptr, nullptr, nullptr};
+};
+
 } // namespace
 
 // Flat C-ABI structs mirrored bit-for-bit in zig/src/cuda.zig!
@@ -291,6 +332,7 @@ struct CDsparkWeights {
     void* hidden_out_b;
     int32_t draft_vocab_size;
     int32_t* draft_vocab_ids;
+    int32_t* inv_draft_vocab_ids;
     CLinearWeight unembed_draft;
     CLinearWeight fold_w;
     float* fold_b;
@@ -352,6 +394,7 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
     dw.hidden_out_b = static_cast<__nv_bfloat16*>(c.hidden_out_b);
     dw.draft_vocab_size = c.draft_vocab_size;
     dw.draft_vocab_ids = c.draft_vocab_ids;
+    dw.inv_draft_vocab_ids = c.inv_draft_vocab_ids;
     dw.unembed_draft = to_lw(c.unembed_draft);
     dw.fold_w = to_lw(c.fold_w);
     dw.fold_b = c.fold_b;
@@ -606,12 +649,13 @@ void squid_launch_mega_global_sconv_prep_store(
 void squid_launch_mega_local_sconv_prep_store(
     float* qrgs, const float* k_proj, const float* v_proj, const void* k_sw, const void* v_sw,
     float* k_ring, float* v_ring, const void* q_cs, const void* r_cs,
-    void* k_cache, void* v_cache, int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale, uint8_t kv_fmt,
+    int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
     launch_mega_local_sconv_prep_store(
         qrgs, k_proj, v_proj, static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
         k_ring, v_ring, static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
-        static_cast<__nv_bfloat16*>(k_cache), static_cast<__nv_bfloat16*>(v_cache),
-        kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_relative_attention_gated(
@@ -628,12 +672,13 @@ void squid_launch_relative_attention_gated(
 void squid_launch_mega_attn_post_mlp_in(
     const float* o_proj, const void* attn_sw, float* attn_ring, const float* hidden, const float* partial_prev,
     float* blocks, int32_t block_count_before, uint8_t is_boundary, float* residual_out, const float* mlp_query,
-    const void* mlp_norm_w, float* mlp_out, void* mlp_out_h, int32_t B, const int32_t* d_pos, void* stream) {
+    const void* mlp_norm_w, float* mlp_out, void* mlp_out_h, int32_t B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
     launch_mega_attn_post_mlp_in(
         o_proj, static_cast<const __nv_bfloat16*>(attn_sw), attn_ring, hidden, partial_prev,
         blocks, block_count_before, is_boundary != 0, residual_out, mlp_query,
         static_cast<const __nv_bfloat16*>(mlp_norm_w), mlp_out, static_cast<__half*>(mlp_out_h),
-        B, d_pos, static_cast<cudaStream_t>(stream));
+        B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_route_topk_nvfp4(
@@ -667,10 +712,11 @@ void squid_launch_moe_down_h(
 
 void squid_launch_mega_mlp_post_res(
     const float* moe_down_or_slots, uint8_t moe_is_slotted, const void* mlp_sw, float* mlp_ring,
-    const float* residual, float* hidden_out, int32_t B, const int32_t* d_pos, void* stream) {
+    const float* residual, float* hidden_out, int32_t B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
     launch_mega_mlp_post_res(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(mlp_sw),
-        mlp_ring, residual, hidden_out, B, d_pos, static_cast<cudaStream_t>(stream));
+        mlp_ring, residual, hidden_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_mega_mlp_post_next_depth_norm(
@@ -679,20 +725,26 @@ void squid_launch_mega_mlp_post_next_depth_norm(
     const float* blocks, int32_t n_blocks, const float* queries,
     const void* n0, const void* n1, const void* n2,
     float* o0, float* o1, float* o2, void* oh0, void* oh1, void* oh2,
-    int32_t n_out, int32_t B, const int32_t* d_pos, void* stream) {
+    int32_t n_out, int32_t B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
     launch_mega_mlp_post_next_depth_norm(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(prev_mlp_sw),
         prev_mlp_ring, residual, hidden_out, pre_tap_out, post_tap_out, partial_out,
         blocks, n_blocks, queries,
         static_cast<const __nv_bfloat16*>(n0), static_cast<const __nv_bfloat16*>(n1), static_cast<const __nv_bfloat16*>(n2),
         o0, o1, o2, static_cast<__half*>(oh0), static_cast<__half*>(oh1), static_cast<__half*>(oh2),
-        n_out, B, d_pos, static_cast<cudaStream_t>(stream));
+        n_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_lm_head_argmax(
     const CLinearWeight* unembed, const float* x, int32_t* out_tokens, float* out_logits,
-    float* scratch_vals, int32_t* scratch_idxs, int32_t B, void* stream) {
-    launch_lm_head_argmax(to_lw(*unembed), x, out_tokens, out_logits, scratch_vals, scratch_idxs, B, static_cast<cudaStream_t>(stream));
+    float* scratch_vals, int32_t* scratch_idxs, const SampleConfig* sample_cfg, const int32_t* d_pos,
+    const int32_t* d_draft_tokens, const float* d_draft_probs, const float* d_draft_q_sel,
+    const int32_t* d_draft_is_delta, const int32_t* inv_draft_vocab, int32_t draft_vocab_size,
+    int32_t B, void* stream) {
+    launch_lm_head_argmax(to_lw(*unembed), x, out_tokens, out_logits, scratch_vals, scratch_idxs,
+                          sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel,
+                          d_draft_is_delta, inv_draft_vocab, draft_vocab_size, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_dspark_commit(
@@ -715,7 +767,9 @@ void squid_launch_dspark_draft(
     const int32_t* d_anchor_token, const int32_t* d_pos, int32_t num_drafts,
     void* const* ctx_k, void* const* ctx_v, const void* const* ctx_ks, const void* const* ctx_vs,
     const int32_t* ctx_cap, uint8_t global_kv_fmt, float* split_buf,
-    const float* f_ring, float* workspace, int32_t* out_draft_tokens, void* stream) {
+    const float* f_ring, float* workspace, int32_t* out_draft_tokens, float* out_draft_conf,
+    const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
+    int32_t* out_draft_is_delta, void* stream) {
     ModelWeights mw;
     mw.embed = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed));
     mw.embed_norm = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed_norm));
@@ -726,8 +780,109 @@ void squid_launch_dspark_draft(
     const __half* cvs[MTP_LAYERS] = {static_cast<const __half*>(ctx_vs[0]), static_cast<const __half*>(ctx_vs[1]), static_cast<const __half*>(ctx_vs[2])};
     int cap[MTP_LAYERS] = {ctx_cap[0], ctx_cap[1], ctx_cap[2]};
     launch_dspark_draft(mw, d_anchor_token, d_pos, num_drafts, ck, cv, cks, cvs, cap,
-                        static_cast<KVFormat>(global_kv_fmt), split_buf, f_ring, workspace, out_draft_tokens,
-                        static_cast<cudaStream_t>(stream));
+                        static_cast<KVFormat>(global_kv_fmt), split_buf, f_ring, workspace,
+                        out_draft_tokens, out_draft_conf, sample_cfg, out_draft_probs,
+                        out_draft_q_sel, out_draft_is_delta, static_cast<cudaStream_t>(stream));
+}
+
+int32_t squid_adaptive_graph_create(
+    const int32_t* d_anchor, const int32_t* d_drafts, const float* d_draft_conf, float threshold,
+    int32_t* d_tokens, int32_t* d_chosen_width,
+    const int32_t* d_accepted, int32_t* h_accepted,
+    const int32_t* d_num_acc, int32_t* h_num_acc, int32_t* h_chosen_width,
+    void* stream_raw, void** out_graph) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream_raw);
+    CAdaptiveGraph* ag = new CAdaptiveGraph();
+    cudaError_t err = cudaGraphCreate(&ag->root_graph, 0);
+    if (err != cudaSuccess) { delete ag; return (int32_t)err; }
+    err = cudaGraphConditionalHandleCreate(&ag->handle, ag->root_graph, 0, 0);
+    if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
+
+    err = cudaStreamBeginCaptureToGraph(s, ag->root_graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal);
+    if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
+
+    z_adaptive_select_width_kernel<<<1, 1, 0, s>>>(
+        d_anchor, d_drafts, d_draft_conf, threshold, d_tokens, d_chosen_width, ag->handle);
+
+    cudaStreamCaptureStatus status;
+    cudaGraph_t g = nullptr;
+    const cudaGraphNode_t* deps = nullptr;
+    const cudaGraphEdgeData* edges = nullptr;
+    size_t ndeps = 0;
+    err = cudaStreamGetCaptureInfo(s, &status, nullptr, &g, &deps, &edges, &ndeps);
+    if (err != cudaSuccess) {
+        cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+        cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+    }
+
+    cudaGraphNodeParams p{};
+    p.type = cudaGraphNodeTypeConditional;
+    p.conditional.handle = ag->handle;
+    p.conditional.type = cudaGraphCondTypeSwitch;
+    p.conditional.size = 4;
+    cudaGraphNode_t sw_node = nullptr;
+    err = cudaGraphAddNode(&sw_node, g, deps, edges, ndeps, &p);
+    if (err != cudaSuccess) {
+        cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+        cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+    }
+    ag->bodies[0] = p.conditional.phGraph_out[0];
+    ag->bodies[1] = p.conditional.phGraph_out[1];
+    ag->bodies[2] = p.conditional.phGraph_out[2];
+    ag->bodies[3] = p.conditional.phGraph_out[3];
+
+    err = cudaStreamUpdateCaptureDependencies(s, &sw_node, nullptr, 1, cudaStreamSetCaptureDependencies);
+    if (err != cudaSuccess) {
+        cudaGraph_t disc = nullptr; cudaStreamEndCapture(s, &disc);
+        cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err;
+    }
+
+    // Async D2H copy of verified outputs right after the switch node finishes!
+    cudaMemcpyAsync(h_accepted, d_accepted, MTP_BLOCK_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(h_num_acc, d_num_acc, sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(h_chosen_width, d_chosen_width, sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+
+    cudaGraph_t out_g = nullptr;
+    err = cudaStreamEndCapture(s, &out_g);
+    if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
+    *out_graph = ag;
+    return 0;
+}
+
+int32_t squid_adaptive_graph_branch_begin(void* graph_raw, int32_t branch_idx, void* stream_raw) {
+    CAdaptiveGraph* ag = static_cast<CAdaptiveGraph*>(graph_raw);
+    return (int32_t)cudaStreamBeginCaptureToGraph(
+        static_cast<cudaStream_t>(stream_raw), ag->bodies[branch_idx],
+        nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal);
+}
+
+int32_t squid_adaptive_graph_branch_end(void* stream_raw) {
+    cudaGraph_t out_g = nullptr;
+    return (int32_t)cudaStreamEndCapture(static_cast<cudaStream_t>(stream_raw), &out_g);
+}
+
+int32_t squid_adaptive_graph_instantiate(void* graph_raw) {
+    CAdaptiveGraph* ag = static_cast<CAdaptiveGraph*>(graph_raw);
+    cudaError_t err = cudaGraphInstantiate(&ag->exec, ag->root_graph, 0);
+    if (ag->root_graph) {
+        cudaGraphDestroy(ag->root_graph);
+        ag->root_graph = nullptr;
+    }
+    return (int32_t)err;
+}
+
+int32_t squid_adaptive_graph_launch(void* graph_raw, void* stream_raw) {
+    CAdaptiveGraph* ag = static_cast<CAdaptiveGraph*>(graph_raw);
+    return (int32_t)cudaGraphLaunch(ag->exec, static_cast<cudaStream_t>(stream_raw));
+}
+
+int32_t squid_adaptive_graph_destroy(void* graph_raw) {
+    if (!graph_raw) return 0;
+    CAdaptiveGraph* ag = static_cast<CAdaptiveGraph*>(graph_raw);
+    if (ag->exec) cudaGraphExecDestroy(ag->exec);
+    if (ag->root_graph) cudaGraphDestroy(ag->root_graph);
+    delete ag;
+    return 0;
 }
 
 void squid_launch_spec_verify(
@@ -770,11 +925,12 @@ void squid_launch_prefill_sconv_post_res(
     const float* src_or_slots, int32_t is_slotted, const void* sconv_w, float* ring,
     const float* residual, float* out_res, float* pre_tap_out,
     float* blocks, const float* partial, int32_t block_idx, int32_t is_boundary,
-    int32_t B, const int32_t* d_pos, void* stream) {
+    int32_t B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
     launch_prefill_sconv_post_res(
         src_or_slots, is_slotted, static_cast<const __nv_bfloat16*>(sconv_w), ring,
         residual, out_res, pre_tap_out, blocks, partial, block_idx, is_boundary,
-        B, d_pos, static_cast<cudaStream_t>(stream));
+        B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_copy_taps(const float* src, float* dst_taps, int32_t tap_slot, int32_t B, void* stream) {
@@ -786,15 +942,15 @@ void squid_launch_prefill_local_sconv_prep_store(
     const void* k_sw, const void* v_sw,
     float* k_ring, float* v_ring,
     const void* q_cs, const void* r_cs,
-    void* k_cache, void* v_cache,
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale, uint8_t kv_fmt,
     int32_t kv_cap, int32_t B, const int32_t* d_pos, void* stream) {
     launch_prefill_local_sconv_prep_store(
         qrgs, k_proj, v_proj,
         static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
         k_ring, v_ring,
         static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
-        static_cast<__nv_bfloat16*>(k_cache), static_cast<__nv_bfloat16*>(v_cache),
-        kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_global_sconv_prep_store(
@@ -862,21 +1018,21 @@ void squid_launch_prefill_route_and_sort(
 void squid_launch_prefill_moe_gate_up_h(
     const CExpertBank* w13, const void* x_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
-    void* out_act_h, void* stream) {
+    void* out_act_h, int32_t B, void* stream) {
     launch_prefill_moe_gate_up_h(
         to_eb(*w13), static_cast<const __half*>(x_h),
         expert_offsets, sorted_tok, sorted_slot,
-        static_cast<__half*>(out_act_h), static_cast<cudaStream_t>(stream));
+        static_cast<__half*>(out_act_h), B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_moe_down_h(
     const CExpertBank* w2, const void* act_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
-    const float* sorted_w, float* out_slots, void* stream) {
+    const float* sorted_w, float* out_slots, int32_t B, void* stream) {
     launch_prefill_moe_down_h(
         to_eb(*w2), static_cast<const __half*>(act_h),
         expert_offsets, sorted_tok, sorted_slot, sorted_w,
-        out_slots, static_cast<cudaStream_t>(stream));
+        out_slots, B, static_cast<cudaStream_t>(stream));
 }
 
 } // extern "C"

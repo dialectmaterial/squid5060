@@ -89,7 +89,7 @@ pub const SafetensorsFile = struct {
         self.tensor_count = 0;
     }
 
-    pub fn lookup(self: *const SafetensorsFile, name: []const u8) *const TensorInfo {
+    pub fn lookup_optional(self: *const SafetensorsFile, name: []const u8) ?*const TensorInfo {
         tiger.assert(self.mapped_ptr != null);
         tiger.assert(name.len > 0);
         const header_slice: []const u8 = self.mapped_ptr.?[8 .. 8 + @as(usize, @intCast(self.header_bytes))];
@@ -109,7 +109,11 @@ pub const SafetensorsFile = struct {
             }
             slot = (slot + 1) & mask;
         }
+        return null;
+    }
 
+    pub fn lookup(self: *const SafetensorsFile, name: []const u8) *const TensorInfo {
+        if (self.lookup_optional(name)) |info| return info;
         tiger.print_stderr("[safetensors] Missing tensor: {s}\n", .{name});
         @panic("Safetensors tensor not found");
     }
@@ -254,7 +258,7 @@ fn parse_raw_json_string(data: []const u8, pos: *usize) Span {
     while (pos.* < data.len) {
         const c = data[pos.*];
         if (c == '\\') {
-            pos.* += 2;
+            pos.* = @min(pos.* + 2, data.len);
             continue;
         }
         if (c == '"') {

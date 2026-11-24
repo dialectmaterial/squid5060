@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 
 comptime {
     if (builtin.os.tag == .linux and builtin.cpu.arch != .x86_64) {
-        @compileError("squid5060 POSIX ABI constants are verified for linux x86_64");
+        @compileError("squid5090-zig POSIX ABI constants are verified for linux x86_64");
     }
 }
 
@@ -82,6 +82,11 @@ pub const Timespec = extern struct {
     tv_nsec: i64,
 };
 
+pub const Timeval = extern struct {
+    tv_sec: i64,
+    tv_usec: i64,
+};
+
 pub const SockaddrIn = extern struct {
     sin_family: u16,
     sin_port: u16,
@@ -93,13 +98,17 @@ comptime {
     if (@sizeOf(SockaddrIn) != 16) {
         @compileError("SockaddrIn must be exactly 16 bytes");
     }
+    if (@sizeOf(Timeval) != 16) {
+        @compileError("Timeval must be exactly 16 bytes");
+    }
 }
 
 pub const O_RDONLY: i32 = 0;
+pub const O_WRONLY: i32 = 1;
+pub const O_CREAT: i32 = 0x40;
+pub const O_TRUNC: i32 = 0x200;
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_END: i32 = 2;
-
-pub extern "c" fn creat(pathname: [*:0]const u8, mode: u32) i32;
 pub const PROT_READ: i32 = 1;
 pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FAILED_ADDR: usize = std.math.maxInt(usize);
@@ -111,6 +120,8 @@ pub const AF_INET: i32 = 2;
 pub const SOCK_STREAM: i32 = 1;
 pub const SOL_SOCKET: i32 = 1;
 pub const SO_REUSEADDR: i32 = 2;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
 pub const IPPROTO_TCP: i32 = 6;
 pub const TCP_NODELAY: i32 = 1;
 pub const MSG_NOSIGNAL: i32 = 0x4000;
@@ -124,6 +135,7 @@ pub const SignalHandler = ?*const fn (i32) callconv(.c) void;
 pub const SIG_IGN: SignalHandler = @ptrFromInt(1);
 
 pub extern "c" fn open(pathname: [*:0]const u8, flags: i32, ...) i32;
+pub extern "c" fn creat(pathname: [*:0]const u8, mode: u32) i32;
 pub extern "c" fn close(fd: i32) i32;
 pub extern "c" fn read(fd: i32, buffer: [*]u8, count: usize) isize;
 pub extern "c" fn write(fd: i32, buffer: [*]const u8, count: usize) isize;
@@ -252,30 +264,50 @@ pub const ByteWriter = struct {
         assert(self.length <= self.buffer.len);
     }
 
-    pub fn append_json_escaped(self: *ByteWriter, text: []const u8) void {
+    pub fn try_append_fmt(self: *ByteWriter, comptime fmt: []const u8, args: anytype) bool {
         assert(self.length <= self.buffer.len);
-        self.append_byte('"');
+        const written = std.fmt.bufPrint(self.buffer[self.length..], fmt, args) catch return false;
+        self.length += written.len;
+        return true;
+    }
+
+    pub fn try_append_json_escaped(self: *ByteWriter, text: []const u8) bool {
+        assert(self.length <= self.buffer.len);
+        const saved = self.length;
+        if (!self.try_append_byte('"')) return false;
         const hex_digits = "0123456789abcdef";
         for (text) |byte| {
-            switch (byte) {
-                '"' => self.append_slice("\\\""),
-                '\\' => self.append_slice("\\\\"),
-                '\n' => self.append_slice("\\n"),
-                '\r' => self.append_slice("\\r"),
-                '\t' => self.append_slice("\\t"),
-                0x08 => self.append_slice("\\b"),
-                0x0c => self.append_slice("\\f"),
-                else => {
+            const ok: bool = switch (byte) {
+                '"' => self.try_append_slice("\\\""),
+                '\\' => self.try_append_slice("\\\\"),
+                '\n' => self.try_append_slice("\\n"),
+                '\r' => self.try_append_slice("\\r"),
+                '\t' => self.try_append_slice("\\t"),
+                0x08 => self.try_append_slice("\\b"),
+                0x0c => self.try_append_slice("\\f"),
+                else => blk: {
                     if (byte < 0x20) {
                         var esc: [6]u8 = .{ '\\', 'u', '0', '0', hex_digits[(byte >> 4) & 0x0f], hex_digits[byte & 0x0f] };
-                        self.append_slice(&esc);
+                        break :blk self.try_append_slice(&esc);
                     } else {
-                        self.append_byte(byte);
+                        break :blk self.try_append_byte(byte);
                     }
                 },
+            };
+            if (!ok) {
+                self.length = saved;
+                return false;
             }
         }
-        self.append_byte('"');
+        if (!self.try_append_byte('"')) {
+            self.length = saved;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn append_json_escaped(self: *ByteWriter, text: []const u8) void {
+        assert(self.try_append_json_escaped(text));
     }
 
     pub fn append_c_string_terminated(self: *ByteWriter, text: []const u8) [*:0]const u8 {
@@ -286,7 +318,7 @@ pub const ByteWriter = struct {
     }
 };
 
-pub fn write_fd_all(fd: i32, bytes: []const u8) void {
+pub fn write_fd_all_checked(fd: i32, bytes: []const u8) bool {
     assert(fd >= 0);
     var sent: usize = 0;
     const iterations_max: usize = bytes.len + 64;
@@ -295,21 +327,32 @@ pub fn write_fd_all(fd: i32, bytes: []const u8) void {
         const written: isize = write(fd, bytes[sent..].ptr, bytes.len - sent);
         if (written <= 0) {
             if (written < 0 and get_errno() == EINTR) continue;
-            return;
+            return false;
         }
         sent += @intCast(written);
     }
+    return sent == bytes.len;
+}
+
+pub fn write_fd_all(fd: i32, bytes: []const u8) void {
+    _ = write_fd_all_checked(fd, bytes);
 }
 
 pub fn print_stdout(comptime fmt: []const u8, args: anytype) void {
-    var stack_buffer: [8192]u8 = undefined;
-    const text = std.fmt.bufPrint(&stack_buffer, fmt, args) catch stack_buffer[0..];
+    var stack_buffer: [8192]u8 = @splat(0);
+    const text = std.fmt.bufPrint(&stack_buffer, fmt, args) catch blk: {
+        const len = std.mem.indexOfScalar(u8, &stack_buffer, 0) orelse stack_buffer.len;
+        break :blk stack_buffer[0..len];
+    };
     write_fd_all(1, text);
 }
 
 pub fn print_stderr(comptime fmt: []const u8, args: anytype) void {
-    var stack_buffer: [4096]u8 = undefined;
-    const text = std.fmt.bufPrint(&stack_buffer, fmt, args) catch stack_buffer[0..];
+    var stack_buffer: [4096]u8 = @splat(0);
+    const text = std.fmt.bufPrint(&stack_buffer, fmt, args) catch blk: {
+        const len = std.mem.indexOfScalar(u8, &stack_buffer, 0) orelse stack_buffer.len;
+        break :blk stack_buffer[0..len];
+    };
     write_fd_all(2, text);
 }
 

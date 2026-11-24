@@ -12,6 +12,13 @@ const weights_mod = @import("weights.zig");
 
 pub const TokenCallbackFn = *const fn (context: *anyopaque, token_id: i32) bool;
 
+pub const SampleParams = struct {
+    temperature: f32 = 0.0,
+    top_p: f32 = 0.95,
+    top_k: i32 = 0,
+    seed: u64 = 0,
+};
+
 pub const GenerateStats = struct {
     prompt_tokens: u32 = 0,
     cached_tokens: u32 = 0,
@@ -19,16 +26,101 @@ pub const GenerateStats = struct {
     prefill_ms: f64 = 0.0,
     decode_ms: f64 = 0.0,
     spec_steps: u32 = 0,
+    lookup_steps: u32 = 0,
     total_drafts: u32 = 0,
     total_accepted: u32 = 0,
     last_token_id: i32 = -1,
 };
 
+/// Zero-malloc O(1) n-gram prompt-lookup drafter (inspired by Atomic Engine's hybrid lookup + DSpark fallback).
+/// Keeps a recent 8,192-token ring and a 16,384-slot two-entry hash index (~320 KiB host RAM, 0 VRAM).
+/// On a >=16-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
+/// bypassing the DSpark neural pass completely (~5 ns CPU lookup vs ~400 us GPU draft).
+const PromptLookupIndex = struct {
+    const hist_cap: usize = 8_192;
+    const hist_mask: usize = hist_cap - 1;
+    const table_cap: usize = 16_384;
+    const table_mask: usize = table_cap - 1;
+    const min_match_len: u32 = 16;
+
+    hist: [hist_cap]i32 = @splat(0),
+    count: u32 = 0,
+    gen: u16 = 0,
+    table_hash: [table_cap]u64 = @splat(0),
+    table_pos0: [table_cap]u32 = @splat(0),
+    table_pos1: [table_cap]u32 = @splat(0),
+    table_gen: [table_cap]u16 = @splat(0),
+
+    fn reset(self: *PromptLookupIndex) void {
+        self.count = 0;
+        self.gen +%= 1;
+        if (self.gen == 0) {
+            @memset(&self.table_gen, 0);
+            self.gen = 1;
+        }
+    }
+
+    inline fn hash4(a: i32, b: i32, c: i32, d: i32) u64 {
+        var h: u64 = @as(u64, @bitCast(@as(i64, a))) *% 0x9E3779B97F4A7C15;
+        h = (h ^ @as(u64, @bitCast(@as(i64, b)))) *% 0xBF58476D1CE4E5B9;
+        h = (h ^ @as(u64, @bitCast(@as(i64, c)))) *% 0x94D049BB133111EB;
+        h = (h ^ @as(u64, @bitCast(@as(i64, d)))) *% 0x9E3779B97F4A7C15;
+        return h ^ (h >> 31);
+    }
+
+    inline fn at(self: *const PromptLookupIndex, abs_idx: u32) i32 {
+        return self.hist[abs_idx & hist_mask];
+    }
+
+    fn push(self: *PromptLookupIndex, tok: i32) void {
+        const idx = self.count;
+        self.hist[idx & hist_mask] = tok;
+        self.count = idx + 1;
+        if (self.count >= 4) {
+            const h = hash4(self.at(self.count - 4), self.at(self.count - 3), self.at(self.count - 2), self.at(self.count - 1));
+            const slot: usize = @intCast(h & table_mask);
+            if (self.table_gen[slot] == self.gen and self.table_hash[slot] == h) {
+                self.table_pos1[slot] = self.table_pos0[slot];
+                self.table_pos0[slot] = self.count;
+            } else {
+                self.table_hash[slot] = h;
+                self.table_pos0[slot] = self.count;
+                self.table_pos1[slot] = 0;
+                self.table_gen[slot] = self.gen;
+            }
+        }
+    }
+
+    fn match(self: *const PromptLookupIndex, out_drafts: *[constants.mtp_draft_count_max]i32) bool {
+        const n = self.count;
+        if (n < min_match_len + constants.mtp_draft_count_max + 1) return false;
+        const h = hash4(self.at(n - 4), self.at(n - 3), self.at(n - 2), self.at(n - 1));
+        const slot: usize = @intCast(h & table_mask);
+        if (self.table_gen[slot] != self.gen or self.table_hash[slot] != h) return false;
+
+        const cand: u32 = if (self.table_pos0[slot] == n) self.table_pos1[slot] else self.table_pos0[slot];
+        if (cand < min_match_len) return false;
+        if (cand + constants.mtp_draft_count_max >= n) return false;
+        const win_lo: u32 = if (n > hist_cap) (n - @as(u32, @intCast(hist_cap))) else 0;
+        if (cand - min_match_len < win_lo) return false;
+
+        var k: u32 = 1;
+        while (k <= min_match_len) : (k += 1) {
+            if (self.at(cand - k) != self.at(n - k)) return false;
+        }
+        var j: u32 = 0;
+        while (j < constants.mtp_draft_count_max) : (j += 1) {
+            out_drafts[j] = self.at(cand + j);
+        }
+        return true;
+    }
+};
+
 const prefix_checkpoint_count: usize = 4;
 const side_shield_max_tokens: u32 = 4096;
-const prefill_batch_max: u32 = 512;
+const prefill_batch_max: u32 = 2048;
 const prefill_local_attn_sub: u32 = 256;
-const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 64
+const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256
 
 inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
     const bytes: [*]u8 = @ptrCast(base);
@@ -53,31 +145,45 @@ const PrefixCache = struct {
 };
 
 pub const Engine = struct {
-    weights: ?*weights_mod.ModelWeights = null,
+    weights: ?*const weights_mod.ModelWeights = null,
     context_tokens_max: u32 = 0,
     use_graphs: bool = true,
     kv_format: constants.KVFormat = .fp8,
+    local_kv_format: constants.KVFormat = .bf16,
     current_position: i32 = 0,
     schedule: [constants.visit_count]constants.VisitInfo = undefined,
 
     arena: vram_arena.VRAMArena = .{},
-    expert_cache: expert_cache_mod.ExpertCache = .{},
     stream: ?*anyopaque = null,
     aux_stream: ?*anyopaque = null,
     fork_event: ?*anyopaque = null,
     join_event: ?*anyopaque = null,
+    done_event: ?*anyopaque = null,
 
     // Cached CUDA Graphs
     b1_graph_exec: ?*anyopaque = null,
     spec_graph_exec: [constants.mtp_draft_count_max + 1]?*anyopaque = @splat(null),
+    draft_graph_exec: ?*anyopaque = null,
+    verify_b8_graph_exec: ?*anyopaque = null,
+    adaptive_graph: ?*anyopaque = null,
+    adaptive_graph_threshold: f32 = -1.0,
+    spec_threshold: f32 = 0.80,
+    use_prompt_lookup: bool = true,
     prefill_b8_graph_exec: [2]?*anyopaque = .{ null, null },
 
-    // Pinned host readback buffers (zero-malloc decode loop)
+    // Pinned host readback/upload buffers (zero-malloc decode loop)
     h_accepted: ?[*]i32 = null,
     h_num_accepted: ?*i32 = null,
+    h_chosen_width: ?*i32 = null,
+    h_lookup_drafts: ?[*]i32 = null,
 
     // Multi-checkpoint host-RAM prefix KV cache (zero extra VRAM!)
     prefix_cache: PrefixCache = .{},
+    prompt_lookup: PromptLookupIndex = .{},
+    expert_cache: expert_cache_mod.ExpertCache = .{},
+    prefill_batch_cap: u32 = prefill_batch_max,
+    prefill_tail_slots: u32 = 0,
+    prefill_aliased: bool = false,
 
     // Per-visit KV caches and sconv rings
     kv_cap: [constants.visit_count]i32 = @splat(0),
@@ -105,6 +211,8 @@ pub const Engine = struct {
     d_next_tokens: [*]i32 = undefined,
     d_anchor: *i32 = undefined,
     d_drafts: [*]i32 = undefined,
+    d_draft_conf: [*]f32 = undefined,
+    d_chosen_width: *i32 = undefined,
     d_accepted: [*]i32 = undefined,
     d_num_acc: *i32 = undefined,
 
@@ -143,6 +251,12 @@ pub const Engine = struct {
     ds_ws: [*]f32 = undefined,
     lm_blk_val: [*]f32 = undefined,
     lm_blk_idx: [*]i32 = undefined,
+    lm_logits: [*]f32 = undefined,
+    d_draft_probs: [*]f32 = undefined,
+    d_draft_q_sel: [*]f32 = undefined,
+    d_draft_is_delta: *i32 = undefined,
+    d_sample_cfg: *cuda.CSampleConfig = undefined,
+    sample_params: SampleParams = .{},
 
     // Fast batched prefill scratch (B <= 256, ~119 MiB total inside same VRAMArena)
     p_tokens: [*]i32 = undefined,
@@ -184,13 +298,10 @@ pub const Engine = struct {
 
     pub fn init(
         self: *Engine,
-        weights: *weights_mod.ModelWeights,
+        weights: *const weights_mod.ModelWeights,
         context_tokens_max: u32,
         use_graphs: bool,
         kv_format: constants.KVFormat,
-        cache_mib: u32,
-        cache_headroom_mib: u32,
-        cache_file_path: []const u8,
     ) void {
         tiger.assert(context_tokens_max >= 64);
         tiger.assert(self.arena.base_ptr == null);
@@ -199,23 +310,36 @@ pub const Engine = struct {
         self.context_tokens_max = context_tokens_max;
         self.use_graphs = use_graphs;
         self.kv_format = kv_format;
+        const force_local_bf16: bool = (tiger.getenv("SQUID_LOCAL_KV_BF16") != null);
+        self.local_kv_format = if (weights.use_expert_cache and kv_format != .bf16 and !force_local_bf16) .fp8 else .bf16;
         self.schedule = constants.build_visit_schedule();
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.stream));
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.aux_stream));
         tiger.assert_cuda(cuda.squid_cuda_event_create(&self.fork_event, 1));
         tiger.assert_cuda(cuda.squid_cuda_event_create(&self.join_event, 1));
+        tiger.assert_cuda(cuda.squid_cuda_event_create(&self.done_event, 1));
 
         const expert_groups_bytes: u64 = cuda.squid_sizeof_expert_groups();
         tiger.assert(expert_groups_bytes > 0);
         const has_dspark: bool = (weights.dspark.loaded != 0);
+        const draft_vocab_size: u32 = if (has_dspark and weights.dspark.draft_vocab_size > 0)
+            @intCast(weights.dspark.draft_vocab_size)
+        else
+            constants.vocab_unpadded_count;
+        const alias_prefill: bool = weights.use_expert_cache;
+        self.prefill_aliased = alias_prefill;
+        self.prefill_batch_cap = if (alias_prefill) 1024 else prefill_batch_max;
 
         // Pass 1: compute exact aligned runtime VRAM requirement -> 1 single cudaMalloc!
         const runtime_bytes: u64 = compute_runtime_vram_bytes(
             &self.schedule,
             context_tokens_max,
             kv_format,
+            self.local_kv_format,
             has_dspark,
+            draft_vocab_size,
+            alias_prefill,
             expert_groups_bytes,
         );
         self.arena = vram_arena.VRAMArena.init(runtime_bytes);
@@ -225,7 +349,7 @@ pub const Engine = struct {
         while (vi < constants.visit_count) : (vi += 1) {
             const is_glob: bool = self.schedule[vi].is_global;
             const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
-            const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
+            const vfmt: constants.KVFormat = if (is_glob) kv_format else self.local_kv_format;
             self.kv_cap[vi] = @intCast(cap);
             self.alloc_kv_pair(cap, vfmt, &self.k_cache[vi], &self.v_cache[vi], &self.k_scale[vi], &self.v_scale[vi]);
             self.k_ring[vi] = self.arena.alloc_many(f32, constants.sconv_ring_slots * constants.kv_dim);
@@ -259,6 +383,8 @@ pub const Engine = struct {
         self.d_next_tokens = self.arena.alloc_many(i32, b_max);
         self.d_anchor = self.arena.alloc_one(i32);
         self.d_drafts = self.arena.alloc_many(i32, constants.mtp_draft_count_max);
+        self.d_draft_conf = self.arena.alloc_many(f32, constants.mtp_draft_count_max);
+        self.d_chosen_width = self.arena.alloc_one(i32);
         self.d_accepted = self.arena.alloc_many(i32, b_max);
         self.d_num_acc = self.arena.alloc_one(i32);
 
@@ -269,6 +395,13 @@ pub const Engine = struct {
         var h_nacc_raw: ?*anyopaque = null;
         tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_nacc_raw, @sizeOf(i32), 0));
         self.h_num_accepted = @ptrCast(@alignCast(h_nacc_raw.?));
+
+        var h_cw_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_cw_raw, @sizeOf(i32), 0));
+        self.h_chosen_width = @ptrCast(@alignCast(h_cw_raw.?));
+        var h_ld_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ld_raw, constants.mtp_draft_count_max * @sizeOf(i32), 0));
+        self.h_lookup_drafts = @ptrCast(@alignCast(h_ld_raw.?));
 
         self.hidden = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.prelude = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -303,73 +436,157 @@ pub const Engine = struct {
         self.moe_act_h = self.arena.alloc_raw(b_max * constants.top_k_experts * constants.intermediate_dim * 2);
         self.moe_down = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.moe_slot_out = self.arena.alloc_many(f32, b_max * constants.top_k_experts * constants.hidden_dim);
-        self.taps = self.arena.alloc_many(f32, 4 * b_max * constants.hidden_dim);
-        self.ds_mix = self.arena.alloc_many(f32, 3 * b_max * constants.hidden_dim);
-        self.ds_kv = self.arena.alloc_many(f32, b_max * 2 * constants.kv_dim);
-        self.ds_ws = self.arena.alloc_many(f32, constants.dspark_workspace_floats);
+        if (has_dspark) {
+            self.taps = self.arena.alloc_many(f32, 4 * b_max * constants.hidden_dim);
+            self.ds_mix = self.arena.alloc_many(f32, 3 * b_max * constants.hidden_dim);
+            self.ds_kv = self.arena.alloc_many(f32, b_max * 2 * constants.kv_dim);
+            self.ds_ws = self.arena.alloc_many(f32, constants.dspark_workspace_floats);
+        }
         self.lm_blk_val = self.arena.alloc_many(f32, b_max * 1024);
         self.lm_blk_idx = self.arena.alloc_many(i32, b_max * 1024);
-
-        // Fast batched prefill arena (B <= 256)
-        const pb: u64 = prefill_batch_max;
-        self.p_tokens = self.arena.alloc_many(i32, pb);
-        self.p_pos_vec = self.arena.alloc_many(i32, prefill_sub_chunks_max);
-        self.p_hidden = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_prelude = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_partial = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_blocks = self.arena.alloc_many(f32, pb * 4 * constants.hidden_dim);
-        self.p_saved = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_prior_last = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        s_idx = 0;
-        while (s_idx < 3) : (s_idx += 1) {
-            self.p_attn_in[s_idx] = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-            self.p_attn_in_h[s_idx] = self.arena.alloc_raw(pb * constants.hidden_dim * 2);
+        self.lm_logits = self.arena.alloc_many(f32, b_max * constants.vocab_unpadded_count);
+        if (has_dspark) {
+            self.d_draft_probs = self.arena.alloc_many(f32, @as(u64, constants.mtp_draft_count_max) * draft_vocab_size);
+        } else {
+            self.d_draft_probs = self.arena.alloc_many(f32, 1);
         }
-        self.p_qrgs = self.arena.alloc_many(f32, pb * constants.qrgs_out_dim);
-        self.p_k_proj = self.arena.alloc_many(f32, pb * constants.kv_dim);
-        self.p_v_proj = self.arena.alloc_many(f32, pb * constants.kv_dim);
-        self.p_attn_gated_h = self.arena.alloc_raw(pb * constants.query_dim * 2);
-        self.p_o_proj = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_residual = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_mlp_in = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_mlp_normed = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_mlp_normed_h = self.arena.alloc_raw(pb * constants.hidden_dim * 2);
-        self.p_router_logits = self.arena.alloc_many(f32, pb * constants.expert_count);
-        self.p_route_ids = self.arena.alloc_many(i32, pb * constants.top_k_experts);
-        self.p_route_w = self.arena.alloc_many(f32, pb * constants.top_k_experts);
-        self.p_exp_offsets = self.arena.alloc_many(i32, 1024);
-        self.p_sorted_tok = self.arena.alloc_many(i32, pb * constants.top_k_experts);
-        self.p_sorted_slot = self.arena.alloc_many(i32, pb * constants.top_k_experts);
-        self.p_sorted_w = self.arena.alloc_many(f32, pb * constants.top_k_experts);
-        self.p_moe_act_h = self.arena.alloc_raw(pb * constants.top_k_experts * constants.intermediate_dim * 2);
-        self.p_moe_slot_out = self.arena.alloc_many(f32, pb * constants.top_k_experts * constants.hidden_dim);
-        self.p_taps = self.arena.alloc_many(f32, 4 * pb * constants.hidden_dim);
-        self.p_w_f16 = self.arena.alloc_raw(@as(u64, constants.qrgs_out_dim) * constants.hidden_dim * 2);
-        self.p_ctrl_msg = self.arena.alloc_many(f32, pb * constants.hidden_dim);
-        self.p_ctrl_cat_h = self.arena.alloc_raw(pb * 2 * constants.hidden_dim * 2);
-        self.p_ctrl_d = self.arena.alloc_many(f32, pb * constants.gate_rank);
-        self.p_ctrl_d_h = self.arena.alloc_raw(pb * constants.gate_rank * 2);
-        // Alias p_ctrl_f and p_ctrl_g inside p_qrgs (non-overlapping lifetimes: 2*2304=4608 <= 6552)
-        self.p_ctrl_f = self.p_qrgs;
-        self.p_ctrl_g = self.p_qrgs + pb * constants.hidden_dim;
+        self.d_draft_q_sel = self.arena.alloc_many(f32, constants.mtp_draft_count_max);
+        self.d_draft_is_delta = self.arena.alloc_one(i32);
+        self.d_sample_cfg = self.arena.alloc_one(cuda.CSampleConfig);
+        const zero_cfg: cuda.CSampleConfig = .{};
+        const zero_i32: i32 = 0;
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_draft_is_delta), @ptrCast(&zero_i32), @sizeOf(i32), self.stream));
+
+        if (!alias_prefill) {
+            // Fast batched prefill arena (carved permanently in VRAM on >=16 GB GPUs)
+            const p_bytes: u64 = compute_prefill_scratch_bytes(prefill_batch_max);
+            const p_base: [*]u8 = @ptrCast(self.arena.alloc_raw(p_bytes));
+            self.bind_prefill_scratch_from_base(p_base, prefill_batch_max);
+        }
 
         // Paired TigerStyle invariant: Pass 1 == Pass 2!
         self.arena.assert_exact_fill();
 
-        // Pre-initialize cuBLAS handle during startup so Chunk 0 prefill pays 0ms cold handle creation
-        // and so cuBLAS workspace is already accounted for before ExpertCache queries free VRAM!
+        // Pre-initialize cuBLAS handle during startup so Chunk 0 prefill pays 0ms cold handle creation.
         cuda.squid_launch_prefill_warmup_cublas(self.stream);
-
-        if (weights.use_expert_cache) {
-            self.expert_cache.init(weights, cache_mib, cache_headroom_mib, cache_file_path, self.stream);
-        }
 
         const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices) | graphs={s}\n",
-            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, if (use_graphs) "on" else "off" },
+            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices, prefill_alias={d}) | graphs={s}\n",
+            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, @as(u8, if (alias_prefill) 1 else 0), if (use_graphs) "on" else "off" },
         );
         self.reset();
+    }
+
+    pub fn init_expert_cache(
+        self: *Engine,
+        weights: *weights_mod.ModelWeights,
+        requested_cache_mib: u32,
+        headroom_mib: u32,
+        cache_file_path: []const u8,
+    ) void {
+        if (!weights.use_expert_cache) return;
+        self.expert_cache.init(weights, requested_cache_mib, headroom_mib, cache_file_path, self.stream);
+        if (self.prefill_aliased) {
+            // Choose largest prefill batch size (default 1024 -> TM=128 wgemm, overridable via SQUID_PREFILL_BATCH)
+            // that cleanly fits in the tail of d_cache_pool while keeping >= 64 active slots during prefill.
+            var desired_pb: u32 = 1024;
+            if (tiger.getenv("SQUID_PREFILL_BATCH")) |pb_env| {
+                const parsed = std.fmt.parseInt(u32, std.mem.span(pb_env), 10) catch 1024;
+                if (parsed == 256 or parsed == 512 or parsed == 1024 or parsed == 2048) desired_pb = parsed;
+            }
+            const slot_bytes: u64 = constants.expert_slot_bytes;
+            const candidates = [_]u32{ desired_pb, 1024, 512, 256, 128, 64 };
+            var chosen_pb: u32 = 0;
+            var chosen_slots: u32 = 0;
+            for (candidates) |cand_pb| {
+                if (cand_pb > desired_pb) continue;
+                const need_bytes: u64 = compute_prefill_scratch_bytes(cand_pb);
+                const need_slots: u32 = @intCast((need_bytes + slot_bytes - 1) / slot_bytes);
+                const min_active: u32 = if (cand_pb <= 64) 16 else 32;
+                if (need_slots + min_active < self.expert_cache.num_slots) {
+                    chosen_pb = cand_pb;
+                    chosen_slots = need_slots;
+                    break;
+                }
+            }
+            if (chosen_pb == 0) {
+                const min_slots_needed: u32 = @as(u32, @intCast((compute_prefill_scratch_bytes(64) + slot_bytes - 1) / slot_bytes)) + 17;
+                tiger.print_stderr(
+                    "[engine] ERROR: expert cache has only {d} slots ({d:.1} MiB), need >= {d} slots ({d:.1} MiB) for prefill tail aliasing; increase --cache-mib or free VRAM.\n",
+                    .{
+                        self.expert_cache.num_slots,
+                        @as(f64, @floatFromInt(@as(u64, self.expert_cache.num_slots) * slot_bytes)) / (1024.0 * 1024.0),
+                        min_slots_needed,
+                        @as(f64, @floatFromInt(@as(u64, min_slots_needed) * slot_bytes)) / (1024.0 * 1024.0),
+                    },
+                );
+                std.process.exit(1);
+            }
+            self.prefill_batch_cap = chosen_pb;
+            self.prefill_tail_slots = chosen_slots;
+            tiger.print_stdout(
+                "[engine] Prefill-scratch tail aliasing: pb={d} borrows {d} tail slots ({d:.1} MiB) during prefill -> 0.0 MiB permanent overhead in decode!\n",
+                .{ chosen_pb, chosen_slots, @as(f64, @floatFromInt(@as(u64, chosen_slots) * slot_bytes)) / (1024.0 * 1024.0) },
+            );
+        }
+    }
+
+    fn bind_prefill_scratch_from_base(self: *Engine, base: [*]u8, pb_u32: u32) void {
+        const pb: u64 = pb_u32;
+        const a: u64 = constants.vram_alignment_bytes;
+        var off: u64 = 0;
+
+        const next_raw = struct {
+            fn take(b: [*]u8, cursor: *u64, bytes: u64, align_bytes: u64) *anyopaque {
+                const ptr: *anyopaque = @ptrCast(b + @as(usize, @intCast(cursor.*)));
+                cursor.* += tiger.align_up_u64(bytes, align_bytes);
+                return ptr;
+            }
+        }.take;
+
+        self.p_tokens = @ptrCast(@alignCast(next_raw(base, &off, pb * 4, a)));
+        self.p_pos_vec = @ptrCast(@alignCast(next_raw(base, &off, prefill_sub_chunks_max * 4, a)));
+        self.p_hidden = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_prelude = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_partial = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_blocks = @ptrCast(@alignCast(next_raw(base, &off, pb * 4 * constants.hidden_dim * 4, a)));
+        self.p_saved = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_prior_last = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        var s_idx: u32 = 0;
+        while (s_idx < 3) : (s_idx += 1) {
+            self.p_attn_in[s_idx] = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+            self.p_attn_in_h[s_idx] = next_raw(base, &off, pb * constants.hidden_dim * 2, a);
+        }
+        self.p_qrgs = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.qrgs_out_dim * 4, a)));
+        self.p_k_proj = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.kv_dim * 4, a)));
+        self.p_v_proj = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.kv_dim * 4, a)));
+        self.p_attn_gated_h = next_raw(base, &off, pb * constants.query_dim * 2, a);
+        self.p_o_proj = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_residual = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_mlp_in = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_mlp_normed = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_mlp_normed_h = next_raw(base, &off, pb * constants.hidden_dim * 2, a);
+        self.p_router_logits = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.expert_count * 4, a)));
+        self.p_route_ids = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * 4, a)));
+        self.p_route_w = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * 4, a)));
+        self.p_exp_offsets = @ptrCast(@alignCast(next_raw(base, &off, 1024 * 4, a)));
+        self.p_sorted_tok = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * 4, a)));
+        self.p_sorted_slot = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * 4, a)));
+        self.p_sorted_w = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * 4, a)));
+        self.p_moe_act_h = next_raw(base, &off, pb * constants.top_k_experts * constants.intermediate_dim * 2, a);
+        self.p_moe_slot_out = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.top_k_experts * constants.hidden_dim * 4, a)));
+        self.p_taps = @ptrCast(@alignCast(next_raw(base, &off, 4 * pb * constants.hidden_dim * 4, a)));
+        self.p_w_f16 = next_raw(base, &off, @as(u64, constants.qrgs_out_dim) * constants.hidden_dim * 2, a);
+        self.p_ctrl_msg = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.hidden_dim * 4, a)));
+        self.p_ctrl_cat_h = next_raw(base, &off, pb * 2 * constants.hidden_dim * 2, a);
+        self.p_ctrl_d = @ptrCast(@alignCast(next_raw(base, &off, pb * constants.gate_rank * 4, a)));
+        self.p_ctrl_d_h = next_raw(base, &off, pb * constants.gate_rank * 2, a);
+        self.p_ctrl_f = self.p_qrgs;
+        self.p_ctrl_g = self.p_qrgs + pb * constants.hidden_dim;
+
+        tiger.assert(off == compute_prefill_scratch_bytes(pb_u32));
     }
 
     pub fn deinit(self: *Engine) void {
@@ -378,15 +595,21 @@ pub const Engine = struct {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
             g.* = null;
         }
+        if (self.draft_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+        if (self.verify_b8_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+        if (self.adaptive_graph) |g| tiger.assert_cuda(cuda.squid_adaptive_graph_destroy(g));
         for (&self.prefill_b8_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
             g.* = null;
         }
         if (self.h_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_num_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
-        self.deinit_prefix_cache();
+        if (self.h_chosen_width) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
+        if (self.h_lookup_drafts) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         self.expert_cache.deinit();
+        self.deinit_prefix_cache();
         self.arena.deinit();
+        if (self.done_event) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
         if (self.fork_event) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
         if (self.join_event) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
         if (self.aux_stream) |s| tiger.assert_cuda(cuda.squid_cuda_stream_destroy(s));
@@ -456,7 +679,8 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                total += 2 * @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                total += 2 * sz.data + 2 * sz.scale;
             }
             total += 2 * constants.sconv_ring_slots * constants.kv_dim * 4;
             total += 2 * constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -506,11 +730,17 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, kv_bytes, self.stream));
-                off += kv_bytes;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_cache[vi].?, sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.k_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), self.v_scale[vi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -554,11 +784,17 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             if (!self.schedule[vi].is_global) {
-                const kv_bytes: usize = @as(usize, @intCast(self.kv_cap[vi])) * constants.kv_dim * 2;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), kv_bytes, self.stream));
-                off += kv_bytes;
+                const sz = global_kv_bytes_for_tokens(self.local_kv_format, @intCast(self.kv_cap[vi]));
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[vi].?, @ptrCast(src[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_scale[vi].?, @ptrCast(src[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                }
             }
             const kv_ring_bytes: usize = constants.sconv_ring_slots * constants.kv_dim * 4;
             const h_ring_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
@@ -694,6 +930,16 @@ pub const Engine = struct {
         const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
         const prompt_len: u32 = @intCast(prompt.len);
 
+        // Upload per-request sampling config to device (zero CUDA graph rebuild!).
+        const cfg_h: cuda.CSampleConfig = .{
+            .inv_temp = if (self.sample_params.temperature >= 1e-4) (1.0 / self.sample_params.temperature) else 0.0,
+            .top_p = self.sample_params.top_p,
+            .top_k = self.sample_params.top_k,
+            .pad = 0,
+            .seed = self.sample_params.seed,
+        };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&cfg_h), @sizeOf(cuda.CSampleConfig), self.stream));
+
         // --- PREFIX KV CACHE MATCHING & SIDE-REQUEST SHIELDING ---
         const prefill_start_ns: u64 = tiger.clock_monotonic_ns();
         var start_pos: u32 = 0;
@@ -756,6 +1002,12 @@ pub const Engine = struct {
         };
 
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
+        // Invalidate any stale checkpoints past the branch point `start_pos` BEFORE prefill writes new KV!
+        if (self.prefix_cache.enabled and shield_tokens == 0) {
+            for (&self.prefix_cache.checkpoints) |*ckpt| {
+                if (ckpt.valid and ckpt.pos > start_pos) ckpt.valid = false;
+            }
+        }
         const rem_tokens: u32 = prompt_len - start_pos;
         if (self.use_graphs and rem_tokens > constants.mtp_block_size_max) {
             self.ensure_prefill_b8_graph(use_mtp);
@@ -793,9 +1045,12 @@ pub const Engine = struct {
         var first_tok: i32 = 0;
         tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(&first_tok), @ptrCast(self.d_next_tokens + (last_batch - 1)), @sizeOf(i32), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-        self.expert_cache.copy_touches_d2h_async(self.stream);
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-        self.expert_cache.process_prefill_chunk(w, last_batch, self.stream);
+
+        // Phase 2A: immediately return borrowed prefill-scratch tail slots to decode's free list!
+        if (self.prefill_aliased and self.expert_cache.prefill_reserved_tail > 0) {
+            self.expert_cache.release_prefill_scratch(self.stream, true);
+        }
 
         // Update session tokens & save prefill_end checkpoint (Slot 2) BEFORE decode overwrites rings/local KV!
         if (self.prefix_cache.enabled and shield_tokens == 0) {
@@ -821,9 +1076,13 @@ pub const Engine = struct {
         if (first_tok == constants.eos_token_id or stats.generated_tokens >= max_new_tokens) return stats;
 
         // Prepare decode CUDA Graph before starting decode timer
+        const use_adaptive: bool = use_mtp and self.use_graphs and num_drafts == constants.mtp_draft_count_max and self.spec_threshold > 0.0;
         if (!use_mtp) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
             self.ensure_b1_graph();
+        } else if (use_adaptive) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_anchor), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
+            self.ensure_adaptive_graphs();
         } else {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_anchor), @ptrCast(&first_tok), @sizeOf(i32), self.stream));
             self.ensure_spec_graph(num_drafts);
@@ -832,19 +1091,21 @@ pub const Engine = struct {
 
         // --- DECODE ---
         var prev_fed_tok: i32 = first_tok;
+        var decode_stop_now: bool = false;
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
         if (!use_mtp) {
-            while (stats.generated_tokens < max_new_tokens) {
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
-                    self.record_target_forward(1, false, true);
+                    self.expert_cache.record_zero_touches(self.stream);
+                    self.record_target_forward(1, false, true, false);
                     cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 }
-                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
                 self.expert_cache.copy_touches_d2h_async(self.stream);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                self.expert_cache.process_decode_step(w, self.stream);
+                self.expert_cache.process_decode_step(w, 1, self.stream);
 
                 if (self.prefix_cache.enabled and shield_tokens == 0 and self.prefix_cache.session_len < self.context_tokens_max) {
                     self.prefix_cache.session_tokens[self.prefix_cache.session_len] = prev_fed_tok;
@@ -857,13 +1118,115 @@ pub const Engine = struct {
                 stats.last_token_id = tok;
                 self.current_position += 1;
                 if (on_token) |cb| {
-                    if (!cb(callback_context.?, tok)) break;
+                    if (!cb(callback_context.?, tok)) {
+                        decode_stop_now = true;
+                        break;
+                    }
                 }
-                if (tok == constants.eos_token_id) break;
+                if (tok == constants.eos_token_id) {
+                    decode_stop_now = true;
+                    break;
+                }
+            }
+        } else if (use_adaptive) {
+            // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
+            // Seed prompt-lookup ring with trailing prompt tokens + first_tok (<=8192 tok -> <25 us CPU).
+            if (self.use_prompt_lookup) {
+                self.prompt_lookup.reset();
+                const seed_start: usize = if (prompt.len > PromptLookupIndex.hist_cap) (prompt.len - PromptLookupIndex.hist_cap) else 0;
+                for (prompt[seed_start..]) |ptok| self.prompt_lookup.push(ptok);
+                self.prompt_lookup.push(first_tok);
+            }
+
+            var draft_in_flight: bool = false;
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + constants.mtp_block_size_max <= self.context_tokens_max) {
+                var lookup_hit: bool = false;
+                if (self.use_prompt_lookup) {
+                    const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
+                    if (self.prompt_lookup.match(out_ptr)) {
+                        lookup_hit = true;
+                        const one_i32: i32 = 1;
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                            @ptrCast(self.d_draft_is_delta),
+                            @ptrCast(&one_i32),
+                            @sizeOf(i32),
+                            self.stream,
+                        ));
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                            @ptrCast(self.d_drafts),
+                            @ptrCast(self.h_lookup_drafts.?),
+                            constants.mtp_draft_count_max * @sizeOf(i32),
+                            self.stream,
+                        ));
+                        tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.verify_b8_graph_exec.?, self.stream));
+                        self.expert_cache.copy_touches_d2h_async(self.stream);
+                        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                        draft_in_flight = false;
+                        stats.lookup_steps += 1;
+                    }
+                }
+                if (!lookup_hit) {
+                    if (!draft_in_flight) {
+                        tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
+                    }
+                    tiger.assert_cuda(cuda.squid_adaptive_graph_launch(self.adaptive_graph.?, self.stream));
+                    self.expert_cache.copy_touches_d2h_async(self.stream);
+                    tiger.assert_cuda(cuda.squid_cuda_event_record(self.done_event, self.stream));
+                    // Overlap next round's DSpark draft while host reads verified tokens & emits SSE!
+                    tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
+                    draft_in_flight = true;
+                    tiger.assert_cuda(cuda.squid_cuda_event_sync(self.done_event));
+                }
+
+                const n_acc_i32: i32 = self.h_num_accepted.?.*;
+                const chosen_w_i32: i32 = if (lookup_hit) constants.mtp_block_size_max else self.h_chosen_width.?.*;
+                tiger.assert(chosen_w_i32 == 1 or chosen_w_i32 == 2 or chosen_w_i32 == 4 or chosen_w_i32 == 8);
+                tiger.assert(n_acc_i32 >= 1 and n_acc_i32 <= chosen_w_i32);
+                const n_acc: u32 = @intCast(n_acc_i32);
+                self.expert_cache.process_decode_step(w, n_acc, self.stream);
+
+                if (self.prefix_cache.enabled and shield_tokens == 0) {
+                    var ci: u32 = 0;
+                    while (ci < n_acc and self.prefix_cache.session_len < self.context_tokens_max) : (ci += 1) {
+                        const fed: i32 = if (ci == 0) prev_fed_tok else self.h_accepted.?[ci - 1];
+                        self.prefix_cache.session_tokens[self.prefix_cache.session_len] = fed;
+                        self.prefix_cache.session_len += 1;
+                    }
+                }
+                prev_fed_tok = self.h_accepted.?[n_acc - 1];
+
+                stats.spec_steps += 1;
+                stats.total_drafts += @intCast(chosen_w_i32 - 1);
+                stats.total_accepted += (n_acc - 1);
+                self.current_position += n_acc_i32;
+
+                var idx: u32 = 0;
+                while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
+                    const tok: i32 = self.h_accepted.?[idx];
+                    if (self.use_prompt_lookup) self.prompt_lookup.push(tok);
+                    if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
+                    stats.generated_tokens += 1;
+                    stats.last_token_id = tok;
+                    if (on_token) |cb| {
+                        if (!cb(callback_context.?, tok)) {
+                            decode_stop_now = true;
+                            break;
+                        }
+                    }
+                    if (tok == constants.eos_token_id) {
+                        decode_stop_now = true;
+                        break;
+                    }
+                }
+                if (decode_stop_now) break;
+            }
+            // Drain any trailing overlapped draft cleanly before returning or falling back to B=1 tail
+            if (draft_in_flight) {
+                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
             }
         } else {
             const batch: i32 = @intCast(num_drafts + 1);
-            while (stats.generated_tokens < max_new_tokens) {
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + @as(u32, @intCast(batch)) <= self.context_tokens_max) {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.spec_graph_exec[num_drafts].?, self.stream));
                 } else {
@@ -886,22 +1249,28 @@ pub const Engine = struct {
                         self.ds_f_ring.?,
                         self.ds_ws,
                         self.d_drafts,
+                        null,
+                        self.d_sample_cfg,
+                        self.d_draft_probs,
+                        self.d_draft_q_sel,
+                        self.d_draft_is_delta,
                         self.stream,
                     );
                     cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
-                    self.record_target_forward(batch, true, true);
+                    self.expert_cache.record_zero_touches(self.stream);
+                    self.record_target_forward(batch, true, true, true);
                     cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
                 }
 
+                self.expert_cache.copy_touches_d2h_async(self.stream);
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_num_accepted.?), @ptrCast(self.d_num_acc), @sizeOf(i32), self.stream));
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_accepted), @as(usize, @intCast(batch)) * @sizeOf(i32), self.stream));
-                self.expert_cache.copy_touches_d2h_async(self.stream);
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                self.expert_cache.process_decode_step(w, self.stream);
 
                 const n_acc_i32: i32 = self.h_num_accepted.?.*;
                 tiger.assert(n_acc_i32 >= 1 and n_acc_i32 <= batch);
                 const n_acc: u32 = @intCast(n_acc_i32);
+                self.expert_cache.process_decode_step(w, n_acc, self.stream);
 
                 // The n_acc tokens that were actually fed into the KV cache are [prev_fed_tok, h_accepted[0..n_acc-1]]!
                 if (self.prefix_cache.enabled and shield_tokens == 0) {
@@ -911,15 +1280,14 @@ pub const Engine = struct {
                         self.prefix_cache.session_tokens[self.prefix_cache.session_len] = fed;
                         self.prefix_cache.session_len += 1;
                     }
-                    prev_fed_tok = self.h_accepted.?[n_acc - 1];
                 }
+                prev_fed_tok = self.h_accepted.?[n_acc - 1];
 
                 stats.spec_steps += 1;
                 stats.total_drafts += num_drafts;
                 stats.total_accepted += (n_acc - 1);
                 self.current_position += n_acc_i32;
 
-                var stop_now: bool = false;
                 var idx: u32 = 0;
                 while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
                     const tok: i32 = self.h_accepted.?[idx];
@@ -928,16 +1296,46 @@ pub const Engine = struct {
                     stats.last_token_id = tok;
                     if (on_token) |cb| {
                         if (!cb(callback_context.?, tok)) {
-                            stop_now = true;
+                            decode_stop_now = true;
                             break;
                         }
                     }
                     if (tok == constants.eos_token_id) {
-                        stop_now = true;
+                        decode_stop_now = true;
                         break;
                     }
                 }
-                if (stop_now) break;
+                if (decode_stop_now) break;
+            }
+        }
+        // Safe B=1 tail when within <mtp_block_size_max tokens of context_tokens_max:
+        // prevents speculative verify from wrapping global KV indices onto slots 0..6!
+        if (use_mtp and !decode_stop_now and stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&prev_fed_tok), @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
+                self.expert_cache.record_zero_touches(self.stream);
+                self.record_target_forward(1, true, true, false);
+                cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
+                self.expert_cache.copy_touches_d2h_async(self.stream);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
+                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                self.expert_cache.process_decode_step(w, 1, self.stream);
+
+                if (self.prefix_cache.enabled and shield_tokens == 0 and self.prefix_cache.session_len < self.context_tokens_max) {
+                    self.prefix_cache.session_tokens[self.prefix_cache.session_len] = prev_fed_tok;
+                    self.prefix_cache.session_len += 1;
+                }
+                const tok: i32 = self.h_accepted.?[0];
+                prev_fed_tok = tok;
+                if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
+                stats.generated_tokens += 1;
+                stats.last_token_id = tok;
+                self.current_position += 1;
+                if (on_token) |cb| {
+                    if (!cb(callback_context.?, tok)) break;
+                }
+                if (tok == constants.eos_token_id) break;
             }
         }
         stats.decode_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - decode_start_ns)) / 1_000_000.0;
@@ -954,10 +1352,10 @@ pub const Engine = struct {
     fn prefill_range(self: *Engine, prompt: []const i32, start_i: u32, end_i: u32, use_mtp: bool, compute_last_lm: bool) u32 {
         tiger.assert(end_i >= start_i);
         var i: u32 = start_i;
-        // Fast batched Tensor Core + multi-token MoE prefill (chunks of 32..256, multiples of 8)
+        // Fast batched Tensor Core + multi-token MoE prefill (chunks of 32..prefill_batch_cap, multiples of 8)
         while (end_i - i >= 32 and (!compute_last_lm or end_i - i > 32)) {
             const avail: u32 = if (compute_last_lm) (end_i - i - 1) else (end_i - i);
-            const chunk: u32 = @min(prefill_batch_max, avail & ~@as(u32, 7));
+            const chunk: u32 = @min(self.prefill_batch_cap, avail & ~@as(u32, 7));
             if (chunk < 32) break;
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
@@ -982,7 +1380,7 @@ pub const Engine = struct {
             const is_last: bool = compute_last_lm and (i + batch == end_i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
             self.current_position += @intCast(batch);
             i += batch;
         }
@@ -995,7 +1393,7 @@ pub const Engine = struct {
         // Fast batched Tensor Core + multi-token MoE prefill leaving 1..31 tokens for final lm_head chunk
         while (prompt_len - i > 32) {
             const avail: u32 = prompt_len - i - 1;
-            const chunk: u32 = @min(prefill_batch_max, avail & ~@as(u32, 7));
+            const chunk: u32 = @min(self.prefill_batch_cap, avail & ~@as(u32, 7));
             if (chunk < 32) break;
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
@@ -1021,7 +1419,7 @@ pub const Engine = struct {
             const is_last: bool = (i + batch == prompt_len);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;
@@ -1033,8 +1431,15 @@ pub const Engine = struct {
     /// Uses cuBLAS FP16 Tensor Cores for dense/router GEMMs and multi-token half2 MoE kernels,
     /// while keeping sconv/attention/depth-norm/dspark_commit 100% exact via 8-token sub-slices.
     fn prefill_chunk_batched(self: *Engine, prompt: []const i32, start_i: u32, chunk_len: u32, commit_dspark: bool) void {
-        tiger.assert(chunk_len >= 8 and chunk_len <= prefill_batch_max and (chunk_len % 8 == 0));
+        tiger.assert(chunk_len >= 8 and chunk_len <= self.prefill_batch_cap and (chunk_len % 8 == 0));
         const w = self.weights.?;
+        if (self.prefill_aliased and self.expert_cache.prefill_reserved_tail == 0) {
+            const tail_base = self.expert_cache.acquire_prefill_scratch(self.prefill_tail_slots, self.stream);
+            self.bind_prefill_scratch_from_base(tail_base, self.prefill_batch_cap);
+        } else {
+            self.expert_cache.flush_async(self.stream);
+        }
+        self.expert_cache.record_zero_touches(self.stream);
         const b_i32: i32 = @intCast(chunk_len);
         const b_usize: usize = chunk_len;
         const n_sub: usize = chunk_len / 8;
@@ -1047,7 +1452,6 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_pos_vec), @ptrCast(&h_pos_vec), n_sub * @sizeOf(i32), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_tokens), @ptrCast(prompt[start_i..].ptr), b_usize * @sizeOf(i32), self.stream));
 
-        self.expert_cache.record_zero_touches(self.stream);
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.p_tokens, self.p_hidden, b_i32, self.stream);
 
         var block_count: i32 = 0;
@@ -1093,6 +1497,7 @@ pub const Engine = struct {
             // 1. BATCHED Pre-attention sconv + depth-norm + optional cross-pass controller (B = chunk_len!)
             if (prev_mlp_pending) {
                 const prev_lw: *const weights_mod.LayerWeights = &w.layers[self.schedule[vi - 1].physical_layer];
+                const abl = ablation_slice(w, true, vi - 1);
                 cuda.squid_launch_prefill_sconv_post_res(
                     self.p_moe_slot_out,
                     1,
@@ -1107,6 +1512,9 @@ pub const Engine = struct {
                     0,
                     b_i32,
                     &self.p_pos_vec[0],
+                    abl.r,
+                    abl.d,
+                    abl.p,
                     self.stream,
                 );
                 if (tap_slot >= 0) {
@@ -1296,6 +1704,9 @@ pub const Engine = struct {
                         lw.rel_clip_scale.?,
                         self.k_cache[vi].?,
                         self.v_cache[vi].?,
+                        self.k_scale[vi],
+                        self.v_scale[vi],
+                        @intFromEnum(self.local_kv_format),
                         self.kv_cap[vi],
                         @intCast(sub_b),
                         d_pos_sub,
@@ -1307,9 +1718,9 @@ pub const Engine = struct {
                         lw.rel_logits_proj.?,
                         self.k_cache[vi].?,
                         self.v_cache[vi].?,
-                        null,
-                        null,
-                        @intFromEnum(constants.KVFormat.bf16),
+                        self.k_scale[vi],
+                        self.v_scale[vi],
+                        @intFromEnum(self.local_kv_format),
                         offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
                         self.kv_cap[vi],
                         constants.swa_window_tokens,
@@ -1338,6 +1749,7 @@ pub const Engine = struct {
 
             // 5. BATCHED Attn post sconv + residual + MLP depth-norm (+ optional MLP controller) (B = chunk_len!)
             const is_boundary: bool = (l % constants.block_layer_count == 0);
+            const attn_abl = ablation_slice(w, false, vi);
             cuda.squid_launch_prefill_sconv_post_res(
                 self.p_o_proj,
                 0,
@@ -1352,6 +1764,9 @@ pub const Engine = struct {
                 if (is_boundary) 1 else 0,
                 b_i32,
                 &self.p_pos_vec[0],
+                attn_abl.r,
+                attn_abl.d,
+                attn_abl.p,
                 self.stream,
             );
             if (is_boundary) block_count += 1;
@@ -1435,6 +1850,7 @@ pub const Engine = struct {
                 self.p_sorted_tok,
                 self.p_sorted_slot,
                 self.p_moe_act_h,
+                b_i32,
                 self.stream,
             );
             cuda.squid_launch_prefill_moe_down_h(
@@ -1445,6 +1861,7 @@ pub const Engine = struct {
                 self.p_sorted_slot,
                 self.p_sorted_w,
                 self.p_moe_slot_out,
+                b_i32,
                 self.stream,
             );
             if (prof_on) {
@@ -1455,6 +1872,7 @@ pub const Engine = struct {
             }
 
             if (vi == 17 or vi == 29) {
+                const mlp_abl = ablation_slice(w, true, vi);
                 cuda.squid_launch_prefill_sconv_post_res(
                     self.p_moe_slot_out,
                     1,
@@ -1469,6 +1887,9 @@ pub const Engine = struct {
                     0,
                     b_i32,
                     &self.p_pos_vec[0],
+                    mlp_abl.r,
+                    mlp_abl.d,
+                    mlp_abl.p,
                     self.stream,
                 );
                 prev_mlp_pending = false;
@@ -1479,6 +1900,7 @@ pub const Engine = struct {
 
         // Visit 47 final MLP post + DSpark commit
         const last_lw = &w.layers[self.schedule[constants.visit_count - 1].physical_layer];
+        const last_mlp_abl = ablation_slice(w, true, constants.visit_count - 1);
         cuda.squid_launch_prefill_sconv_post_res(
             self.p_moe_slot_out,
             1,
@@ -1493,6 +1915,9 @@ pub const Engine = struct {
             0,
             b_i32,
             &self.p_pos_vec[0],
+            last_mlp_abl.r,
+            last_mlp_abl.d,
+            last_mlp_abl.p,
             self.stream,
         );
         cuda.squid_launch_fused_depth_norm(
@@ -1556,12 +1981,12 @@ pub const Engine = struct {
                 },
             );
         }
+        self.current_position += b_i32;
         if (self.expert_cache.enabled) {
             self.expert_cache.copy_touches_d2h_async(self.stream);
             tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
             self.expert_cache.process_prefill_chunk(w, chunk_len, self.stream);
         }
-        self.current_position += b_i32;
     }
 
     /// Long-context latency microbenchmark at simulated KV position `sim_pos`.
@@ -1575,12 +2000,12 @@ pub const Engine = struct {
 
         self.reset();
 
-        // Zero-init global KV caches so synthetic reads are strictly finite (zero NaN)
+        // Zero-init all KV caches (global + local) so synthetic longctx reads are strictly finite (zero NaN)
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
-            if (!self.schedule[vi].is_global) continue;
+            const vfmt: constants.KVFormat = if (self.schedule[vi].is_global) self.kv_format else self.local_kv_format;
             const cap: u64 = @intCast(self.kv_cap[vi]);
-            const data_bytes: usize = @intCast(switch (self.kv_format) {
+            const data_bytes: usize = @intCast(switch (vfmt) {
                 .bf16 => cap * constants.kv_dim * 2,
                 .fp8 => cap * constants.kv_dim,
                 .q4 => cap * (constants.kv_dim / 2),
@@ -1588,7 +2013,7 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_memset_async(self.k_cache[vi].?, 0, data_bytes, self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memset_async(self.v_cache[vi].?, 0, data_bytes, self.stream));
             if (self.k_scale[vi]) |ks| {
-                const scale_bytes: usize = @intCast(if (self.kv_format == .fp8)
+                const scale_bytes: usize = @intCast(if (vfmt == .fp8)
                     cap * constants.kv_head_count * 2
                 else
                     cap * constants.kv_q4_scales_per_token * 2);
@@ -1624,16 +2049,10 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
         const graph_exec = if (use_mtp) self.spec_graph_exec[num_drafts].? else self.b1_graph_exec.?;
-        const warmup_iters: u32 = if (self.expert_cache.enabled and self.expert_cache.free_slots_used < self.expert_cache.num_slots) 48 else 4;
         var warmup: u32 = 0;
-        while (warmup < warmup_iters) : (warmup += 1) {
+        while (warmup < 4) : (warmup += 1) {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&sim_pos), @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_graph_launch(graph_exec, self.stream));
-            if (self.expert_cache.enabled) {
-                self.expert_cache.copy_touches_d2h_async(self.stream);
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                self.expert_cache.process_decode_step(w, self.stream);
-            }
         }
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
@@ -1695,23 +2114,91 @@ pub const Engine = struct {
         }
     }
 
-    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool) void {
+    pub const LogitsChunkCallbackFn = *const fn (context: *anyopaque, pos_offset: usize, chunk_logits: []const f32, count: usize) bool;
+
+    /// Stream exact post-softcap FP32 logits in 8-token chunks (6.2 MiB host RAM regardless of context length!).
+    pub fn eval_logits_streaming(
+        self: *Engine,
+        tokens: []const i32,
+        chunk_buf: []f32,
+        on_chunk: LogitsChunkCallbackFn,
+        callback_context: *anyopaque,
+    ) bool {
+        const vocab: usize = constants.vocab_unpadded_count;
+        tiger.assert(tokens.len > 0 and tokens.len < self.context_tokens_max);
+        tiger.assert(chunk_buf.len >= constants.mtp_block_size_max * vocab);
+        self.reset();
+
+        const dump_cfg: cuda.CSampleConfig = .{ .inv_temp = -1.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&dump_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        defer {
+            const zero_cfg: cuda.CSampleConfig = .{ .inv_temp = 0.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
+
+        var i: usize = 0;
+        while (i < tokens.len) {
+            const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.record_target_forward(@intCast(batch), false, true, false);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
+                @ptrCast(chunk_buf.ptr),
+                @ptrCast(self.lm_logits),
+                batch * vocab * @sizeOf(f32),
+                self.stream,
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            self.current_position += @intCast(batch);
+            if (!on_chunk(callback_context, i, chunk_buf[0 .. batch * vocab], batch)) return false;
+            i += batch;
+        }
+        return true;
+    }
+
+    /// Evaluate exact post-softcap FP32 logits [tokens.len, VOCAB_UNPADDED] for KLD / PPL quality eval.
+    pub fn eval_logits_chunked(self: *Engine, tokens: []const i32, out_logits_host: []f32) void {
+        const vocab: usize = constants.vocab_unpadded_count;
+        tiger.assert(tokens.len > 0 and tokens.len < self.context_tokens_max);
+        tiger.assert(out_logits_host.len >= tokens.len * vocab);
+        self.reset();
+
+        const dump_cfg: cuda.CSampleConfig = .{ .inv_temp = -1.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&dump_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        defer {
+            const zero_cfg: cuda.CSampleConfig = .{ .inv_temp = 0.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
+
+        var i: usize = 0;
+        while (i < tokens.len) {
+            const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.record_target_forward(@intCast(batch), false, true, false);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
+                @ptrCast(out_logits_host[i * vocab ..].ptr),
+                @ptrCast(self.lm_logits),
+                batch * vocab * @sizeOf(f32),
+                self.stream,
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            self.current_position += @intCast(batch);
+            i += batch;
+        }
+    }
+
+    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool, is_verify: bool) void {
         tiger.assert(batch_size >= 1 and batch_size <= constants.mtp_block_size_max);
         const w = self.weights.?;
         const b_usize: usize = @intCast(batch_size);
-        const moe_slotted: u8 = if (batch_size > 1 or self.expert_cache.enabled) 1 else 0;
+        // Cached dual-path MoE kernels write slotted [B, TOP_K, HIDDEN] into self.moe_slot_out;
+        // upstream TC moe_down_tc_kernel sums all 8 expert slots in registers into self.moe_down.
+        const moe_slotted: u8 = if (self.expert_cache.enabled) 1 else 0;
+        const moe_out_ptr: [*]f32 = if (moe_slotted != 0) self.moe_slot_out else self.moe_down;
 
-        const prof_dec: bool = (!self.use_graphs and tiger.getenv("SQUID_PROF_DECODE") != null and self.current_position > 80 and (self.current_position & 63) == 0);
-        var t_non_moe: u64 = 0;
-        var t_moe_gu: u64 = 0;
-        var t_moe_dn: u64 = 0;
-        var t_lm: u64 = 0;
-        var t_mark: u64 = if (prof_dec) blk: {
-            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-            break :blk tiger.clock_monotonic_ns();
-        } else 0;
-
-        self.expert_cache.record_zero_touches(self.stream);
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
 
         var block_count: i32 = 0;
@@ -1791,8 +2278,9 @@ pub const Engine = struct {
 
             if (prev_mlp_pending) {
                 const prev_lw: *const weights_mod.LayerWeights = &w.layers[self.schedule[vi - 1].physical_layer];
+                const prev_abl = ablation_slice(w, true, vi - 1);
                 cuda.squid_launch_mega_mlp_post_next_depth_norm(
-                    if (moe_slotted != 0) self.moe_slot_out else self.moe_down,
+                    moe_out_ptr,
                     moe_slotted,
                     prev_lw.mlp_sconv_w.?,
                     self.mlp_ring[vi - 1],
@@ -1816,6 +2304,9 @@ pub const Engine = struct {
                     n_out,
                     batch_size,
                     self.d_pos,
+                    prev_abl.r,
+                    prev_abl.d,
+                    prev_abl.p,
                     self.stream,
                 );
                 prev_mlp_pending = false;
@@ -1902,12 +2393,8 @@ pub const Engine = struct {
             const in_kh = if (distinct_inputs) self.attn_in_h[1] else self.attn_in_h[0];
             const in_vh = if (distinct_inputs) self.attn_in_h[2] else self.attn_in_h[0];
 
-            if (lw.w_qrgs.kind == @intFromEnum(constants.WeightKind.nvfp4)) {
+            if (lw.w_qrgs.kind != @intFromEnum(constants.WeightKind.bf16)) {
                 cuda.squid_launch_qkvrg_fused(&lw.w_qrgs, &lw.w_k, &lw.w_v, in_qh, in_kh, in_vh, self.qrgs, self.k_proj, self.v_proj, batch_size, self.stream);
-            } else if (lw.w_qrgs.kind == @intFromEnum(constants.WeightKind.fp8)) {
-                cuda.squid_launch_linear_h(&lw.w_qrgs, in_qh, self.qrgs, batch_size, 0, self.stream);
-                cuda.squid_launch_linear_h(&lw.w_k, in_kh, self.k_proj, batch_size, 0, self.stream);
-                cuda.squid_launch_linear_h(&lw.w_v, in_vh, self.v_proj, batch_size, 0, self.stream);
             } else {
                 cuda.squid_launch_linear(&lw.w_qrgs, in_q, self.qrgs, batch_size, 0, self.stream);
                 cuda.squid_launch_linear(&lw.w_k, in_k, self.k_proj, batch_size, 0, self.stream);
@@ -1952,6 +2439,9 @@ pub const Engine = struct {
                     lw.rel_clip_scale.?,
                     self.k_cache[vi].?,
                     self.v_cache[vi].?,
+                    self.k_scale[vi],
+                    self.v_scale[vi],
+                    @intFromEnum(self.local_kv_format),
                     self.kv_cap[vi],
                     batch_size,
                     self.d_pos,
@@ -1966,7 +2456,7 @@ pub const Engine = struct {
                 self.v_cache[vi].?,
                 self.k_scale[vi],
                 self.v_scale[vi],
-                if (v.is_global) @intFromEnum(self.kv_format) else @intFromEnum(constants.KVFormat.bf16),
+                if (v.is_global) @intFromEnum(self.kv_format) else @intFromEnum(self.local_kv_format),
                 self.split_buf,
                 if (use_half_dense) null else self.attn_gated,
                 if (use_half_dense) self.attn_gated_h else null,
@@ -1984,6 +2474,7 @@ pub const Engine = struct {
             }
 
             const is_boundary: bool = (l % constants.block_layer_count == 0);
+            const attn_abl = ablation_slice(w, false, vi);
             cuda.squid_launch_mega_attn_post_mlp_in(
                 self.o_proj,
                 lw.attn_sconv_w.?,
@@ -2000,6 +2491,9 @@ pub const Engine = struct {
                 if (use_prior) null else self.mlp_normed_h,
                 batch_size,
                 self.d_pos,
+                attn_abl.r,
+                attn_abl.d,
+                attn_abl.p,
                 self.stream,
             );
             if (is_boundary) block_count += 1;
@@ -2019,6 +2513,7 @@ pub const Engine = struct {
                 }
             }
 
+            const route_groups: ?*anyopaque = if (self.expert_cache.enabled and batch_size > 1) self.exp_groups else null;
             if (w.mode == .nvfp4) {
                 cuda.squid_launch_route_topk_nvfp4(
                     self.mlp_normed_h,
@@ -2027,7 +2522,7 @@ pub const Engine = struct {
                     self.router_logits,
                     self.route_ids,
                     self.route_w,
-                    if (batch_size > 1) self.exp_groups else null,
+                    route_groups,
                     batch_size,
                     self.stream,
                 );
@@ -2039,35 +2534,18 @@ pub const Engine = struct {
                     self.router_logits,
                     self.route_ids,
                     self.route_w,
-                    if (batch_size > 1) self.exp_groups else null,
+                    route_groups,
                     batch_size,
                     self.stream,
                 );
             }
-            if (prof_dec) {
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                const now = tiger.clock_monotonic_ns();
-                t_non_moe += now - t_mark;
-                t_mark = now;
-            }
             cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
-            if (prof_dec) {
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                const now = tiger.clock_monotonic_ns();
-                t_moe_gu += now - t_mark;
-                t_mark = now;
-            }
-            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, if (moe_slotted != 0) self.moe_slot_out else self.moe_down, batch_size, self.stream);
-            if (prof_dec) {
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                const now = tiger.clock_monotonic_ns();
-                t_moe_dn += now - t_mark;
-                t_mark = now;
-            }
+            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, moe_out_ptr, batch_size, self.stream);
 
             if (vi == 17 or vi == 29) {
+                const mlp_abl = ablation_slice(w, true, vi);
                 cuda.squid_launch_mega_mlp_post_res(
-                    if (moe_slotted != 0) self.moe_slot_out else self.moe_down,
+                    moe_out_ptr,
                     moe_slotted,
                     lw.mlp_sconv_w.?,
                     self.mlp_ring[vi],
@@ -2075,6 +2553,9 @@ pub const Engine = struct {
                     self.hidden,
                     batch_size,
                     self.d_pos,
+                    mlp_abl.r,
+                    mlp_abl.d,
+                    mlp_abl.p,
                     self.stream,
                 );
                 prev_mlp_pending = false;
@@ -2084,8 +2565,9 @@ pub const Engine = struct {
         }
 
         // Visit 47 final MLP post + output depth attention + final norm (+ tap 3)
+        const last_mlp_abl = ablation_slice(w, true, constants.visit_count - 1);
         cuda.squid_launch_mega_mlp_post_next_depth_norm(
-            if (moe_slotted != 0) self.moe_slot_out else self.moe_down,
+            moe_out_ptr,
             moe_slotted,
             w.layers[self.schedule[constants.visit_count - 1].physical_layer].mlp_sconv_w.?,
             self.mlp_ring[constants.visit_count - 1],
@@ -2109,17 +2591,14 @@ pub const Engine = struct {
             1,
             batch_size,
             self.d_pos,
+            last_mlp_abl.r,
+            last_mlp_abl.d,
+            last_mlp_abl.p,
             self.stream,
         );
 
         // Overlap dspark_commit on aux_stream concurrently with lm_head_argmax on stream!
         if (compute_lm_head) {
-            if (prof_dec) {
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                const now = tiger.clock_monotonic_ns();
-                t_non_moe += now - t_mark;
-                t_mark = now;
-            }
             if (commit_dspark) {
                 tiger.assert_cuda(cuda.squid_cuda_event_record(self.fork_event, self.stream));
                 tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.aux_stream, self.fork_event));
@@ -2145,31 +2624,22 @@ pub const Engine = struct {
                 &w.unembed,
                 self.mlp_normed,
                 self.d_next_tokens,
-                null,
+                self.lm_logits,
                 self.lm_blk_val,
                 self.lm_blk_idx,
+                self.d_sample_cfg,
+                self.d_pos,
+                if (is_verify) self.d_drafts else null,
+                if (is_verify) self.d_draft_probs else null,
+                if (is_verify) self.d_draft_q_sel else null,
+                if (is_verify) self.d_draft_is_delta else null,
+                if (is_verify) w.dspark.inv_draft_vocab_ids else null,
+                w.dspark.draft_vocab_size,
                 batch_size,
                 self.stream,
             );
             if (commit_dspark) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.stream, self.join_event));
-            }
-            if (prof_dec) {
-                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-                t_lm = tiger.clock_monotonic_ns() - t_mark;
-                const tot_ms = @as(f64, @floatFromInt(t_non_moe + t_moe_gu + t_moe_dn + t_lm)) / 1e6;
-                tiger.print_stdout(
-                    "[prof-dec B={d} pos={d}] total={d:.2}ms | non_moe={d:.2}ms moe_gu={d:.2}ms moe_dn={d:.2}ms lm={d:.2}ms\n",
-                    .{
-                        batch_size,
-                        self.current_position,
-                        tot_ms,
-                        @as(f64, @floatFromInt(t_non_moe)) / 1e6,
-                        @as(f64, @floatFromInt(t_moe_gu)) / 1e6,
-                        @as(f64, @floatFromInt(t_moe_dn)) / 1e6,
-                        @as(f64, @floatFromInt(t_lm)) / 1e6,
-                    },
-                );
             }
         } else if (commit_dspark) {
             cuda.squid_launch_dspark_commit(
@@ -2194,7 +2664,8 @@ pub const Engine = struct {
     fn ensure_b1_graph(self: *Engine) void {
         if (self.b1_graph_exec != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        self.record_target_forward(1, false, true);
+        self.expert_cache.record_zero_touches(self.stream);
+        self.record_target_forward(1, false, true, false);
         cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.b1_graph_exec));
         tiger.assert(self.b1_graph_exec != null);
@@ -2204,7 +2675,7 @@ pub const Engine = struct {
         const slot: usize = if (commit_dspark) 1 else 0;
         if (self.prefill_b8_graph_exec[slot] != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false);
+        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false, false);
         cuda.squid_launch_inc_pos_by(self.d_pos, constants.mtp_block_size_max, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.prefill_b8_graph_exec[slot]));
         tiger.assert(self.prefill_b8_graph_exec[slot] != null);
@@ -2236,21 +2707,141 @@ pub const Engine = struct {
             self.ds_f_ring.?,
             self.ds_ws,
             self.d_drafts,
+            null,
+            self.d_sample_cfg,
+            self.d_draft_probs,
+            self.d_draft_q_sel,
+            self.d_draft_is_delta,
             self.stream,
         );
         cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
-        self.record_target_forward(batch, true, true);
+        self.expert_cache.record_zero_touches(self.stream);
+        self.record_target_forward(batch, true, true, true);
         cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.spec_graph_exec[num_drafts]));
         tiger.assert(self.spec_graph_exec[num_drafts] != null);
     }
+
+    fn ensure_adaptive_graphs(self: *Engine) void {
+        if (!self.use_graphs) return;
+        const w = self.weights.?;
+        const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
+        const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
+
+        if (self.draft_graph_exec == null) {
+            tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
+            cuda.squid_launch_dspark_draft(
+                w.embed.?,
+                w.embed_norm.?,
+                &w.dspark,
+                self.d_anchor,
+                self.d_pos,
+                constants.mtp_draft_count_max,
+                &self.ds_k_cache,
+                &self.ds_v_cache,
+                &ds_ks_const,
+                &ds_vs_const,
+                &self.ds_kv_cap,
+                @intFromEnum(self.kv_format),
+                self.split_buf,
+                self.ds_f_ring.?,
+                self.ds_ws,
+                self.d_drafts,
+                self.d_draft_conf,
+                self.d_sample_cfg,
+                self.d_draft_probs,
+                self.d_draft_q_sel,
+                self.d_draft_is_delta,
+                self.stream,
+            );
+            tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.draft_graph_exec));
+            tiger.assert(self.draft_graph_exec != null);
+        }
+
+        if (self.verify_b8_graph_exec == null) {
+            tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
+            cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, constants.mtp_draft_count_max, self.stream);
+            self.expert_cache.record_zero_touches(self.stream);
+            self.record_target_forward(constants.mtp_block_size_max, true, true, true);
+            cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, constants.mtp_block_size_max, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_num_accepted.?), @ptrCast(self.d_num_acc), @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_accepted), constants.mtp_block_size_max * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.verify_b8_graph_exec));
+            tiger.assert(self.verify_b8_graph_exec != null);
+        }
+
+        if (self.adaptive_graph != null and self.adaptive_graph_threshold == self.spec_threshold) return;
+        if (self.adaptive_graph) |old| {
+            tiger.assert_cuda(cuda.squid_adaptive_graph_destroy(old));
+            self.adaptive_graph = null;
+        }
+
+        tiger.assert_cuda(cuda.squid_adaptive_graph_create(
+            self.d_anchor,
+            self.d_drafts,
+            self.d_draft_conf,
+            self.spec_threshold,
+            self.d_tokens,
+            self.d_chosen_width,
+            self.d_accepted,
+            self.h_accepted.?,
+            self.d_num_acc,
+            self.h_num_accepted.?,
+            self.h_chosen_width.?,
+            self.stream,
+            &self.adaptive_graph,
+        ));
+        const widths = [_]i32{ 1, 2, 4, 8 };
+        for (widths, 0..) |width, bidx| {
+            tiger.assert_cuda(cuda.squid_adaptive_graph_branch_begin(self.adaptive_graph, @intCast(bidx), self.stream));
+            self.expert_cache.record_zero_touches(self.stream);
+            self.record_target_forward(width, true, true, width > 1);
+            cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, width, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
+            tiger.assert_cuda(cuda.squid_adaptive_graph_branch_end(self.stream));
+        }
+        tiger.assert_cuda(cuda.squid_adaptive_graph_instantiate(self.adaptive_graph));
+        self.adaptive_graph_threshold = self.spec_threshold;
+    }
 };
+
+fn compute_prefill_scratch_bytes(pb_u32: u32) u64 {
+    const a = constants.vram_alignment_bytes;
+    const pb: u64 = pb_u32;
+    var total: u64 = 0;
+    total += tiger.align_up_u64(pb * 4, a); // p_tokens
+    total += tiger.align_up_u64(prefill_sub_chunks_max * 4, a); // p_pos_vec
+    total += 3 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_hidden, p_prelude, p_partial
+    total += tiger.align_up_u64(pb * 4 * constants.hidden_dim * 4, a); // p_blocks
+    total += 2 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_saved, p_prior_last
+    total += 3 * (tiger.align_up_u64(pb * constants.hidden_dim * 4, a) + tiger.align_up_u64(pb * constants.hidden_dim * 2, a));
+    total += tiger.align_up_u64(pb * constants.qrgs_out_dim * 4, a);
+    total += 2 * tiger.align_up_u64(pb * constants.kv_dim * 4, a);
+    total += tiger.align_up_u64(pb * constants.query_dim * 2, a);
+    total += 4 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_o_proj, p_residual, p_mlp_in, p_mlp_normed
+    total += tiger.align_up_u64(pb * constants.hidden_dim * 2, a); // p_mlp_normed_h
+    total += tiger.align_up_u64(pb * constants.expert_count * 4, a); // p_router_logits
+    total += 2 * tiger.align_up_u64(pb * constants.top_k_experts * 4, a); // p_route_ids, p_route_w
+    total += tiger.align_up_u64(1024 * 4, a); // p_exp_offsets + flat MoE tile table
+    total += 3 * tiger.align_up_u64(pb * constants.top_k_experts * 4, a); // p_sorted_tok, p_sorted_slot, p_sorted_w
+    total += tiger.align_up_u64(pb * constants.top_k_experts * constants.intermediate_dim * 2, a); // p_moe_act_h
+    total += tiger.align_up_u64(pb * constants.top_k_experts * constants.hidden_dim * 4, a); // p_moe_slot_out
+    total += tiger.align_up_u64(4 * pb * constants.hidden_dim * 4, a); // p_taps
+    total += tiger.align_up_u64(@as(u64, constants.qrgs_out_dim) * constants.hidden_dim * 2, a); // p_w_f16
+    total += tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_ctrl_msg
+    total += tiger.align_up_u64(pb * 2 * constants.hidden_dim * 2, a); // p_ctrl_cat_h
+    total += tiger.align_up_u64(pb * constants.gate_rank * 4, a); // p_ctrl_d
+    total += tiger.align_up_u64(pb * constants.gate_rank * 2, a); // p_ctrl_d_h
+    return total;
+}
 
 fn compute_runtime_vram_bytes(
     schedule: *const [constants.visit_count]constants.VisitInfo,
     context_tokens_max: u32,
     kv_format: constants.KVFormat,
+    local_kv_format: constants.KVFormat,
     has_dspark: bool,
+    draft_vocab_size: u32,
+    alias_prefill: bool,
     expert_groups_bytes: u64,
 ) u64 {
     const a = constants.vram_alignment_bytes;
@@ -2260,7 +2851,7 @@ fn compute_runtime_vram_bytes(
     while (vi < constants.visit_count) : (vi += 1) {
         const is_glob = schedule[vi].is_global;
         const cap: u32 = if (is_glob) context_tokens_max else (constants.swa_window_tokens + prefill_local_attn_sub);
-        const vfmt: constants.KVFormat = if (is_glob) kv_format else .bf16;
+        const vfmt: constants.KVFormat = if (is_glob) kv_format else local_kv_format;
         total += constants.kv_cache_pair_vram_bytes(cap, vfmt);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.kv_dim * 4, a);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.hidden_dim * 4, a);
@@ -2290,6 +2881,8 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(b * 4, a); // d_next_tokens
     total += tiger.align_up_u64(4, a); // d_anchor
     total += tiger.align_up_u64(constants.mtp_draft_count_max * 4, a); // d_drafts
+    total += tiger.align_up_u64(constants.mtp_draft_count_max * 4, a); // d_draft_conf
+    total += tiger.align_up_u64(4, a); // d_chosen_width
     total += tiger.align_up_u64(b * 4, a); // d_accepted
     total += tiger.align_up_u64(4, a); // d_num_acc
 
@@ -2313,37 +2906,47 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(b * constants.top_k_experts * constants.intermediate_dim * 2, a); // moe_act_h
     total += tiger.align_up_u64(b * constants.hidden_dim * 4, a); // moe_down
     total += tiger.align_up_u64(b * constants.top_k_experts * constants.hidden_dim * 4, a); // moe_slot_out
-    total += tiger.align_up_u64(4 * b * constants.hidden_dim * 4, a); // taps
-    total += tiger.align_up_u64(3 * b * constants.hidden_dim * 4, a); // ds_mix
-    total += tiger.align_up_u64(b * 2 * constants.kv_dim * 4, a); // ds_kv
-    total += tiger.align_up_u64(constants.dspark_workspace_floats * 4, a); // ds_ws
+    if (has_dspark) {
+        total += tiger.align_up_u64(4 * b * constants.hidden_dim * 4, a); // taps
+        total += tiger.align_up_u64(3 * b * constants.hidden_dim * 4, a); // ds_mix
+        total += tiger.align_up_u64(b * 2 * constants.kv_dim * 4, a); // ds_kv
+        total += tiger.align_up_u64(constants.dspark_workspace_floats * 4, a); // ds_ws
+    }
     total += 2 * tiger.align_up_u64(b * 1024 * 4, a); // lm_blk_val, lm_blk_idx
+    total += tiger.align_up_u64(b * constants.vocab_unpadded_count * 4, a); // lm_logits
+    if (has_dspark) {
+        total += tiger.align_up_u64(@as(u64, constants.mtp_draft_count_max) * draft_vocab_size * 4, a); // d_draft_probs
+    } else {
+        total += tiger.align_up_u64(4, a); // placeholder d_draft_probs
+    }
+    total += tiger.align_up_u64(constants.mtp_draft_count_max * 4, a); // d_draft_q_sel
+    total += tiger.align_up_u64(4, a); // d_draft_is_delta
+    total += tiger.align_up_u64(@sizeOf(cuda.CSampleConfig), a); // d_sample_cfg
 
-    // Fast batched prefill arena (B <= 512)
-    const pb: u64 = prefill_batch_max;
-    total += tiger.align_up_u64(pb * 4, a); // p_tokens
-    total += tiger.align_up_u64(prefill_sub_chunks_max * 4, a); // p_pos_vec
-    total += 3 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_hidden, p_prelude, p_partial
-    total += tiger.align_up_u64(pb * 4 * constants.hidden_dim * 4, a); // p_blocks
-    total += 2 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_saved, p_prior_last
-    total += 3 * (tiger.align_up_u64(pb * constants.hidden_dim * 4, a) + tiger.align_up_u64(pb * constants.hidden_dim * 2, a));
-    total += tiger.align_up_u64(pb * constants.qrgs_out_dim * 4, a);
-    total += 2 * tiger.align_up_u64(pb * constants.kv_dim * 4, a);
-    total += tiger.align_up_u64(pb * constants.query_dim * 2, a);
-    total += 4 * tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_o_proj, p_residual, p_mlp_in, p_mlp_normed
-    total += tiger.align_up_u64(pb * constants.hidden_dim * 2, a); // p_mlp_normed_h
-    total += tiger.align_up_u64(pb * constants.expert_count * 4, a); // p_router_logits
-    total += 2 * tiger.align_up_u64(pb * constants.top_k_experts * 4, a); // p_route_ids, p_route_w
-    total += tiger.align_up_u64(1024 * 4, a); // p_exp_offsets + flat MoE tile table
-    total += 3 * tiger.align_up_u64(pb * constants.top_k_experts * 4, a); // p_sorted_tok, p_sorted_slot, p_sorted_w
-    total += tiger.align_up_u64(pb * constants.top_k_experts * constants.intermediate_dim * 2, a); // p_moe_act_h
-    total += tiger.align_up_u64(pb * constants.top_k_experts * constants.hidden_dim * 4, a); // p_moe_slot_out
-    total += tiger.align_up_u64(4 * pb * constants.hidden_dim * 4, a); // p_taps
-    total += tiger.align_up_u64(@as(u64, constants.qrgs_out_dim) * constants.hidden_dim * 2, a); // p_w_f16
-    total += tiger.align_up_u64(pb * constants.hidden_dim * 4, a); // p_ctrl_msg
-    total += tiger.align_up_u64(pb * 2 * constants.hidden_dim * 2, a); // p_ctrl_cat_h
-    total += tiger.align_up_u64(pb * constants.gate_rank * 4, a); // p_ctrl_d
-    total += tiger.align_up_u64(pb * constants.gate_rank * 2, a); // p_ctrl_d_h
+    if (!alias_prefill) {
+        total += tiger.align_up_u64(compute_prefill_scratch_bytes(prefill_batch_max), a);
+    }
 
     return total;
+}
+
+const AblationSlice = struct {
+    r: ?[*]const f32 = null,
+    d: ?[*]const f32 = null,
+    p: ?[*]const f32 = null,
+};
+
+fn ablation_slice(w: *const weights_mod.ModelWeights, is_mlp: bool, visit_idx: u32) AblationSlice {
+    if (!w.ablation.active) return .{};
+    const v: usize = @intCast(visit_idx);
+    const active = if (is_mlp) w.ablation.mlp_nonzero[v] else w.ablation.attn_nonzero[v];
+    if (!active) return .{};
+    const dirs = if (is_mlp) w.ablation.mlp_dirs.? else w.ablation.attn_dirs.?;
+    const det_opt = if (is_mlp) w.ablation.mlp_det else w.ablation.attn_det;
+    const params = if (is_mlp) w.ablation.mlp_params.? else w.ablation.attn_params.?;
+    return .{
+        .r = dirs + v * constants.hidden_dim,
+        .d = if (det_opt) |det| det + v * constants.hidden_dim else null,
+        .p = params + v * 4,
+    };
 }

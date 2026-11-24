@@ -15,6 +15,7 @@ __pycache__/
 
 # Model weights & local data
 models/
+work/
 *.safetensors
 *.bin
 

@@ -567,15 +567,18 @@ __global__ void dynamic_sconv_kernel(
     }
 }
 
-// Fused Q/R/K/V prep + KV cache store
+// Fused Q/R/K/V prep + KV cache store (BF16/FP8/Q4)
+template <int KV_FMT>
 __global__ void attn_prep_store_kernel(
     float* __restrict__ qrgs,
     const float* __restrict__ ck,
     const float* __restrict__ cv,
     const __nv_bfloat16* __restrict__ q_clip_scale,
     const __nv_bfloat16* __restrict__ rel_clip_scale,
-    __nv_bfloat16* __restrict__ k_cache,
-    __nv_bfloat16* __restrict__ v_cache,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
     int kv_cap,
     bool is_global,
     const int32_t* __restrict__ d_pos) {
@@ -625,7 +628,7 @@ __global__ void attn_prep_store_kernel(
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
         int slot = pos % kv_cap;
-        k_cache[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, slot, h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         const float* vp = cv + (size_t)b * KV_DIM + h * HEAD_DIM;
@@ -638,7 +641,7 @@ __global__ void attn_prep_store_kernel(
         if (tid == 0) inv_rms = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
         int slot = pos % kv_cap;
-        v_cache[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = __float2bfloat16(val * inv_rms);
+        store_kv_head_128<KV_FMT>(val * inv_rms, slot, h, tid, v_cache, v_scale, sm);
     }
 }
 
@@ -1009,6 +1012,8 @@ attn_merge_sink_gate_kernel(
     __half* __restrict__ out_gated_h,
     int window,
     const int32_t* __restrict__ d_pos) {
+    pdl_wait();
+    pdl_trigger();
     int h = blockIdx.x;
     int b = blockIdx.y;
     int tid = threadIdx.x; // 0..127
@@ -1152,7 +1157,7 @@ relative_attention_gated_inline_kernel(
         #pragma unroll
         for (int w = 1; w < 8; ++w) g_m = fmaxf(g_m, sm_m[w]);
 
-        int base_hb = (h * MAX_VERIFY_B + b) * KV_SPLIT_K;
+        int base_hb = (h * MAX_VERIFY_B + b) * KV_TOTAL_SPLITS;
         const float* s_m_in = split_buf + SPLIT_M_OFF;
         const float* s_d_in = split_buf + SPLIT_D_OFF;
         const float* s_o_in = split_buf + SPLIT_O_OFF;
@@ -1246,6 +1251,7 @@ route_logits_parallel_kernel(
 }
 
 // 64-block HALF-WARP NVFP4 MoE Router (64 SMs, 2 experts/block, 16 threads/expert = 9 EXACT iters!)
+// Pre-issues all 9 NVFP4 weight & scale loads BEFORE pdl_wait_fenced(zero) to overlap predecessor tail!
 template <int B_CONST>
 __global__ void __launch_bounds__(32)
 route_logits_nvfp4_parallel_kernel(
@@ -1254,7 +1260,8 @@ route_logits_nvfp4_parallel_kernel(
     const uint8_t* __restrict__ w_scales,      // [128, HIDDEN/16]
     float gscale,
     float* __restrict__ out_logits,            // [B, 128]
-    float* __restrict__ /*moe_down_zero*/) {
+    float* __restrict__ /*moe_down_zero*/,
+    uint32_t zero) {
     int sub_e = threadIdx.x >> 4;  // 0 or 1
     int lane = threadIdx.x & 15;   // 0..15
     int e = blockIdx.x * 2 + sub_e;
@@ -1264,6 +1271,17 @@ route_logits_nvfp4_parallel_kernel(
     const uint2* wr = reinterpret_cast<const uint2*>(w_data + (size_t)e * W_STRIDE);
     const uint8_t* sr = w_scales + (size_t)e * S_STRIDE;
 
+    uint2 w8[9];
+    uint8_t s8[9];
+    #pragma unroll
+    for (int iter = 0; iter < 9; ++iter) {
+        int blk = lane + iter * 16;
+        w8[iter] = ld_stream_u2(wr + blk);
+        s8[iter] = ld_scale_u8(sr + blk);
+    }
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
     float acc[B_CONST];
     #pragma unroll
     for (int b = 0; b < B_CONST; ++b) acc[b] = 0.0f;
@@ -1271,16 +1289,15 @@ route_logits_nvfp4_parallel_kernel(
     #pragma unroll
     for (int iter = 0; iter < 9; ++iter) {
         int blk = lane + iter * 16;
-        uint2 w8 = __ldg(wr + blk);
-        float sc = cvt_e4m3_to_float(__ldg(sr + blk));
+        float sc = cvt_e4m3_to_float(s8[iter]);
         __half2 wh[8];
-        cvt_e2m1x8_to_half2x4(w8.x, wh[0], wh[1], wh[2], wh[3]);
-        cvt_e2m1x8_to_half2x4(w8.y, wh[4], wh[5], wh[6], wh[7]);
+        cvt_e2m1x8_to_half2x4(w8[iter].x, wh[0], wh[1], wh[2], wh[3]);
+        cvt_e2m1x8_to_half2x4(w8[iter].y, wh[4], wh[5], wh[6], wh[7]);
         int koff = blk << 4;
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
-            const uint4* x4 = reinterpret_cast<const uint4*>(m_h + (size_t)b * HIDDEN + koff);
-            uint4 xv0 = __ldg(x4), xv1 = __ldg(x4 + 1);
+            uint4 xv0 = ld_dep_u4(m_h + (size_t)b * HIDDEN + koff);
+            uint4 xv1 = ld_dep_u4(m_h + (size_t)b * HIDDEN + koff + 8);
             const __half2* xb0 = reinterpret_cast<const __half2*>(&xv0);
             const __half2* xb1 = reinterpret_cast<const __half2*>(&xv1);
             __half2 p0 = __hmul2(wh[0], xb0[0]), p1 = __hmul2(wh[1], xb0[1]);
@@ -1307,17 +1324,24 @@ route_select_and_group_kernel(
     const float* __restrict__ router_bias, // [128]
     int32_t* __restrict__ out_ids,         // [B, TOP_K]
     float* __restrict__ out_weights,       // [B, TOP_K]
-    ExpertGroups* __restrict__ g) {        // optional (filled when B_CONST > 1 && g != nullptr)
+    ExpertGroups* __restrict__ g,
+    uint32_t zero) {
     int b = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
+
+    float rb[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) rb[i] = __ldg(router_bias + lane + 32 * i);
+    pdl_wait_fenced(zero);
+    pdl_trigger();
 
     float sc[4], bi[4];
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         int e = lane + 32 * i;
-        float raw = fast_sigmoid(logits[b * NUM_EXPERTS + e]);
+        float raw = fast_sigmoid(ld_dep_f32(logits + b * NUM_EXPERTS + e));
         sc[i] = raw;
-        bi[i] = raw + router_bias[e];
+        bi[i] = raw + rb[i];
     }
     int winners[TOP_K];
     float chosen[TOP_K];
@@ -1335,6 +1359,7 @@ route_select_and_group_kernel(
         for (int off = 16; off > 0; off >>= 1) {
             cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, off));
         }
+        cand = min(cand, NUM_EXPERTS - 1);
         float sel = 0.0f;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -1686,6 +1711,8 @@ mega_global_sconv_prep_store_kernel(
     int tid = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
+    pdl_wait();
+    pdl_trigger();
     int p = (*d_pos) + b;
     float ratio = fmaxf(float(p + 1) / float(LOG_SCALE_FLOOR), 1.0f);
     float tau = 1.0f + LOG_SCALE_ALPHA * logf(ratio);
@@ -1800,6 +1827,7 @@ mega_global_sconv_prep_store_kernel(
 // MEGA-FUSION 2 (v2): PARALLEL across B tokens! Grid = dim3(64, B), Block = 128!
 // Safe on 16-slot ring because b=0..B-1 ONLY reads prior slots pos0-3..pos0-1 from ring and reads
 // intra-batch history from read-only k_proj/v_proj, while writing distinct slots (pos0+b)&15!
+template <int KV_FMT>
 __global__ void __launch_bounds__(128)
 mega_local_sconv_prep_store_kernel(
     float* __restrict__ qrgs,
@@ -1811,12 +1839,16 @@ mega_local_sconv_prep_store_kernel(
     float* __restrict__ v_ring,
     const __nv_bfloat16* __restrict__ q_clip_scale,
     const __nv_bfloat16* __restrict__ rel_clip_scale,
-    __nv_bfloat16* __restrict__ k_cache,
-    __nv_bfloat16* __restrict__ v_cache,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
     int kv_cap, const int32_t* __restrict__ d_pos) {
     int kind_id = blockIdx.x;
     int b = blockIdx.y;
     int tid = threadIdx.x;
+    pdl_wait();
+    pdl_trigger();
     int pos0 = *d_pos;
     int p = pos0 + b;
     constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
@@ -1859,7 +1891,7 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
-        k_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         int c = h * HEAD_DIM + tid;
@@ -1877,8 +1909,40 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
-        v_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
     }
+}
+
+// Runtime-gated directional ablation (adapted from satellitedown/inkling-2-mini-abliterated-ingine, Apache-2.0):
+// y <- y - w * max(r . y - offset, floor) * r   if (!abl_d || abl_d . y > threshold)
+__device__ __forceinline__ float4 apply_ablation_576(
+    float4 y,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p,
+    int c4, int lane, int warp,
+    float* sm_r, float* sm_d, float* s_coeff) {
+    if (!abl_r) return y;
+    float4 rv = *reinterpret_cast<const float4*>(abl_r + c4);
+    float dr = warp_sum(f4_dot(y, rv));
+    if (lane == 0) sm_r[warp] = dr;
+    if (abl_d) {
+        float4 dv = *reinterpret_cast<const float4*>(abl_d + c4);
+        float dd = warp_sum(f4_dot(y, dv));
+        if (lane == 0) sm_d[warp] = dd;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float tot_r = warp_sum((lane < 18) ? sm_r[lane] : 0.0f);
+        float tot_d = abl_d ? warp_sum((lane < 18) ? sm_d[lane] : 0.0f) : 0.0f;
+        if (lane == 0) {
+            float4 ap = __ldg(reinterpret_cast<const float4*>(abl_p));
+            *s_coeff = (!abl_d || tot_d > ap.w) ? (ap.x * fmaxf(tot_r - ap.y, ap.z)) : 0.0f;
+        }
+    }
+    __syncthreads();
+    float k = *s_coeff;
+    return make_float4(y.x - k * rv.x, y.y - k * rv.y, y.z - k * rv.z, y.w - k * rv.w);
 }
 
 // MEGA-FUSION 3 (v3): 576-thread (18-warp) VECTORIZED float4 REGISTER-CACHED ZERO-SMEM-ARRAY!
@@ -1899,25 +1963,32 @@ mega_attn_post_mlp_in_kernel(
     const __nv_bfloat16* __restrict__ mlp_norm_w,
     float* __restrict__ mlp_out,
     __half* __restrict__ mlp_out_h,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p) {
     int b = blockIdx.x;
     int tid = threadIdx.x; // 0..575
     int lane = tid & 31;
     int warp = tid >> 5;   // 0..17
     int c4 = tid << 2;     // 0, 4, ..., 2300
+    pdl_wait();
+    pdl_trigger();
     int p = (*d_pos) + b;
     int n_blocks = block_count_before + (is_boundary ? 1 : 0);
     int n_cand = n_blocks + 1;
 
     __shared__ float sm[18];
+    __shared__ float sm_abl[18];
     __shared__ float partials[18][8];
     __shared__ float weights[8];
     __shared__ float inv_rms;
 
     float* blk_b = blocks + (size_t)b * 4 * HIDDEN;
 
-    // 1. Vectorized attn_sconv + block copy/residual -> r_mp in registers!
+    // 1. Vectorized attn_sconv + optional runtime-gated ablation + block copy/residual -> r_mp in registers!
     float4 ao = sconv_apply_f4(o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    ao = apply_ablation_576(ao, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 rv;
     if (is_boundary) {
         float4 pp = *reinterpret_cast<const float4*>(partial_prev + (size_t)b * HIDDEN + c4);
@@ -2017,11 +2088,23 @@ mega_mlp_post_res_kernel(
     float* __restrict__ mlp_ring,
     const float* __restrict__ residual,
     float* __restrict__ hidden_out,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p) {
     int b = blockIdx.x;
-    int c4 = threadIdx.x << 2;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int c4 = tid << 2;
+    pdl_wait();
+    pdl_trigger();
     int p = (*d_pos) + b;
+    __shared__ float sm_r[18];
+    __shared__ float sm_d[18];
+    __shared__ float s_coeff;
     float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
+    ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm_r, sm_d, &s_coeff);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     *reinterpret_cast<float4*>(hidden_out + (size_t)b * HIDDEN + c4) =
         make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
@@ -2247,22 +2330,29 @@ mega_mlp_post_next_depth_norm_kernel(
     BF16Ptr3 norms,
     MutPtr3 outs,
     HalfPtr3 outs_h,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const float* __restrict__ abl_r,
+    const float* __restrict__ abl_d,
+    const float* __restrict__ abl_p) {
     int b = blockIdx.x;
     int s = blockIdx.y;
     int tid = threadIdx.x; // 0..575
     int lane = tid & 31;
     int warp = tid >> 5;   // 0..17
     int c4 = tid << 2;     // 0, 4, ..., 2300
+    pdl_wait();
+    pdl_trigger();
     int p = (*d_pos) + b;
 
     __shared__ float sm[18];
+    __shared__ float sm_abl[18];
     __shared__ float partials[18][8];
     __shared__ float weights[8];
     __shared__ float inv_rms;
 
-    // 1. Vectorized mlp_sconv (with deterministic 8-slot MoE sum when B>1!) + residual add -> hv in regs!
+    // 1. Vectorized mlp_sconv (with deterministic 8-slot MoE sum when B>1!) + optional ablation + residual add -> hv in regs!
     float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, b, p, c4, s == 0);
+    ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     float4 hv = make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
     if (s == 0) {
@@ -2471,10 +2561,18 @@ void launch_dynamic_sconv(
 void launch_attn_prep_store(
     float* qrgs, const float* ck, const float* cv,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, bool is_global,
-    int B, const int32_t* d_pos, cudaStream_t stream) {
-    attn_prep_store_kernel<<<dim3(B, 64), 128, 0, stream>>>(
-        qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, is_global, d_pos);
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
+    int kv_cap, bool is_global, int B, const int32_t* d_pos, cudaStream_t stream) {
+    if (kv_fmt == KVFormat::FP8) {
+        attn_prep_store_kernel<1><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    } else if (kv_fmt == KVFormat::Q4) {
+        attn_prep_store_kernel<2><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    } else {
+        attn_prep_store_kernel<0><<<dim3(B, 64), 128, 0, stream>>>(
+            qrgs, ck, cv, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, is_global, d_pos);
+    }
 }
 
 template <int KV_FMT, int B_CONST>
@@ -2492,7 +2590,7 @@ static void dispatch_tc_attn_b(
     }
     local_tail_attn_tc_kernel<KV_FMT, B_CONST><<<dim3(NUM_KV_HEADS, KV_LOCAL_SPLITS), LOCAL_THREADS, 0, stream>>>(
         qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, kv_cap, window, d_pos, split_buf);
-    attn_merge_sink_gate_kernel<<<dim3(NUM_HEADS, B_CONST), HEAD_DIM, 0, stream>>>(
+    launch_pdl(attn_merge_sink_gate_kernel, dim3(NUM_HEADS, B_CONST), HEAD_DIM, stream,
         qrgs, split_buf, out_gated, out_gated_h, window, d_pos);
 }
 
@@ -2541,8 +2639,8 @@ static void dispatch_route_bf16(
     float* scratch_logits, int32_t* out_ids, float* out_weights,
     ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
     route_logits_parallel_kernel<B_CONST><<<64, 64, 0, stream>>>(m, router_w, scratch_logits, moe_down_zero);
-    route_select_and_group_kernel<B_CONST><<<1, B_CONST * 32, 0, stream>>>(
-        scratch_logits, router_bias, out_ids, out_weights, groups);
+    launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
+        scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
 }
 
 void launch_route_topk(
@@ -2566,10 +2664,10 @@ static void dispatch_route_nvfp4(
     const __half* m_h, const LinearWeight& r, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
     ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
-    route_logits_nvfp4_parallel_kernel<B_CONST><<<64, 32, 0, stream>>>(
-        m_h, static_cast<const uint8_t*>(r.data), r.scales, r.global_scale, scratch_logits, moe_down_zero);
-    route_select_and_group_kernel<B_CONST><<<1, B_CONST * 32, 0, stream>>>(
-        scratch_logits, router_bias, out_ids, out_weights, groups);
+    launch_pdl(route_logits_nvfp4_parallel_kernel<B_CONST>, dim3(64), 32, stream,
+        m_h, static_cast<const uint8_t*>(r.data), r.scales, r.global_scale, scratch_logits, moe_down_zero, 0u);
+    launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
+        scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
 }
 
 void launch_route_topk_nvfp4(
@@ -2681,15 +2779,15 @@ void launch_mega_global_sconv_prep_store(
     void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
     int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
     if (kv_fmt == KVFormat::FP8) {
-        mega_global_sconv_prep_store_kernel<1><<<dim3(64, B), 128, 0, stream>>>(
+        launch_pdl(mega_global_sconv_prep_store_kernel<1>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
             k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
     } else if (kv_fmt == KVFormat::Q4) {
-        mega_global_sconv_prep_store_kernel<2><<<dim3(64, B), 128, 0, stream>>>(
+        launch_pdl(mega_global_sconv_prep_store_kernel<2>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
             k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
     } else {
-        mega_global_sconv_prep_store_kernel<0><<<dim3(64, B), 128, 0, stream>>>(
+        launch_pdl(mega_global_sconv_prep_store_kernel<0>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
             k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
     }
@@ -2702,13 +2800,15 @@ void launch_mega_mlp_post_next_depth_norm(
     float* partial_out, const float* blocks, int n_blocks, const float* queries,
     const __nv_bfloat16* norm0, const __nv_bfloat16* norm1, const __nv_bfloat16* norm2,
     float* out0, float* out1, float* out2, __half* out_h0, __half* out_h1, __half* out_h2,
-    int n_out, int B, const int32_t* d_pos, cudaStream_t stream) {
+    int n_out, int B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
     BF16Ptr3 np{{norm0, norm1, norm2}};
     MutPtr3 op{{out0, out1, out2}};
     HalfPtr3 ohp{{out_h0, out_h1, out_h2}};
-    mega_mlp_post_next_depth_norm_kernel<<<dim3(B, n_out), 576, 0, stream>>>(
+    launch_pdl(mega_mlp_post_next_depth_norm_kernel, dim3(B, n_out), 576, stream,
         moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, residual, hidden_out,
-        pre_tap_out, post_tap_out, partial_out, blocks, n_blocks, queries, np, op, ohp, d_pos);
+        pre_tap_out, post_tap_out, partial_out, blocks, n_blocks, queries, np, op, ohp, d_pos,
+        abl_r, abl_d, abl_p);
 }
 
 void launch_mega_local_sconv_prep_store(
@@ -2716,27 +2816,41 @@ void launch_mega_local_sconv_prep_store(
     const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
     float* k_ring, float* v_ring,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
-    mega_local_sconv_prep_store_kernel<<<dim3(64, B), 128, 0, stream>>>(
-        qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
-        q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, d_pos);
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
+    int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
+    if (kv_fmt == KVFormat::FP8) {
+        launch_pdl(mega_local_sconv_prep_store_kernel<1>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else if (kv_fmt == KVFormat::Q4) {
+        launch_pdl(mega_local_sconv_prep_store_kernel<2>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else {
+        launch_pdl(mega_local_sconv_prep_store_kernel<0>, dim3(64, B), 128, stream,
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    }
 }
 
 void launch_mega_attn_post_mlp_in(
     const float* o_proj, const __nv_bfloat16* attn_sconv_w, float* attn_ring,
     const float* hidden, const float* partial_prev, float* blocks, int block_count_before, bool is_boundary,
     float* residual_out, const float* mlp_query, const __nv_bfloat16* mlp_norm_w,
-    float* mlp_out, __half* mlp_out_h, int B, const int32_t* d_pos, cudaStream_t stream) {
-    mega_attn_post_mlp_in_kernel<<<B, 576, 0, stream>>>(
+    float* mlp_out, __half* mlp_out_h, int B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    launch_pdl(mega_attn_post_mlp_in_kernel, dim3(B), 576, stream,
         o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary,
-        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos);
+        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p);
 }
 
 void launch_mega_mlp_post_res(
     const float* moe_down_or_slots, bool moe_is_slotted, const __nv_bfloat16* mlp_sconv_w, float* mlp_ring,
-    const float* residual, float* hidden_out, int B, const int32_t* d_pos, cudaStream_t stream) {
-    mega_mlp_post_res_kernel<<<B, 576, 0, stream>>>(
-        moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, d_pos);
+    const float* residual, float* hidden_out, int B, const int32_t* d_pos,
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    launch_pdl(mega_mlp_post_res_kernel, dim3(B), 576, stream,
+        moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, d_pos,
+        abl_r, abl_d, abl_p);
 }
 
 void launch_vec_add(const float* a, const float* b, float* out, int n, cudaStream_t stream) {

@@ -21,11 +21,16 @@ pub fn build(b: *std.Build) void {
         "CUDA Blackwell SM architecture (default: 120a)",
     ) orelse "120a";
 
+    const default_cuda_path: []const u8 = if (@import("builtin").os.tag == .linux and std.os.linux.access("/opt/cuda/bin/nvcc", 0) == 0)
+        "/opt/cuda"
+    else
+        "/usr/local/cuda";
+
     const cuda_path = b.option(
         []const u8,
         "cuda-path",
-        "CUDA toolkit root directory (default: /opt/cuda)",
-    ) orelse "/opt/cuda";
+        "CUDA toolkit root directory (auto-detects /opt/cuda or /usr/local/cuda)",
+    ) orelse default_cuda_path;
 
     const nvcc_bin = b.fmt("{s}/bin/nvcc", .{cuda_path});
     const cuda_lib = b.fmt("{s}/lib64", .{cuda_path});
@@ -38,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Compile all 4 Blackwell CUDA translation units in parallel with full
+    // Compile all 5 Blackwell CUDA translation units in parallel with full
     // content-addressed Zig caching (including header dependency tracking).
     const cuda_headers = [_][]const u8{
         "cuda/config.hpp",
@@ -98,7 +103,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run squid5060 with arbitrary CLI arguments");
     run_step.dependOn(&run_cmd.step);
 
-    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 3 ...]`
+    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 7 ...]`
     const serve_cmd = b.addRunArtifact(exe);
     serve_cmd.step.dependOn(b.getInstallStep());
     serve_cmd.addArg("serve");
@@ -106,7 +111,7 @@ pub fn build(b: *std.Build) void {
     const serve_step = b.step("serve", "Start the native Zig OpenAI HTTP/SSE API server");
     serve_step.dependOn(&serve_cmd.step);
 
-    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 3 ...]`
+    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 7 ...]`
     const bench_cmd = b.addRunArtifact(exe);
     bench_cmd.step.dependOn(b.getInstallStep());
     bench_cmd.addArg("bench");

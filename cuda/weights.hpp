@@ -27,15 +27,14 @@ struct ExpertBank {
     int n_experts = NUM_EXPERTS;
     int rows = 0; // w13: 2*INTERMEDIATE=2304, w2: HIDDEN=2304
     int cols = 0; // w13: HIDDEN=2304, w2: INTERMEDIATE=1152
-    uint8_t* data = nullptr;    // All-VRAM mode: U8 [E, rows, cols/2], Cache mode: nullptr
-    uint8_t* scales = nullptr;  // All-VRAM mode: F8_E4M3 [E, rows, cols/16], Cache mode: nullptr
-    float* expert_scale = nullptr; // NVFP4: precomputed F32 [E] = amax[e] / denom[0] (always in VRAM)
-
-    // Unified 8 GB VRAM Expert Cache + Zero-Copy Mapped Host Fallback (active when cache_pool != nullptr)
-    uint8_t* cache_pool = nullptr;    // Unified VRAM cache [num_slots * EXPERT_SLOT_BYTES]
-    uint8_t* host_pool = nullptr;     // Layer's pinned mapped host bank [128 * EXPERT_SLOT_BYTES]
-    int32_t* slot_map = nullptr;      // Layer's VRAM slot map [128]: >=0 = VRAM slot, -1 = host zero-copy
-    uint32_t* touch_counts = nullptr; // Layer's VRAM touch counter [128] (incremented per visit/token)
+    uint8_t* data = nullptr;    // NVFP4: U8 [E, rows, cols/2], MXFP8: F8_E4M3 [E, rows, cols]
+    uint8_t* scales = nullptr;  // NVFP4: F8_E4M3 [E, rows, cols/16], MXFP8: U8 UE8M0 [E, rows, cols/32]
+    float* expert_scale = nullptr; // NVFP4: precomputed F32 [E] = amax[e] / denom[0]
+    // 8 GB Unified Expert Cache fields (null when all experts are resident in VRAM)
+    uint8_t* cache_pool = nullptr;   // Unified VRAM slot pool [num_slots, EXPERT_SLOT_BYTES]
+    uint8_t* host_pool = nullptr;    // Per-layer zero-copy mapped host bank [128, EXPERT_SLOT_BYTES]
+    int32_t* slot_map = nullptr;     // Per-layer [128] -> VRAM slot index or -1 (PCIe miss)
+    uint32_t* touch_counts = nullptr;// Per-layer [128] atomic touch telemetry (w13 only)
 };
 
 struct ControllerWeights {
@@ -125,8 +124,9 @@ struct DsparkWeights {
     // Precomputed folded draft projections for blazing fast Markov RNN argmax:
     // Optional pruned draft vocabulary (e.g. 32K/49K tokens -> 4-6x faster drafter, 100% lossless!)
     int draft_vocab_size = VOCAB_UNPADDED;
-    int32_t* draft_vocab_ids = nullptr; // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
-    LinearWeight unembed_draft;         // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
+    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
+    int32_t* inv_draft_vocab_ids = nullptr; // [VOCAB_UNPADDED] maps real vocab ID -> local idx or -1 (nullptr = identity)
+    LinearWeight unembed_draft;             // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
     LinearWeight fold_w;                // [draft_vocab_size, 256]  (NVFP4: only 4.7-7.0 MB!)
     float* fold_b = nullptr;            // [draft_vocab_size] F32
 

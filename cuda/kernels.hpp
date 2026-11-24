@@ -39,15 +39,25 @@ void launch_bf16_linear(
     int B, int N, int K,
     cudaStream_t stream);
 
-// Fused LM Head + Softcap(30) + GPU Argmax for B rows!
-// Optionally writes full logits [B, VOCAB_UNPADDED] if out_logits != nullptr.
+// Fused LM Head + Softcap(30) + GPU Argmax / Leviathan-Chen Stochastic Rejection Sampling!
+// sample_cfg->inv_temp == 0: pure greedy argmax (zero logits write).
+// sample_cfg->inv_temp <  0: write post-softcap logits for KLD eval + greedy argmax.
+// sample_cfg->inv_temp >  0: temperature/top_p/top_k sampling (with exact rejection sampling when d_draft_tokens != nullptr).
 void launch_lm_head_argmax(
     const LinearWeight& unembed,
-    const float* x,          // [B, HIDDEN]
-    int32_t* out_tokens,     // [B]
-    float* out_logits,       // optional [B, VOCAB_UNPADDED]
-    float* scratch_vals,     // [B, 1024]
-    int32_t* scratch_idxs,   // [B, 1024]
+    const float* x,                      // [B, HIDDEN]
+    int32_t* out_tokens,                 // [B]
+    float* out_logits,                   // optional [B, VOCAB_UNPADDED]
+    float* scratch_vals,                 // [B, 1024]
+    int32_t* scratch_idxs,               // [B, 1024]
+    const SampleConfig* sample_cfg,      // optional device pointer
+    const int32_t* d_pos,                // optional device pointer (batch start pos)
+    const int32_t* d_draft_tokens,       // optional [B-1] for rejection sampling
+    const float* d_draft_probs,          // optional [B-1, draft_vocab_size] normalized q_b(v)
+    const float* d_draft_q_sel,          // optional [B-1] q_b(draft_tokens[b])
+    const int32_t* d_draft_is_delta,     // optional [1] non-zero when prompt-lookup (q = delta_x)
+    const int32_t* inv_draft_vocab,      // optional [VOCAB_UNPADDED] real->draft idx (-1 if absent)
+    int draft_vocab_size,
     int B,
     cudaStream_t stream);
 
@@ -210,8 +220,11 @@ void launch_attn_prep_store(
     const float* cv,            // [B, KV_DIM]
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,     // [cap, KV_DIM]
-    __nv_bfloat16* v_cache,     // [cap, KV_DIM]
+    void* k_cache,              // [cap, KV_DIM] (BF16/FP8) or [cap, KV_DIM/2] (Q4)
+    void* v_cache,              // [cap, KV_DIM] (BF16/FP8) or [cap, KV_DIM/2] (Q4)
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     bool is_global,
     int B, const int32_t* d_pos,
@@ -344,6 +357,9 @@ void launch_mega_mlp_post_next_depth_norm(
     int n_out,
     int B,
     const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -357,8 +373,11 @@ void launch_mega_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     int B, const int32_t* d_pos,
     cudaStream_t stream);
@@ -379,6 +398,9 @@ void launch_mega_attn_post_mlp_in(
     float* mlp_out,            // [B, HIDDEN]
     __half* mlp_out_h,         // optional [B, HIDDEN]
     int B, const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // MEGA-FUSION 4: mlp_sconv + residual add -> hidden (supports deterministic 8-slot reduction when B>1!)
@@ -390,6 +412,9 @@ void launch_mega_mlp_post_res(
     const float* residual,
     float* hidden_out,
     int B, const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // Simple vector ops
@@ -432,6 +457,11 @@ void launch_dspark_draft(
     const float* f_ring,           // [16, HIDDEN], reads (pos - 1) & 15
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
+    float* out_draft_conf,         // optional [num_drafts] max softmax probability
+    const SampleConfig* sample_cfg,// optional device sampling config (inv_temp > 0 => stochastic draft!)
+    float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
+    float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
+    int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
@@ -473,6 +503,9 @@ void launch_prefill_sconv_post_res(
     int is_boundary,
     int B,
     const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 void launch_prefill_copy_taps(
@@ -492,8 +525,11 @@ void launch_prefill_local_sconv_prep_store(
     float* v_ring,
     const __nv_bfloat16* q_clip_scale,
     const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
     int kv_cap,
     int B,
     const int32_t* d_pos,
@@ -578,6 +614,7 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* sorted_tok,
     const int32_t* sorted_slot,
     __half* out_act_h,
+    int B,
     cudaStream_t stream);
 
 void launch_prefill_moe_down_h(
@@ -588,6 +625,7 @@ void launch_prefill_moe_down_h(
     const int32_t* sorted_slot,
     const float* sorted_w,
     float* out_slots,
+    int B,
     cudaStream_t stream);
 
 } // namespace squid

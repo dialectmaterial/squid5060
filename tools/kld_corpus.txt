@@ -1,0 +1,527 @@
+# Multi-Domain Long-Context KLD Evaluation Corpus (squid5090)
+# Designed to exercise both the 1,024-token sliding-window local attention layers
+# and the 8 global attention layers (positions > 1,024) across technical prose,
+# Python, C++/CUDA, Zig, mathematics, and analytical reasoning.
+
+## Section 1: GPU Memory Roofline and Autoregressive Bottlenecks
+
+Modern single-user large language model decoding is fundamentally constrained by
+DRAM memory bandwidth rather than floating-point compute throughput. On a
+workstation GPU with roughly 1,500 to 1,800 GB/s of sustained GDDR7 bandwidth
+and hundreds of teraflops of low-precision Tensor Core throughput, the ridge
+point for FP16 matrix multiplication exceeds 100 arithmetic operations per byte.
+When generating a single token (batch size B = 1), each dense linear projection
+reads an entire weight matrix W of shape [M, K] from off-chip memory, performs
+only 2 * M * K multiply-accumulate operations against a single activation vector
+of length K, and discards the weights until the next decode step.
+
+Consequently, the arithmetic intensity of B = 1 decoding is approximately two
+operations per weight element. If weights are stored in BF16 (2 bytes/weight),
+the intensity is 1 FLOP/byte; in FP8 (1 byte/weight), it is 2 FLOP/byte; in
+4-bit microscaled floating point (NVFP4, 0.5625 bytes/weight including E4M3
+group scales per 16 elements), it rises to ~3.55 FLOP/byte. Even at 4 bits per
+weight, the hardware remains deeply memory-bound at B = 1, leaving over 90% of
+the Tensor Core execution pipelines idle waiting for memory transactions.
+
+Speculative decoding alters this balance without modifying the target model's
+output distribution. A compact draft model or zero-cost n-gram lookup index
+proposes gamma candidate future tokens [d_1, d_2, ..., d_gamma]. The target
+model then evaluates all B = gamma + 1 positions simultaneously in a single
+forward pass. Because the target weights are streamed from VRAM once and reused
+across all B activation vectors in registers and shared memory, the effective
+arithmetic intensity scales linearly with B. When B = 8, the GPU loads nearly
+the same weight bytes as B = 1 (for dense layers, and only modestly more for
+sparse Mixture-of-Experts layers whose routed expert union grows sublinearly
+with B) while verifying up to 8 tokens in parallel.
+
+Under greedy decoding (temperature = 0), verification simply compares the target
+model's argmax token at each position i against the proposed draft token d_{i+1}.
+Under stochastic sampling (temperature > 0, top-p, top-k), exact distribution
+preservation requires the Leviathan-Chen rejection sampling algorithm:
+1. For each draft position i, accept d_{i+1} with probability
+   alpha_i = min(1, p_target(d_{i+1}) / q_draft(d_{i+1})).
+2. At the first rejected position r, draw a replacement token from the
+   normalized positive residual distribution:
+   p_res(x) = max(p_target(x) - q_draft(x), 0) / sum_y max(p_target(y) - q_draft(y), 0).
+3. If all gamma draft tokens are accepted, sample one bonus token directly from
+   p_target at the final position gamma.
+
+By the law of total probability, the resulting marginal probability of emitting
+any token x equals q(x) * min(1, p(x)/q(x)) + (1 - sum_y min(p(y), q(y))) *
+max(p(x) - q(x), 0) / (1 - sum_y min(p(y), q(y))) = min(p(x), q(x)) +
+max(p(x) - q(x), 0) = p(x). This identity holds strictly regardless of how well
+or poorly the drafter approximates p, provided p and q are evaluated over the
+exact same vocabulary support and the residual denominator is computed cleanly.
+
+---
+
+## Section 2: Python Implementation — Lock-Free Ring Buffer & LRU Cache
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Generic, Optional, TypeVar
+import heapq
+import math
+import time
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+@dataclass
+class CacheEntry(Generic[K, V]):
+    key: K
+    value: V
+    weight_bytes: int
+    prev: Optional[CacheEntry[K, V]] = None
+    next: Optional[CacheEntry[K, V]] = None
+
+
+class WeightedLRUCache(Generic[K, V]):
+    """O(1) byte-budgeted LRU cache with deterministic eviction hooks.
+
+    Tracks total resident bytes rather than item count so variable-length
+    KV-cache checkpoints and serialized prompt states obey strict RAM caps.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        if max_bytes <= 0:
+            raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+        self._max_bytes = max_bytes
+        self._used_bytes = 0
+        self._table: dict[K, CacheEntry[K, V]] = {}
+        self._head: Optional[CacheEntry[K, V]] = None
+        self._tail: Optional[CacheEntry[K, V]] = None
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @property
+    def used_bytes(self) -> int:
+        return self._used_bytes
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return (self.hits / total) if total > 0 else 0.0
+
+    def _unlink(self, node: CacheEntry[K, V]) -> None:
+        if node.prev is not None:
+            node.prev.next = node.next
+        else:
+            self._head = node.next
+        if node.next is not None:
+            node.next.prev = node.prev
+        else:
+            self._tail = node.prev
+        node.prev = None
+        node.next = None
+
+    def _push_front(self, node: CacheEntry[K, V]) -> None:
+        node.prev = None
+        node.next = self._head
+        if self._head is not None:
+            self._head.prev = node
+        else:
+            self._tail = node
+        self._head = node
+
+    def get(self, key: K) -> Optional[V]:
+        node = self._table.get(key)
+        if node is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        if node is not self._head:
+            self._unlink(node)
+            self._push_front(node)
+        return node.value
+
+    def put(self, key: K, value: V, weight_bytes: int) -> list[K]:
+        if weight_bytes < 0:
+            raise ValueError("weight_bytes must be non-negative")
+        evicted: list[K] = []
+        if weight_bytes > self._max_bytes:
+            return evicted
+        existing = self._table.get(key)
+        if existing is not None:
+            self._used_bytes -= existing.weight_bytes
+            self._unlink(existing)
+            existing.value = value
+            existing.weight_bytes = weight_bytes
+            self._used_bytes += weight_bytes
+            self._push_front(existing)
+        else:
+            node = CacheEntry(key=key, value=value, weight_bytes=weight_bytes)
+            self._table[key] = node
+            self._used_bytes += weight_bytes
+            self._push_front(node)
+
+        while self._used_bytes > self._max_bytes and self._tail is not None:
+            victim = self._tail
+            self._unlink(victim)
+            del self._table[victim.key]
+            self._used_bytes -= victim.weight_bytes
+            self.evictions += 1
+            evicted.append(victim.key)
+        return evicted
+
+
+def streaming_quantiles(samples: list[float]) -> dict[str, float]:
+    if not samples:
+        return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+    ordered = sorted(samples)
+    n = len(ordered)
+
+    def pct(q: float) -> float:
+        idx = q * (n - 1)
+        lo = int(math.floor(idx))
+        hi = min(n - 1, lo + 1)
+        frac = idx - lo
+        return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+    return {
+        "mean": sum(ordered) / n,
+        "p50": pct(0.50),
+        "p95": pct(0.95),
+        "p99": pct(0.99),
+        "max": ordered[-1],
+    }
+```
+
+---
+
+## Section 3: CUDA Warp-Level Online Softmax & Numerical Precision
+
+When implementing FlashAttention or split-K paged attention in CUDA, numerical
+stability hinges on two properties: avoiding exponent overflow during online
+softmax accumulation, and preventing underflow or NaN propagation when
+dequantizing microscaled weights and key-value caches.
+
+Consider a 4-bit symmetric key-value cache quantized in groups of 32 elements
+along the head dimension (`head_dim = 128`, producing 4 FP16 scales per head).
+For a group vector `x[0..31]`, we compute `amax = max_i |x_i|` and store
+`scale = __float2half(fmaxf(amax / 7.0f, 1e-7f))`. Why must the scale floor be
+`1e-7f` rather than `1e-8f`? The smallest positive subnormal IEEE-754 binary16
+value is `2^-24 = 5.9604645e-8`. Under round-to-nearest-even, any FP32 value
+below `2^-25 = 2.9802322e-8` (including `1e-8f`) rounds silently to exact `+0.0`
+in FP16! When the subsequent quantization step computes `inv_scale = 1.0f /
+__half2float(scale)`, dividing by zero produces `+Inf`, and multiplying `0.0f *
+Inf` produces `NaN` in the quantized nibble. Raising the floor to `1e-7f`
+guarantees that `__float2half(1e-7f)` is strictly nonzero (`2 * 2^-24 = 1.19e-7`),
+eliminating zero-row NaNs completely.
+
+A second subtle hazard arises in FP8 E4M3 matrix-vector products when dot
+products are accumulated in FP16 (`__hmul2` / `__hfma2`). Because E4M3 weights
+span up to `+/- 448.0`, multiplying an unscaled E4M3 weight by an activation
+magnitude of `|x| >= 18.3` yields `448 * 18.3 = 8,198` per term, and summing
+just eight terms in FP16 exceeds `65,504`, saturating to `Inf`. If a second
+term has opposite sign, `Inf + (-Inf) = NaN`. By unpacking each pair of FP8
+bytes to FP16 and converting immediately to FP32 (`__half2float`) before
+accumulating with `fmaf`, the dynamic range expands to `3.4e38` with zero
+measurable slowdown because the kernel is strictly memory-bandwidth bound.
+
+```cpp
+__device__ __forceinline__ float warp_reduce_max(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+    }
+    return v;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
+// Deterministic fixed-point accumulation for top-p cumulative histograms.
+// Unlike floating-point atomicAdd (whose rounding order varies with warp
+// scheduling), scaling each normalized probability p in [0, 1] by 2^30
+// produces bit-identical sums across arbitrary thread interleavings.
+__device__ __forceinline__ void accumulate_prob_bucket(
+    unsigned long long* hist_fixed,
+    int bucket,
+    float prob
+) {
+    unsigned long long q = (unsigned long long)llroundf(fminf(fmaxf(prob, 0.0f), 1.0f) * 1073741824.0f);
+    if (q > 0ULL) {
+        atomicAdd(&hist_fixed[bucket], q);
+    }
+}
+```
+
+A third hazard occurs in Programmatic Dependent Launch (PDL) on Blackwell
+(`sm_120a`). When a producer kernel signals `griddepcontrol.launch_dependents`
+early, the dependent consumer kernel begins executing concurrently on available
+SMs. Any load from the producer's output buffer issued before
+`griddepcontrol.wait` can observe stale data from the previous decode step, and
+even after `griddepcontrol.wait`, the compiler can hoist loads across an inline
+asm barrier that lacks a `"memory"` clobber or data-dependency chain. Using an
+explicit `asm volatile("griddepcontrol.wait;" ::: "memory")` paired with a
+dependency-carried load ensures strict release-acquire coherence without
+sacrificing overlap for independent setup arithmetic.
+
+---
+
+## Section 4: Zig Zero-Allocation Systems Patterns
+
+In long-running inference servers, unbounded heap allocation per HTTP request
+introduces latency jitter, memory fragmentation, and out-of-memory crashes
+under adversarial inputs. A TigerStyle architecture allocates all host and
+device workspaces once during startup and enforces explicit upper bounds on
+every loop, parser state, and buffer write.
+
+```zig
+const std = @import("std");
+
+pub const RingSlot = struct {
+    valid: bool = false,
+    position: u32 = 0,
+    checksum: u64 = 0,
+};
+
+pub const BoundedWriter = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    pub fn tryAppend(self: *BoundedWriter, bytes: []const u8) bool {
+        if (bytes.len > self.buf.len - self.len) return false;
+        @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
+        self.len += bytes.len;
+        return true;
+    }
+
+    pub fn slice(self: *const BoundedWriter) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
+    var diff: u8 = if (a.len == b.len) 0 else 1;
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+}
+
+pub fn clampI64ToI32(val: i64, lo: i32, hi: i32) i32 {
+    if (val < @as(i64, lo)) return lo;
+    if (val > @as(i64, hi)) return hi;
+    return @intCast(val);
+}
+
+pub fn parseBoundedPositiveInt(raw: []const u8, max_allowed: usize) ?usize {
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return null;
+    if (parsed > max_allowed) return null;
+    return parsed;
+}
+```
+
+Equally important in HTTP/1.1 request handling is defending against parser
+desynchronization and boundary bugs:
+- Trailing backslashes inside JSON strings (`{"messages":"a\`) must clamp the
+  cursor advance `pos = min(pos + 2, len)` so the index never steps past
+  `data.len` and triggers an out-of-bounds slice panic.
+- Oversized JSON string fields that exceed a scratch buffer must still consume
+  through their terminating unescaped quote before returning `null`, keeping
+  the outer object scanner synchronized.
+- Content-Length checks must compare `content_len > buffer.len - body_start`
+  rather than `body_start + content_len > buffer.len` to avoid unsigned integer
+  wraparound on crafted 64-bit lengths like `18446744073709551615`.
+- Client sockets should always configure `SO_RCVTIMEO` and `SO_SNDTIMEO` so a
+  slowloris peer cannot stall a single-threaded request loop indefinitely.
+- Untrusted chat message fields (`user`, `tool`, `assistant`) must be tokenized
+  with `parse_special = false` while only server-emitted template delimiters
+  use `parse_special = true`, preventing control-token injection attacks.
+
+---
+
+## Section 5: Information Theory, KL Divergence, and Fisher-LDA Geometry
+
+When comparing a quantized inference engine `q` against a full-precision
+reference distribution `p` at token position `t`, the forward Kullback-Leibler
+divergence is defined as:
+
+    D_KL(p_t || q_t) = sum_{v=1}^{V} p_t(v) * (log p_t(v) - log q_t(v))
+
+where `p_t(v) = softmax(z_ref(t))_v` and `q_t(v) = softmax(z_cand(t))_v` are
+computed in IEEE-754 float64 using log-sum-exp stabilization. Forward KLD is
+strictly non-negative (`D_KL >= 0`, with equality if and only if `p_t == q_t`)
+and is far more sensitive than top-1 argmax agreement or perplexity delta alone.
+Two engines can agree on 97% of top-1 greedy tokens while diverging heavily on
+the second and third most probable continuations — divergence that immediately
+degrades stochastic sampling at `temperature = 1.0, top_p = 0.95` and lowers
+speculative acceptance rates.
+
+Evaluating KLD only over short sequences (< 1,024 tokens) tests weight
+quantization thoroughly, because every layer's GEMV and MoE projection is
+exercised, but it does not stress long-range global KV-cache quantization when
+the model architecture employs a 1,024-token sliding local attention window.
+In hybrid recurrent/looped transformers with 40 local visits (BF16 sliding
+window of 1,024 tokens) and 8 global visits (quantized FP8 or Q4 KV cache),
+positions `t < 1,024` are dominated by local BF16 context. Only once the
+evaluation sequence extends to 4,096 tokens and beyond do attention heads in
+the global visits attend heavily to quantized keys and values stored thousands
+of positions earlier.
+
+Turning to representation geometry, directional activation editing (such as
+refusal abliteration) operates on residual stream vectors `y in R^d` (here
+`d = 2,304`). Suppose harmless prompt activations follow a distribution with
+mean `mu_h` and covariance matrix `Sigma_h`, while refusal-inducing prompt
+activations have mean `mu_r`. The difference-in-means vector `delta = mu_r -
+mu_h` defines the projection axis `r = delta / ||delta||_2`. However, because
+`Sigma_h` is highly anisotropic — stretched wide along semantic topic axes and
+narrow along orthogonal axes — projecting every activation along `r` indiscriminately
+distorts benign coding and analytical prompts that happen to have non-zero
+inner product with `r`.
+
+Fisher's Linear Discriminant Analysis resolves this by solving the generalized
+eigenvalue problem for the maximum signal-to-noise detector axis:
+
+    d = normalize( (Sigma_h + lambda * I)^{-1} * delta )
+
+Geometrically, multiplying by `Sigma_h^{-1}` whitens the harmless covariance
+ellipsoid into an isotropic sphere, turning `d` nearly orthogonal to the
+high-variance harmless subspace. At runtime, we compute a lightweight scalar
+gate `g(y) = I(d . y > tau)` where `tau = d . mu_h + k * sigma_d` sits several
+standard deviations above the harmless cloud. Whenever `d . y <= tau`, `g(y) = 0`
+and the hidden state passes through untouched with zero numerical perturbation.
+Only when `d . y > tau` does the kernel subtract the excess component above the
+harmless baseline `c = r . mu_h`:
+
+    y' = y - w * g(y) * max(r . y - c, 0) * r
+
+Because this update is a rank-1 vector operation fused into the existing
+post-attention and post-MLP short-convolution kernel, its memory footprint is
+only 1.8 MB for all 48 visits (directions, detectors, and per-visit scalars),
+requiring zero modifications to the 14.6 GiB base checkpoint weights.
+
+---
+
+## Section 6: Distributed Systems Debugging Case Study & Long-Range Recall
+
+To verify that global attention layers accurately retrieve distant facts from
+Section 1 through Section 5 (well past the 1,024-token sliding window), let us
+synthesize the concrete numerical invariants introduced earlier and trace a
+multi-turn debugging scenario.
+
+Recall the key constants established in Sections 1 through 5:
+- In Section 1, NVFP4 weights consume 0.5625 bytes per weight including E4M3
+  group scales per 16 elements, giving ~3.55 FLOP/byte at B = 1, while
+  speculative verification of gamma candidate tokens runs at batch size
+  B = gamma + 1 and preserves exact target probabilities via Leviathan-Chen
+  rejection sampling (`alpha_i = min(1, p_target / q_draft)`).
+- In Section 2, `WeightedLRUCache` tracks `_used_bytes` against `_max_bytes`,
+  unlinking and pushing accessed entries to `_head` in O(1) time and evicting
+  from `_tail` whenever `_used_bytes > _max_bytes`.
+- In Section 3, the FP16 minimum subnormal is `2^-24 = 5.9604645e-8`, so the
+  Q4 KV group scale floor must be at least `1e-7f` rather than `1e-8f` to
+  avoid rounding to `+0.0` in FP16; FP8 E4M3 weights reach `+/- 448.0`, so
+  FP16 accumulation overflows at `|x| >= 18.3`; and fixed-point top-p histogram
+  accumulation scales probabilities by `2^30 = 1,073,741,824` for bit-identical
+  results across warp schedules.
+- In Section 4, HTTP/1.1 servers prevent unsigned wraparound by checking
+  `content_len > buffer.len - body_start`, clamp backslash advances to
+  `min(pos + 2, len)`, enforce socket timeouts (`SO_RCVTIMEO` / `SO_SNDTIMEO`),
+  and tokenize untrusted message payloads with `parse_special = false`.
+- In Section 5, forward KL divergence `D_KL(p_t || q_t)` is evaluated in FP64,
+  and Fisher-LDA uses `d = normalize((Sigma_h + lambda I)^(-1) delta)` with a
+  1.8 MB sidecar across 48 visits (40 local BF16 + 8 global quantized KV).
+
+Now consider a production bug report from a multi-turn coding agent session:
+"Turn 1 sends a 40,000-token repository context followed by Question A. Turn 2
+branches back to the 40,000-token repository context (dropping Question A) and
+asks Question B, whose prompt length happens to equal Turn 1's exact length of
+40,128 tokens. Turn 3 appends Question C to Turn 2. Unexpectedly, Turn 3
+hallucinates facts from Question A instead of Question B!"
+
+Root cause analysis:
+1. During Turn 1, the prefix cache saved a checkpoint of local attention rings
+   and sconv states in Slot 1 at position 40,128 (or at a 2,048-token aligned
+   boundary beyond the common prefix).
+2. When Turn 2 branched at `start_pos = 40,000`, the engine restored the
+   checkpoint at `start_pos` and prefilled the new 128 tokens of Question B into
+   global KV slots `40,000..40,127`.
+3. However, because checkpoint invalidation checked `ckpt.pos > prompt_len`
+   AFTER prefill instead of `ckpt.pos > start_pos` BEFORE prefill, the stale
+   Slot 1 checkpoint from Turn 1 at `pos == 40,128` remained marked `valid = true`!
+4. On Turn 3, the common prefix with Turn 2 was `40,128`, so the checkpoint
+   selector scanned all valid slots with `ckpt.pos <= 40,128`, picked stale
+   Slot 1 (which came earlier in the array than Slot 2), and restored Turn 1's
+   local sliding-window KV cache — injecting Question A's tokens into Turn 3!
+
+The fix is a single invariant enforced before prefill begins: whenever a non-
+shielded turn resumes at `start_pos`, immediately invalidate every cached
+checkpoint with `ckpt.pos > start_pos`. Any new intermediate or prefill-end
+checkpoints written during Turn 2's prefill then reflect strictly Turn 2's
+tokens, making stale branch resurrection impossible.
+
+A closely related boundary invariant governs speculative verification near the
+end of the allocated context window (`context_tokens_max`). Suppose
+`context_tokens_max = 65,536` and `current_position = 65,532` (4 tokens left).
+If the engine launches a `B = 8` verify pass, the CUDA kernel writes keys and
+values for tokens `65,532..65,539` modulo `kv_cap = 65,536`, wrapping the four
+speculative lookahead slots `65,536..65,539` directly onto global KV positions
+`0, 1, 2, 3` — silently overwriting the beginning-of-sequence and system-prompt
+KV cache entries! Dropping out of the speculative verify loop whenever
+`current_position + block_size > context_tokens_max` and finishing the final
+`1..7` tokens with `B = 1` decode preserves slots `0..6` completely while losing
+less than a millisecond at the extreme tail of a 65K–1M context window.
+
+---
+
+## Section 7: Extended Numerical Verification & Cross-Section Synthesis
+
+Let us also check how quantized key-value caches interact with looped depth-
+norm architectures when prompts exceed several thousand tokens. In Inkling-2-Mini,
+the 24 physical transformer layers are traversed in 48 logical visits:
+- Layers 0 through 11 execute once (`visits 0..11`).
+- Layers 12 through 19 execute four times in a recurrent middle loop (`4 x 8 =
+  32` visits, `visits 12..43`), with learned cross-pass low-rank gating
+  controllers (`rank = 576`) bridging pass `p - 1` into pass `p`.
+- Layers 20 through 23 execute once (`visits 44..47`), using MXFP8 experts in
+  the official checkpoint rather than NVFP4 experts.
+
+Across those 48 visits, exactly 8 visits use full global attention without
+sliding-window truncation, while the remaining 40 visits attend only to the
+most recent 1,024 tokens in BF16. Because only 8 of 48 visits store long-range
+global KV state, the per-token KV footprint is extraordinarily compact:
+- BF16 global KV: `8 visits * 2 (K+V) * 1,024 dims * 2 bytes = 32 KiB / token`
+  (32 GiB at 1M tokens — exceeds a single 32 GiB GPU).
+- FP8 E4M3 global KV: `8 * 2 * 1,024 * 1 byte + scales ~= 16.25 KiB / token`
+  (~16 GiB at 1M tokens, or ~4 GiB at 256K tokens).
+- Q4 symmetric global KV: `8 * 2 * 512 bytes + group scales ~= 8.5 KiB / token`
+  (~8.5 GiB at 1M tokens, fitting all 1,048,576 tokens + NVFP4 weights inside
+  23.2 GiB total VRAM with zero host spill!).
+
+Notice an important architectural nuance when evaluating Q4 global KV quality:
+at `ctx <= 1,024`, a token can still attend to all earlier tokens through the
+40 BF16 local visits in addition to the 8 global visits. Once the sequence
+passes 2,048 to 4,096 tokens, every earlier section — such as the `WeightedLRUCache`
+class in Section 2, the `1e-7f` FP16 subnormal scale floor in Section 3, and
+the Leviathan-Chen residual formula in Section 1 — falls outside the 1,024-token
+local window and can ONLY be retrieved via the 8 global visits! Therefore,
+computing exact FP64 KL divergence over this entire 4,000+ token document
+directly measures whether Q4 and FP8 global KV quantization preserve long-range
+attention fidelity when the local BF16 window can no longer see the earlier
+sections.
+
+Finally, let us verify one concrete algorithmic calculation tying Sections 1, 3,
+and 5 together:
+Suppose a draft model proposes a token `x` with probability `q(x) = 0.40`, while
+the target model assigns `p(x) = 0.25`. Under exact rejection sampling, `x` is
+accepted with probability `alpha = min(1, 0.25 / 0.40) = 0.625`. If a uniform
+draw `u ~ Uniform(0, 1)` lands at `u = 0.78 > 0.625`, `x` is rejected, and the
+residual mass `max(p(y) - q(y), 0)` is zero at `y = x` (since `0.25 - 0.40 < 0`).
+In exact arithmetic, `x` can never be resampled from the residual distribution;
+even under extreme floating-point degeneracy where `sum_y max(p(y) - q(y), 0)`
+underflows to zero, the fallback token must be selected from `argmax_{y != x} p(y)`
+rather than blindly emitting the rejected draft token `x`. This closes the final
+corner case in GPU-resident speculative rejection sampling.

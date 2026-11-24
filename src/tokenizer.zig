@@ -178,7 +178,8 @@ pub const Tokenizer = struct {
                 var added_iter: u32 = 0;
                 while (pos < data.len and added_iter < special_tokens_max * 4) : (added_iter += 1) {
                     skip_ws(data, &pos);
-                    if (pos < data.len and data[pos] == ']') {
+                    if (pos >= data.len) break;
+                    if (data[pos] == ']') {
                         pos += 1;
                         break;
                     }
@@ -301,7 +302,7 @@ pub const Tokenizer = struct {
             var merge_iter: u32 = 0;
             while (mp < data.len and merge_iter < 600_000) : (merge_iter += 1) {
                 skip_ws(data, &mp);
-                if (mp < data.len and data[mp] == ']') break;
+                if (mp >= data.len or data[mp] == ']') break;
 
                 var a_slice: []const u8 = &.{};
                 var b_slice: []const u8 = &.{};
@@ -407,6 +408,7 @@ pub const Tokenizer = struct {
     }
 
     /// Encode `text` into caller-provided `output_ids` using `scratch`. ZERO dynamic allocation!
+    /// Stops gracefully at `output_ids.len` without panicking if the caller buffer is full.
     pub fn encode_into(
         self: *const Tokenizer,
         text: []const u8,
@@ -415,7 +417,7 @@ pub const Tokenizer = struct {
         output_ids: []i32,
     ) usize {
         tiger.assert(self.byte_arena.len > 0);
-        tiger.assert(output_ids.len > 0);
+        if (text.len == 0 or output_ids.len == 0) return 0;
         var out_len: usize = 0;
         if (!parse_special or self.special_count == 0) {
             self.pretokenize_and_encode(text, scratch, output_ids, &out_len);
@@ -426,7 +428,7 @@ pub const Tokenizer = struct {
         var seg_start: usize = 0;
         var iter: usize = 0;
         const iter_max: usize = text.len + 1;
-        while (pos < text.len and iter < iter_max) : (iter += 1) {
+        while (pos < text.len and out_len < output_ids.len and iter < iter_max) : (iter += 1) {
             const cand_rel = std.mem.indexOf(u8, text[pos..], "<|") orelse break;
             const cand = pos + cand_rel;
             var matched_id: i32 = -1;
@@ -445,7 +447,7 @@ pub const Tokenizer = struct {
                 if (cand > seg_start) {
                     self.pretokenize_and_encode(text[seg_start..cand], scratch, output_ids, &out_len);
                 }
-                tiger.assert(out_len < output_ids.len);
+                if (out_len >= output_ids.len) return out_len;
                 output_ids[out_len] = matched_id;
                 out_len += 1;
                 pos = cand + matched_len;
@@ -454,7 +456,7 @@ pub const Tokenizer = struct {
                 pos = cand + 2;
             }
         }
-        if (seg_start < text.len) {
+        if (seg_start < text.len and out_len < output_ids.len) {
             self.pretokenize_and_encode(text[seg_start..], scratch, output_ids, &out_len);
         }
         return out_len;
@@ -473,7 +475,7 @@ pub const Tokenizer = struct {
         writer.append_slice("<|end_message|>");
     }
 
-    pub fn emit_thinking_effort(writer: *tiger.ByteWriter, effort: []const u8) void {
+    pub fn try_emit_thinking_effort(writer: *tiger.ByteWriter, effort: []const u8) bool {
         var num: f64 = 0.0;
         if (effort.len > 0) {
             if (std.mem.eql(u8, effort, "none")) {
@@ -489,14 +491,15 @@ pub const Tokenizer = struct {
             } else if (std.mem.eql(u8, effort, "xhigh") or std.mem.eql(u8, effort, "max")) {
                 num = 0.99;
             } else {
-                num = std.fmt.parseFloat(f64, effort) catch 0.0;
+                const parsed = std.fmt.parseFloat(f64, effort) catch 0.0;
+                num = if (std.math.isFinite(parsed)) parsed else 0.0;
             }
         }
-        if (num < 0.0) num = 0.0;
+        if (!std.math.isFinite(num) or num < 0.0) num = 0.0;
         if (num > 0.99) num = 0.99;
-        writer.append_slice("<|message_system|><|content_text|>Thinking effort level: ");
+        if (!writer.try_append_slice("<|message_system|><|content_text|>Thinking effort level: ")) return false;
         if (num == 0.0) {
-            writer.append_slice("0");
+            if (!writer.try_append_slice("0")) return false;
         } else {
             // Trim trailing zeros to match C++ `%.6g` formatting
             var tmp: [32]u8 = undefined;
@@ -506,9 +509,13 @@ pub const Tokenizer = struct {
                 while (end > 1 and formatted[end - 1] == '0') end -= 1;
                 if (end > 1 and formatted[end - 1] == '.') end -= 1;
             }
-            writer.append_slice(formatted[0..end]);
+            if (!writer.try_append_slice(formatted[0..end])) return false;
         }
-        writer.append_slice("<|end_message|>");
+        return writer.try_append_slice("<|end_message|>");
+    }
+
+    pub fn emit_thinking_effort(writer: *tiger.ByteWriter, effort: []const u8) void {
+        tiger.assert(try_emit_thinking_effort(writer, effort));
     }
 
     fn store_arena_bytes(self: *Tokenizer, bytes: []const u8) u32 {
@@ -616,16 +623,29 @@ pub const Tokenizer = struct {
         output_ids: []i32,
         out_len: *usize,
     ) void {
-        if (piece.len == 0) return;
+        if (piece.len == 0 or out_len.* >= output_ids.len) return;
         if (piece.len == 1) {
-            tiger.assert(out_len.* < output_ids.len);
             output_ids[out_len.*] = self.byte_to_id[piece[0]];
             out_len.* += 1;
             return;
         }
+        if (piece.len > scratch.bpe_ids.len) {
+            var off: usize = 0;
+            while (off < piece.len and out_len.* < output_ids.len) {
+                var end = @min(piece.len, off + scratch.bpe_ids.len);
+                if (end < piece.len) {
+                    var back: usize = 0;
+                    while (back < 4 and end > off + 1 and (piece[end] & 0xC0) == 0x80) : (back += 1) {
+                        end -= 1;
+                    }
+                }
+                self.encode_bpe_piece(piece[off..end], scratch, output_ids, out_len);
+                off = end;
+            }
+            return;
+        }
         // Fast path: check if entire piece is directly in vocab (Wait: BPE merges can differ from direct lookup
         // only if an intermediate merge didn't exist; in o200k_base we run exact merge loop for 100% parity!)
-        tiger.assert(piece.len <= scratch.bpe_ids.len);
         var ids_len: usize = piece.len;
         for (piece, 0..) |byte, idx| {
             scratch.bpe_ids[idx] = self.byte_to_id[byte];
@@ -670,9 +690,11 @@ pub const Tokenizer = struct {
             ids_len = write_idx;
         }
 
-        tiger.assert(out_len.* + ids_len <= output_ids.len);
-        @memcpy(output_ids[out_len.* .. out_len.* + ids_len], ids[0..ids_len]);
-        out_len.* += ids_len;
+        const take: usize = @min(ids_len, output_ids.len - out_len.*);
+        if (take > 0) {
+            @memcpy(output_ids[out_len.* .. out_len.* + take], ids[0..take]);
+            out_len.* += take;
+        }
     }
 
     fn pretokenize_and_encode(
@@ -682,7 +704,60 @@ pub const Tokenizer = struct {
         output_ids: []i32,
         out_len: *usize,
     ) void {
-        if (text.len == 0) return;
+        if (text.len == 0 or out_len.* >= output_ids.len) return;
+        const chunk_cap: usize = @min(scratch.codepoints.len, 1024 * 1024);
+        if (text.len <= chunk_cap) {
+            self.pretokenize_and_encode_chunk(text, scratch, output_ids, out_len);
+            return;
+        }
+        // Stream arbitrarily large prompts (>2 MiB, e.g. 512K-1M context) in <=1 MiB chunks
+        // split cleanly at newline, whitespace, or UTF-8 character boundaries (zero heap alloc).
+        var off: usize = 0;
+        while (off < text.len and out_len.* < output_ids.len) {
+            var end: usize = @min(text.len, off + chunk_cap);
+            if (end < text.len) {
+                const search_floor: usize = if (end > off + 65536) (end - 65536) else (off + 1);
+                var split_pos: usize = 0;
+                var scan: usize = end;
+                while (scan > search_floor) {
+                    scan -= 1;
+                    if (text[scan] == '\n') {
+                        split_pos = scan + 1;
+                        break;
+                    }
+                }
+                if (split_pos == 0) {
+                    scan = end;
+                    while (scan > search_floor) {
+                        scan -= 1;
+                        if (text[scan] == ' ' or text[scan] == '\t' or text[scan] == '\r') {
+                            split_pos = scan;
+                            break;
+                        }
+                    }
+                }
+                if (split_pos > off) {
+                    end = split_pos;
+                } else {
+                    var back: usize = 0;
+                    while (back < 4 and end > off + 1 and (text[end] & 0xC0) == 0x80) : (back += 1) {
+                        end -= 1;
+                    }
+                }
+            }
+            self.pretokenize_and_encode_chunk(text[off..end], scratch, output_ids, out_len);
+            off = end;
+        }
+    }
+
+    fn pretokenize_and_encode_chunk(
+        self: *const Tokenizer,
+        text: []const u8,
+        scratch: *TokenizerScratch,
+        output_ids: []i32,
+        out_len: *usize,
+    ) void {
+        if (text.len == 0 or out_len.* >= output_ids.len) return;
         tiger.assert(text.len <= scratch.codepoints.len);
 
         var cp_count: usize = 0;
@@ -955,57 +1030,68 @@ pub fn parse_json_string(data: []const u8, pos: *usize, out_buf: []u8) ?[]const 
     if (pos.* >= data.len or data[pos.*] != '"') return null;
     pos.* += 1;
 
-    // Fast path: check if string has no escapes before closing quote -> zero copy?
-    // Copy into out_buf so callers always own a contiguous decoded slice.
     var out_len: usize = 0;
+    var overflowed: bool = false;
     while (pos.* < data.len) {
         const c = data[pos.*];
         pos.* += 1;
-        if (c == '"') return out_buf[0..out_len];
+        if (c == '"') return if (overflowed) null else out_buf[0..out_len];
         if (c == '\\') {
             if (pos.* >= data.len) return null;
             const esc = data[pos.*];
             pos.* += 1;
+            if (overflowed) {
+                if (esc == 'u' and pos.* + 4 <= data.len) pos.* += 4;
+                continue;
+            }
             switch (esc) {
                 '"' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '"';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '"';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 '\\' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '\\';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '\\';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 '/' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '/';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '/';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 'b' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = 0x08;
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = 0x08;
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 'f' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = 0x0C;
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = 0x0C;
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 'n' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '\n';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '\n';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 'r' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '\r';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '\r';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 't' => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = '\t';
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = '\t';
+                        out_len += 1;
+                    } else overflowed = true;
                 },
                 'u' => {
                     var cp = parse_hex4(data, pos.*) orelse return null;
@@ -1017,18 +1103,22 @@ pub fn parse_json_string(data: []const u8, pos: *usize, out_buf: []u8) ?[]const 
                             pos.* += 6;
                         }
                     }
-                    if (!append_utf8_codepoint(out_buf, &out_len, cp)) return null;
+                    if (!append_utf8_codepoint(out_buf, &out_len, cp)) overflowed = true;
                 },
                 else => {
-                    if (out_len >= out_buf.len) return null;
-                    out_buf[out_len] = esc;
-                    out_len += 1;
+                    if (out_len < out_buf.len) {
+                        out_buf[out_len] = esc;
+                        out_len += 1;
+                    } else overflowed = true;
                 },
             }
-        } else {
-            if (out_len >= out_buf.len) return null;
-            out_buf[out_len] = c;
-            out_len += 1;
+        } else if (!overflowed) {
+            if (out_len < out_buf.len) {
+                out_buf[out_len] = c;
+                out_len += 1;
+            } else {
+                overflowed = true;
+            }
         }
     }
     return null;
@@ -1061,7 +1151,7 @@ pub fn skip_json_value(data: []const u8, pos: *usize) void {
         while (pos.* < data.len) {
             const c = data[pos.*];
             if (c == '\\') {
-                pos.* += 2;
+                pos.* = @min(pos.* + 2, data.len);
                 continue;
             }
             pos.* += 1;
@@ -1078,7 +1168,7 @@ pub fn skip_json_value(data: []const u8, pos: *usize) void {
                 while (pos.* < data.len) {
                     const sc = data[pos.*];
                     if (sc == '\\') {
-                        pos.* += 2;
+                        pos.* = @min(pos.* + 2, data.len);
                         continue;
                     }
                     pos.* += 1;

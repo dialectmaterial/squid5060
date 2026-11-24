@@ -1,0 +1,30 @@
+[project]
+name = "squid5090-tools"
+version = "0.1.0"
+description = "Optional offline Python abliteration and evaluation tools for squid5090 (core engine requires zero Python)"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.10.0",
+    "transformers",
+    "safetensors",
+    "numpy",
+    "pyarrow",
+    "huggingface-hub",
+    "datasets",
+    "optuna",
+    "accelerate",
+    "jinja2",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "6173a2f679ff4ed393afc499aefc569da7e68bc1" }

@@ -1,0 +1,39 @@
+squid5090
+Copyright (c) 2026 tensorfish
+
+This project includes kernel designs and inference features adapted from the
+following open-source projects:
+
+1. satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
+   https://github.com/satellitedown/inkling-2-mini-abliterated-ingine
+   - Runtime-gated Fisher-LDA directional ablation tensor schema & projection formula
+     (optional `--ablation <path.safetensors>` support in src/weights.zig,
+     cuda/kernels_inkling.cu, and cuda/kernels_prefill.cu).
+   - Blackwell Programmatic Dependent Launch (PDL) overlap pattern and register-
+     permuted Tensor Core `mma.m16n8k16` decode MoE and dense NVFP4 GEMV structure
+     (cuda/kernels_common.cuh, cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
+   - Device-side adaptive `{2, 4, 8}` DSpark speculative verify width selection via
+     CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`) and Markov-head
+     online softmax confidence scoring (cuda/kernels_dspark.cu, cuda/cuda_abi.cu,
+     src/engine.zig).
+   - Multi-stage `cp.async` `128x128x64` grouped MoE GEMM pipeline structure for
+     prefill, specialized for Blackwell `cvt.rn.f16x2.e2m1x2` + FP16 MMA
+     (cuda/kernels_prefill.cu).
+   - Offline Fisher-LDA abliteration generation and refusal evaluation tools
+     (tools/ablate.py, tools/inkling_ref.py, tools/refusal_eval.py,
+     tools/pyproject.toml), adapted to run via `uv` and evaluate refusals via
+     `squid5090 serve`.
+
+2. AtomicBot-ai/atomic-engine (MIT License, llama.cpp fork)
+   https://github.com/AtomicBot-ai/atomic-engine/tree/codex/expert-weight-source
+   - Inspiration for hybrid prompt-lookup speculative drafting with DSpark
+     fallback (implemented from scratch as a zero-malloc O(1) hash-indexed
+     PromptLookupIndex in src/engine.zig).
+
+3. sybil-solutions/inference-optimisation-skill
+   https://github.com/sybil-solutions/inference-optimisation-skill
+   - Hardware-ceiling roofline methodology, noise-controlled hill-climbing
+     workflow, and lever prioritization documented in LEARNINGS.md.
+
+4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
+   Thinking Machines / Inkling-2-Mini.

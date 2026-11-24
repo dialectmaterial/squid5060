@@ -243,7 +243,10 @@ dspark_global_attn_bulk_splitk_kernel(
     int p = *d_pos;
     if (p <= 0) return;
 
-    int first = (p > cap) ? (p - cap) : 0;
+    // Reserve MTP_MAX_DRAFTS (7) slots of ring slack so rejected future draft tokens
+    // written ahead of *d_pos are never read as valid history when p > cap.
+    int max_win = max(0, cap - MTP_MAX_DRAFTS);
+    int first = (p > max_win) ? (p - max_win) : 0;
     int total_len = p - first;
     int split = blockIdx.y;
     int chunk = (total_len + KV_SPLIT_K - 1) / KV_SPLIT_K;
@@ -444,8 +447,8 @@ markov_rnn_proj_kernel(
     }
 }
 
-// Persistent 208-block SMEM NVFP4 base_logits[K, Vd] = unembed_draft @ normed_h + fold_b (8*26 SMs -> 0% wave tail!)
-constexpr int DSPARK_UNEMBED_BLOCKS = 208;
+// Persistent 680-block SMEM NVFP4 base_logits[K, Vd] = unembed_draft @ normed_h + fold_b (HALF-WARP -> 0% idle!)
+constexpr int DSPARK_UNEMBED_BLOCKS = 208; // 8 blocks/SM on RTX 5060 (26 SMs)
 
 template <int K_CONST>
 __global__ void __launch_bounds__(256)
@@ -504,7 +507,138 @@ dspark_base_logits_nvfp4_kernel(
     }
 }
 
-constexpr int MARKOV_BLOCKS = 104; // 4 blocks/SM on RTX 5060 (26 SMs -> 0% wave tail!)
+// Blackwell Tensor Core (mma.m16n8k16) NVFP4 Draft Unembed for K_CONST = 2..7!
+// 192 threads (SPLITK=6 warps, U=3 steps of 128 cols/warp = 2304 exact), persistent across V!
+template <int K_CONST>
+__global__ void __launch_bounds__(192)
+dspark_base_logits_nvfp4_mma_kernel(
+    const uint8_t* __restrict__ w_data,
+    const uint8_t* __restrict__ w_scales,
+    float gscale,
+    const __half* __restrict__ normed_h, // [K_CONST, HIDDEN]
+    const float* __restrict__ fold_b,    // [V]
+    float* __restrict__ out_base,        // [K_CONST, V]
+    int V, uint32_t zero) {
+    constexpr int SPLITK = 6;
+    constexpr int U = 3;
+    constexpr int CB = HIDDEN >> 1;
+    constexpr int SB = HIDDEN >> 4;
+    __shared__ __half s_xh[K_CONST][HIDDEN];
+    __shared__ float cs[SPLITK][16][8];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int c_base = warp * (4 * U) + t;
+
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    int total_x = K_CONST * HIDDEN;
+    for (int i = tid; i < total_x; i += 192) {
+        s_xh[i / HIDDEN][i % HIDDEN] = normed_h[i];
+    }
+    __syncthreads();
+
+    uint32_t xw[U][16];
+    const bool lx = (g < K_CONST);
+    #pragma unroll
+    for (int u = 0; u < U; ++u) {
+        int col = (c_base + 4 * u) * 32;
+        if (lx) {
+            const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                uint4 q = xp[v];
+                xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
+                xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
+            }
+        } else {
+            #pragma unroll
+            for (int v = 0; v < 16; ++v) xw[u][v] = 0;
+        }
+    }
+
+    auto decode32 = [](uint4 q, uint16_t s, uint32_t (&o)[16]) {
+        const __half2 sc = cvt_e4m3x2_to_half2(s);
+        const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
+        const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            __half2 h0, h1, h2, h3;
+            cvt_e2m1x8_to_half2x4(words[w], h0, h1, h2, h3);
+            const __half2 sm = (w < 2) ? slo : shi;
+            __half2 p0 = __hmul2(h0, sm), p1 = __hmul2(h1, sm), p2 = __hmul2(h2, sm), p3 = __hmul2(h3, sm);
+            o[4 * w + 0] = *reinterpret_cast<uint32_t*>(&p0);
+            o[4 * w + 1] = *reinterpret_cast<uint32_t*>(&p1);
+            o[4 * w + 2] = *reinterpret_cast<uint32_t*>(&p2);
+            o[4 * w + 3] = *reinterpret_cast<uint32_t*>(&p3);
+        }
+    };
+
+    int n_tiles = (V + 15) / 16;
+    for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+        int r0 = tile * 16;
+        int ra = r0 + g, rb = r0 + g + 8;
+        bool la = (ra < V), lb = (rb < V);
+
+        uint4 aq[U], bq[U];
+        uint16_t as[U], bs[U];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int c = c_base + 4 * u;
+            if (la) {
+                aq[u] = ld_stream_u4(w_data + (size_t)ra * CB + (size_t)c * 16);
+                as[u] = ld_scale_u16(w_scales + (size_t)ra * SB + (size_t)c * 2);
+            } else { aq[u] = make_uint4(0, 0, 0, 0); as[u] = 0; }
+            if (lb) {
+                bq[u] = ld_stream_u4(w_data + (size_t)rb * CB + (size_t)c * 16);
+                bs[u] = ld_scale_u16(w_scales + (size_t)rb * SB + (size_t)c * 2);
+            } else { bq[u] = make_uint4(0, 0, 0, 0); bs[u] = 0; }
+        }
+        uint32_t dep = 0;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) dep ^= aq[u].x ^ aq[u].w ^ bq[u].x ^ bq[u].w;
+        dep &= zero;
+
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            uint32_t a[16], b[16];
+            decode32(aq[u], as[u], a);
+            decode32(bq[u], bs[u], b);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                     a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
+                                     xw[u][2 * i] ^ dep, xw[u][2 * i + 1],
+                                     d[0], d[1], d[2], d[3]);
+            }
+        }
+        cs[warp][g][2 * t]     = d[0];
+        cs[warp][g][2 * t + 1] = d[1];
+        cs[warp][g + 8][2 * t]     = d[2];
+        cs[warp][g + 8][2 * t + 1] = d[3];
+        __syncthreads();
+
+        for (int idx = tid; idx < 16 * K_CONST; idx += 192) {
+            int r = idx / K_CONST;
+            int k = idx % K_CONST;
+            int row = r0 + r;
+            if (row < V) {
+                float s = cs[0][r][k] + cs[1][r][k] + cs[2][r][k]
+                        + cs[3][r][k] + cs[4][r][k] + cs[5][r][k];
+                float fb = fold_b ? __ldg(fold_b + row) : 0.0f;
+                out_base[(size_t)k * V + row] = s * gscale + fb;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+constexpr int MARKOV_BLOCKS = 104; // 4 blocks/SM on RTX 5060 (26 SMs)
 
 template <int KIND> // 0=BF16, 2=NVFP4
 __global__ void __launch_bounds__(256)
@@ -518,7 +652,12 @@ markov_fold_argmax_stage1_kernel(
     float* __restrict__ state,             // [256] updated by block 0!
     float* __restrict__ blk_val,
     int32_t* __restrict__ blk_idx,
+    float* __restrict__ blk_cm,
+    float* __restrict__ blk_csum,
+    float* __restrict__ out_step_probs,
+    const SampleConfig* __restrict__ sample_cfg,
     int V) {
+    const bool write_logits = (out_step_probs != nullptr) && (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f);
     __shared__ __half s_lh[256];
     __shared__ float s_lf[256];
     int tid = threadIdx.x;
@@ -541,6 +680,8 @@ markov_fold_argmax_stage1_kernel(
 
     float bv = -1e30f;
     int32_t bi = 0;
+    float cm = -1e30f;
+    float csum = 0.0f;
 
     for (int row = gr; row < V; row += tr) {
         float acc = 0.0f;
@@ -574,52 +715,240 @@ markov_fold_argmax_stage1_kernel(
         if (lane == 0) {
             float total = base_logits[row] + (fold_b ? fold_b[row] : 0.0f) + acc;
             if (total > bv) { bv = total; bi = row; }
+            float cap = fast_tanh(total * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+            if (write_logits) out_step_probs[row] = cap;
+            if (cap > cm) {
+                csum = (csum > 0.0f) ? (csum * __expf(cm - cap) + 1.0f) : 1.0f;
+                cm = cap;
+            } else {
+                csum += __expf(cap - cm);
+            }
         }
     }
 
-    __shared__ float sv[RPB];
+    __shared__ float sv[RPB], scm[RPB], scs[RPB];
     __shared__ int32_t si[RPB];
-    if (lane == 0) { sv[r_in_blk] = bv; si[r_in_blk] = bi; }
+    if (lane == 0) { sv[r_in_blk] = bv; si[r_in_blk] = bi; scm[r_in_blk] = cm; scs[r_in_blk] = csum; }
     __syncthreads();
     if (tid == 0) {
-        bv = sv[0]; bi = si[0];
+        bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
         for (int w = 1; w < RPB; ++w) {
             if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+            if (scs[w] > 0.0f) {
+                float nm = fmaxf(cm, scm[w]);
+                csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
+                cm = nm;
+            }
         }
         blk_val[blockIdx.x] = bv;
         blk_idx[blockIdx.x] = bi;
+        blk_cm[blockIdx.x] = cm;
+        blk_csum[blockIdx.x] = csum;
     }
 }
 
 __global__ void markov_fold_argmax_stage2_kernel(
     const float* __restrict__ blk_val,
     const int32_t* __restrict__ blk_idx,
+    const float* __restrict__ blk_cm,
+    const float* __restrict__ blk_csum,
     const int32_t* __restrict__ draft_vocab_ids, // optional remap to real vocab ID
-    int32_t* __restrict__ out_tok) {
+    int32_t* __restrict__ out_tok,
+    float* __restrict__ out_conf,
+    float* __restrict__ out_step_probs,
+    float* __restrict__ out_q_sel,
+    int32_t* __restrict__ d_draft_is_delta,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    int step_idx,
+    int V) {
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
+    float cm = -1e30f;
+    float csum = 0.0f;
     for (int i = tid; i < MARKOV_BLOCKS; i += 256) {
         float v = blk_val[i];
         int32_t idx = blk_idx[i];
         if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+        float bcm = blk_cm[i], bcs = blk_csum[i];
+        if (bcs > 0.0f) {
+            float nm = fmaxf(cm, bcm);
+            csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + bcs * __expf(bcm - nm);
+            cm = nm;
+        }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         float ov = __shfl_xor_sync(0xffffffffu, bv, off);
         int32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
         if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        float om = __shfl_xor_sync(0xffffffffu, cm, off);
+        float os = __shfl_xor_sync(0xffffffffu, csum, off);
+        if (os > 0.0f) {
+            float nm = fmaxf(cm, om);
+            csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + os * __expf(om - nm);
+            cm = nm;
+        }
     }
-    __shared__ float sv[8];
+    __shared__ float sv[8], scm[8], scs[8];
     __shared__ int32_t si[8];
-    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; scm[tid >> 5] = cm; scs[tid >> 5] = csum; }
     __syncthreads();
+
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && out_step_probs != nullptr);
+    if (!do_sample) {
+        if (tid == 0) {
+            bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
+            for (int w = 1; w < 8; ++w) {
+                if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+                if (scs[w] > 0.0f) {
+                    float nm = fmaxf(cm, scm[w]);
+                    csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
+                    cm = nm;
+                }
+            }
+            *out_tok = draft_vocab_ids ? draft_vocab_ids[bi] : bi;
+            if (out_conf) *out_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+            if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        }
+        return;
+    }
+
+    __shared__ float s_max_cap;
+    __shared__ float s_conf;
+    __shared__ int32_t s_greedy;
+    __shared__ unsigned long long hist_sum[256];
+    __shared__ uint32_t hist_cnt[256];
+    __shared__ float s_tau;
+    __shared__ float s_inv_z;
+    __shared__ int32_t s_picked;
+
     if (tid == 0) {
-        bv = sv[0]; bi = si[0];
+        bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
         for (int w = 1; w < 8; ++w) {
             if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+            if (scs[w] > 0.0f) {
+                float nm = fmaxf(cm, scm[w]);
+                csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
+                cm = nm;
+            }
         }
-        *out_tok = draft_vocab_ids ? draft_vocab_ids[bi] : bi;
+        s_max_cap = cm;
+        s_greedy = bi;
+        s_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+    }
+    __syncthreads();
+
+    const int32_t top_k = sample_cfg->top_k;
+    if (top_k == 1) {
+        for (int row = tid; row < V; row += 256) out_step_probs[row] = (row == s_greedy) ? 1.0f : 0.0f;
+        __syncthreads();
+        if (tid == 0) {
+            int32_t pk = s_greedy;
+            *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
+            if (out_q_sel) *out_q_sel = 1.0f;
+            if (out_conf) *out_conf = s_conf;
+            if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        }
+        return;
+    }
+
+    const float max_cap = s_max_cap;
+    const float inv_temp = sample_cfg->inv_temp;
+    const float top_p = sample_cfg->top_p;
+    const uint64_t draft_seed = sample_cfg->seed ^ 0xD5A2C1B39E3779B9ULL;
+    const int32_t pos = (d_pos ? (*d_pos) : 0) + step_idx;
+
+    constexpr float HIST_RANGE = 20.0f;
+    constexpr float HIST_SCALE = 256.0f / HIST_RANGE;
+
+    if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
+        hist_sum[tid] = 0ULL;
+        hist_cnt[tid] = 0u;
+        __syncthreads();
+        for (int row = tid; row < V; row += 256) {
+            float d = (max_cap - out_step_probs[row]) * inv_temp;
+            if (d < HIST_RANGE) {
+                int bin = (int)(d * HIST_SCALE);
+                if (bin < 0) bin = 0;
+                else if (bin > 255) bin = 255;
+                unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
+                atomicAdd(&hist_sum[bin], fp);
+                atomicAdd(&hist_cnt[bin], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            double total_z = 0.0;
+            for (int k = 0; k < 256; ++k) total_z += (double)hist_sum[k];
+            double cum_z = 0.0;
+            uint32_t cum_c = 0u;
+            int cut_bin = 255;
+            const double target_z = (top_p > 0.0f && top_p < 1.0f) ? ((double)top_p * total_z) : total_z;
+            for (int k = 0; k < 256; ++k) {
+                cum_z += (double)hist_sum[k];
+                cum_c += hist_cnt[k];
+                const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
+                const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);
+                if (hit_p || hit_k) { cut_bin = k; break; }
+            }
+            s_tau = max_cap - ((float)(cut_bin + 1) / HIST_SCALE) / inv_temp;
+        }
+        __syncthreads();
+    } else {
+        if (tid == 0) s_tau = max_cap - HIST_RANGE / inv_temp;
+        __syncthreads();
+    }
+
+    const float tau = s_tau;
+    float local_z = 0.0f;
+    float best_s = -1e30f;
+    int32_t best_t = s_greedy;
+    for (int row = tid; row < V; row += 256) {
+        float l = out_step_probs[row];
+        if (l >= tau) {
+            float e = __expf((l - max_cap) * inv_temp);
+            out_step_probs[row] = e;
+            local_z += e;
+            float sc = (l - max_cap) * inv_temp + hash_gumbel(draft_seed, pos, row);
+            if (sc > best_s) { best_s = sc; best_t = row; }
+        } else {
+            out_step_probs[row] = 0.0f;
+        }
+    }
+    local_z = warp_sum(local_z);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+        int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
+        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
+    }
+    if ((tid & 31) == 0) { scs[tid >> 5] = local_z; sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
+    __syncthreads();
+    if (tid == 0) {
+        float tot_z = 0.0f;
+        best_s = sv[0]; best_t = si[0];
+        for (int w = 0; w < 8; ++w) {
+            tot_z += scs[w];
+            if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
+        }
+        s_inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
+        s_picked = best_t;
+    }
+    __syncthreads();
+
+    const float inv_z = s_inv_z;
+    for (int row = tid; row < V; row += 256) {
+        out_step_probs[row] *= inv_z;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int32_t pk = s_picked;
+        *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
+        if (out_q_sel) *out_q_sel = out_step_probs[pk];
+        if (out_conf) *out_conf = s_conf;
+        if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
     }
 }
 
@@ -697,24 +1026,12 @@ void launch_dspark_draft(
     void* ctx_k[MTP_LAYERS], void* ctx_v[MTP_LAYERS],
     const __half* ctx_ks[MTP_LAYERS], const __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt, float* split_buf,
-    const float* f_ring, float* ws, int32_t* out_draft_tokens, cudaStream_t stream) {
+    const float* f_ring, float* ws, int32_t* out_draft_tokens, float* out_draft_conf,
+    const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
+    int32_t* out_draft_is_delta, cudaStream_t stream) {
     const DsparkWeights& dw = mw.dspark;
 
     // Partition preallocated DSpark workspace (in floats):
-    // block_x:     8 * 2304 = 18,432
-    // normed:      8 * 2304 = 18,432
-    // qkv:         8 * 5120 = 40,960
-    // attn_out:    8 * 3072 = 24,576
-    // gu:          8 * 18432 = 147,456
-    // swiglu:      8 * 9216 = 73,728
-    // f_prev:      2304
-    // c_f:         768
-    // c_h:         7 * 768 = 5,376
-    // state:       256
-    // latent:      256
-    // blk_val:     680
-    // blk_idx:     680 (as int32)
-    // base_logits: 7 * VOCAB_UNPADDED = 1,400,406 floats (~5.6 MB)
     float* block_x     = ws;
     float* normed      = block_x + MTP_BLOCK_SIZE * HIDDEN;
     __half* normed_h   = reinterpret_cast<__half*>(normed + MTP_BLOCK_SIZE * HIDDEN);
@@ -731,7 +1048,9 @@ void launch_dspark_draft(
     float* raw_rnn     = state + MTP_MARKOV_RANK;
     float* blk_val     = raw_rnn + 3 * MTP_MARKOV_RANK;
     int32_t* blk_idx   = reinterpret_cast<int32_t*>(blk_val + MARKOV_BLOCKS);
-    float* base_logits = reinterpret_cast<float*>(blk_idx + MARKOV_BLOCKS);
+    float* blk_cm      = reinterpret_cast<float*>(blk_idx + MARKOV_BLOCKS);
+    float* blk_csum    = blk_cm + MARKOV_BLOCKS;
+    float* base_logits = blk_csum + MARKOV_BLOCKS;
 
     bool use_half = (dw.layers[0].w_qkv.kind != WeightKind::BF16);
 
@@ -804,12 +1123,12 @@ void launch_dspark_draft(
         float gs = dw.unembed_draft.global_scale;
         switch (num_drafts) {
             case 1: dspark_base_logits_nvfp4_kernel<1><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 2: dspark_base_logits_nvfp4_kernel<2><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 3: dspark_base_logits_nvfp4_kernel<3><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 4: dspark_base_logits_nvfp4_kernel<4><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 5: dspark_base_logits_nvfp4_kernel<5><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 6: dspark_base_logits_nvfp4_kernel<6><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 7: dspark_base_logits_nvfp4_kernel<7><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
+            case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
         }
     } else if (dw.unembed_draft.kind != WeightKind::BF16) {
         launch_linear_h(dw.unembed_draft, normed_h, base_logits, num_drafts, false, stream);
@@ -817,7 +1136,7 @@ void launch_dspark_draft(
         launch_linear(dw.unembed_draft, normed, base_logits, num_drafts, false, stream);
     }
 
-    // 6. Run num_drafts sequential Markov steps (24-block coalesced RNN + half-warp fused argmax!)
+    // 6. Run num_drafts sequential Markov steps (24-block coalesced RNN + half-warp fused argmax + exact confidence!)
     const float* fb_arg = fold_b_in_base ? nullptr : dw.fold_b;
     for (int i = 0; i < num_drafts; ++i) {
         const int32_t* prev_ptr = (i == 0) ? d_anchor_token : (out_draft_tokens + i - 1);
@@ -826,16 +1145,23 @@ void launch_dspark_draft(
             c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state, raw_rnn);
 
         const float* bl_i = base_logits + (size_t)i * Vd;
+        float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * Vd) : nullptr;
         if (dw.fold_w.kind == WeightKind::NVFP4) {
             markov_fold_argmax_stage1_kernel<2><<<MARKOV_BLOCKS, 256, 0, stream>>>(
                 dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, Vd);
+                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                dp_i, sample_cfg, Vd);
         } else {
             markov_fold_argmax_stage1_kernel<0><<<MARKOV_BLOCKS, 256, 0, stream>>>(
                 dw.fold_w.data, nullptr, 1.0f,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, Vd);
+                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                dp_i, sample_cfg, Vd);
         }
-        markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(blk_val, blk_idx, dw.draft_vocab_ids, out_draft_tokens + i);
+        markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
+            blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
+            out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr,
+            dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
+            sample_cfg, d_pos, i, Vd);
     }
 }
 

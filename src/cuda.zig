@@ -3,6 +3,14 @@
 
 const constants = @import("constants.zig");
 
+pub const CSampleConfig = extern struct {
+    inv_temp: f32 = 0.0,
+    top_p: f32 = 0.95,
+    top_k: i32 = 0,
+    pad: u32 = 0,
+    seed: u64 = 0,
+};
+
 pub const CLinearWeight = extern struct {
     kind: u8 = 0,
     rows: i32 = 0,
@@ -66,6 +74,7 @@ pub const CDsparkWeights = extern struct {
     hidden_out_b: ?*anyopaque = null,
     draft_vocab_size: i32 = 0,
     draft_vocab_ids: ?[*]i32 = null,
+    inv_draft_vocab_ids: ?[*]i32 = null,
     unembed_draft: CLinearWeight = .{},
     fold_w: CLinearWeight = .{},
     fold_b: ?[*]f32 = null,
@@ -300,6 +309,9 @@ pub extern "c" fn squid_launch_mega_local_sconv_prep_store(
     r_cs: *const anyopaque,
     k_cache: *anyopaque,
     v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    kv_fmt: u8,
     kv_cap: i32,
     batch_size: i32,
     d_pos: *const i32,
@@ -340,6 +352,9 @@ pub extern "c" fn squid_launch_mega_attn_post_mlp_in(
     mlp_out_h: ?*anyopaque,
     batch_size: i32,
     d_pos: *const i32,
+    abl_r: ?[*]const f32,
+    abl_d: ?[*]const f32,
+    abl_p: ?[*]const f32,
     stream: ?*anyopaque,
 ) void;
 
@@ -397,6 +412,9 @@ pub extern "c" fn squid_launch_mega_mlp_post_res(
     hidden_out: [*]f32,
     batch_size: i32,
     d_pos: *const i32,
+    abl_r: ?[*]const f32,
+    abl_d: ?[*]const f32,
+    abl_p: ?[*]const f32,
     stream: ?*anyopaque,
 ) void;
 
@@ -425,6 +443,9 @@ pub extern "c" fn squid_launch_mega_mlp_post_next_depth_norm(
     n_out: i32,
     batch_size: i32,
     d_pos: *const i32,
+    abl_r: ?[*]const f32,
+    abl_d: ?[*]const f32,
+    abl_p: ?[*]const f32,
     stream: ?*anyopaque,
 ) void;
 
@@ -435,6 +456,14 @@ pub extern "c" fn squid_launch_lm_head_argmax(
     out_logits: ?[*]f32,
     scratch_vals: [*]f32,
     scratch_idxs: [*]i32,
+    sample_cfg: ?*const CSampleConfig,
+    d_pos: ?*const i32,
+    d_draft_tokens: ?[*]const i32,
+    d_draft_probs: ?[*]const f32,
+    d_draft_q_sel: ?[*]const f32,
+    d_draft_is_delta: ?*const i32,
+    inv_draft_vocab: ?[*]const i32,
+    draft_vocab_size: i32,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -473,8 +502,34 @@ pub extern "c" fn squid_launch_dspark_draft(
     f_ring: [*]const f32,
     workspace: [*]f32,
     out_draft_tokens: [*]i32,
+    out_draft_conf: ?[*]f32,
+    sample_cfg: ?*const CSampleConfig,
+    out_draft_probs: ?[*]f32,
+    out_draft_q_sel: ?[*]f32,
+    out_draft_is_delta: ?*i32,
     stream: ?*anyopaque,
 ) void;
+
+pub extern "c" fn squid_adaptive_graph_create(
+    d_anchor: *const i32,
+    d_drafts: [*]const i32,
+    d_draft_conf: [*]const f32,
+    threshold: f32,
+    d_tokens: [*]i32,
+    d_chosen_width: *i32,
+    d_accepted: [*]const i32,
+    h_accepted: [*]i32,
+    d_num_acc: *const i32,
+    h_num_acc: *i32,
+    h_chosen_width: *i32,
+    stream: ?*anyopaque,
+    out_graph: *?*anyopaque,
+) i32;
+pub extern "c" fn squid_adaptive_graph_branch_begin(graph: ?*anyopaque, branch_idx: i32, stream: ?*anyopaque) i32;
+pub extern "c" fn squid_adaptive_graph_branch_end(stream: ?*anyopaque) i32;
+pub extern "c" fn squid_adaptive_graph_instantiate(graph: ?*anyopaque) i32;
+pub extern "c" fn squid_adaptive_graph_launch(graph: ?*anyopaque, stream: ?*anyopaque) i32;
+pub extern "c" fn squid_adaptive_graph_destroy(graph: ?*anyopaque) i32;
 
 pub extern "c" fn squid_launch_spec_verify(
     target_preds: [*]const i32,
@@ -542,6 +597,9 @@ pub extern "c" fn squid_launch_prefill_sconv_post_res(
     is_boundary: i32,
     batch_size: i32,
     d_pos: *const i32,
+    abl_r: ?[*]const f32,
+    abl_d: ?[*]const f32,
+    abl_p: ?[*]const f32,
     stream: ?*anyopaque,
 ) void;
 
@@ -565,6 +623,9 @@ pub extern "c" fn squid_launch_prefill_local_sconv_prep_store(
     r_cs: *const anyopaque,
     k_cache: *anyopaque,
     v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    kv_fmt: u8,
     kv_cap: i32,
     batch_size: i32,
     d_pos: *const i32,
@@ -654,6 +715,7 @@ pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
     sorted_tok: [*]const i32,
     sorted_slot: [*]const i32,
     out_act_h: *anyopaque,
+    batch_size: i32,
     stream: ?*anyopaque,
 ) void;
 
@@ -665,5 +727,6 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     sorted_slot: [*]const i32,
     sorted_w: [*]const f32,
     out_slots: [*]f32,
+    batch_size: i32,
     stream: ?*anyopaque,
 ) void;
