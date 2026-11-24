@@ -101,6 +101,8 @@ hf download thinkingmachines/Inkling-2-Mini --local-dir /path/to/inkling-2-mini
 | `--mtp` | `0` (`serve` 8 GB), `3` (≥15 GB) | DSpark MTP draft count (`0` = best mixed-workload default; `2` = best for code/high-acceptance) |
 | `--cache-mib` | `0` (auto) | Explicit VRAM MoE cache pool size in MiB (`0` = auto-fill remaining VRAM minus headroom) |
 | `--cache-headroom-mib` | `180` | Free VRAM margin reserved above the MoE cache pool |
+| `--cache-file` / `--no-warm-cache` | `<model_dir>/.squid5060-warm-cache.bin` | 12 KiB LRFU warm-cache snapshot saved on clean shutdown & bulk-DMA'd on startup (~259 ms → instant 90%+ Turn-1 hit rate) |
+| `--api-key-file` | unset | Read `Authorization: Bearer <key>` secret from a file (trimmed; matches `llama-server`) |
 | `--expert-cache` / `--no-expert-cache` | auto (`< 15 GiB`) | Force unified VRAM expert cache on or off |
 | `SQUID_CACHE_POLICY` | `lrfu` | Replacement policy (`lrfu` \| `clock`) |
 | `SQUID_CACHE_ASYNC` | `1` | Overlapped `copy_stream` promotion with victim quarantine (`1` \| `0`) |

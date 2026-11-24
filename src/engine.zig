@@ -190,6 +190,7 @@ pub const Engine = struct {
         kv_format: constants.KVFormat,
         cache_mib: u32,
         cache_headroom_mib: u32,
+        cache_file_path: []const u8,
     ) void {
         tiger.assert(context_tokens_max >= 64);
         tiger.assert(self.arena.base_ptr == null);
@@ -360,7 +361,7 @@ pub const Engine = struct {
         cuda.squid_launch_prefill_warmup_cublas(self.stream);
 
         if (weights.use_expert_cache) {
-            self.expert_cache.init(weights, cache_mib, cache_headroom_mib, self.stream);
+            self.expert_cache.init(weights, cache_mib, cache_headroom_mib, cache_file_path, self.stream);
         }
 
         const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);

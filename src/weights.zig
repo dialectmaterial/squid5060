@@ -586,13 +586,56 @@ pub const ModelWeights = struct {
             tiger.assert(w2_w.len == constants.expert_count * w2_db);
             tiger.assert(w2_s.len == constants.expert_count * w2_sb);
 
-            var e: usize = 0;
-            while (e < constants.expert_count) : (e += 1) {
-                const dst = h_bank + e * slot_bytes;
-                @memcpy((dst + @as(usize, @intCast(constants.expert_w13_data_off)))[0..w13_db], w13_w[e * w13_db ..][0..w13_db]);
-                @memcpy((dst + @as(usize, @intCast(constants.expert_w13_scale_off)))[0..w13_sb], w13_s[e * w13_sb ..][0..w13_sb]);
-                @memcpy((dst + @as(usize, @intCast(constants.expert_w2_data_off)))[0..w2_db], w2_w[e * w2_db ..][0..w2_db]);
-                @memcpy((dst + @as(usize, @intCast(constants.expert_w2_scale_off)))[0..w2_sb], w2_s[e * w2_sb ..][0..w2_sb]);
+            const PackCtx = struct {
+                h_bank: [*]u8,
+                w13_w: []const u8,
+                w13_s: []const u8,
+                w2_w: []const u8,
+                w2_s: []const u8,
+                e_start: usize,
+                e_end: usize,
+            };
+            const pack_worker = struct {
+                fn run(ctx: PackCtx) void {
+                    const sb: usize = @intCast(constants.expert_slot_bytes);
+                    const d13: usize = @intCast(constants.expert_w13_data_bytes);
+                    const s13: usize = @intCast(constants.expert_w13_scale_bytes);
+                    const d2: usize = @intCast(constants.expert_w2_data_bytes);
+                    const s2: usize = @intCast(constants.expert_w2_scale_bytes);
+                    var e: usize = ctx.e_start;
+                    while (e < ctx.e_end) : (e += 1) {
+                        const dst = ctx.h_bank + e * sb;
+                        @memcpy((dst + @as(usize, @intCast(constants.expert_w13_data_off)))[0..d13], ctx.w13_w[e * d13 ..][0..d13]);
+                        @memcpy((dst + @as(usize, @intCast(constants.expert_w13_scale_off)))[0..s13], ctx.w13_s[e * s13 ..][0..s13]);
+                        @memcpy((dst + @as(usize, @intCast(constants.expert_w2_data_off)))[0..d2], ctx.w2_w[e * d2 ..][0..d2]);
+                        @memcpy((dst + @as(usize, @intCast(constants.expert_w2_scale_off)))[0..s2], ctx.w2_s[e * s2 ..][0..s2]);
+                    }
+                }
+            }.run;
+
+            const n_threads: usize = 8;
+            const per_t: usize = constants.expert_count / n_threads;
+            var threads: [n_threads]?std.Thread = @splat(null);
+            var t: usize = 0;
+            while (t < n_threads) : (t += 1) {
+                const ctx: PackCtx = .{
+                    .h_bank = h_bank,
+                    .w13_w = w13_w,
+                    .w13_s = w13_s,
+                    .w2_w = w2_w,
+                    .w2_s = w2_s,
+                    .e_start = t * per_t,
+                    .e_end = if (t + 1 == n_threads) constants.expert_count else (t + 1) * per_t,
+                };
+                if (t + 1 < n_threads) {
+                    threads[t] = std.Thread.spawn(.{}, pack_worker, .{ctx}) catch null;
+                    if (threads[t] == null) pack_worker(ctx);
+                } else {
+                    pack_worker(ctx);
+                }
+            }
+            for (threads) |th_opt| {
+                if (th_opt) |th| th.join();
             }
 
             // Upload precomputed per-expert scales (24 KiB total across all 24 layers)

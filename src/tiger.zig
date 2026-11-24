@@ -98,6 +98,8 @@ comptime {
 pub const O_RDONLY: i32 = 0;
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_END: i32 = 2;
+
+pub extern "c" fn creat(pathname: [*:0]const u8, mode: u32) i32;
 pub const PROT_READ: i32 = 1;
 pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FAILED_ADDR: usize = std.math.maxInt(usize);

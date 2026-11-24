@@ -32,6 +32,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var model_name: []const u8 = "inkling-2-mini";
     var effort: []const u8 = "none";
     var api_key: []const u8 = "";
+    var api_key_file: []const u8 = "";
+    var api_key_buf: [512]u8 = undefined;
+    var cache_file_arg: []const u8 = "";
+    var cache_file_default_buf: [1024]u8 = undefined;
+    var disable_warm_cache: bool = false;
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
 
     var port: u16 = 8000;
@@ -85,6 +90,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--api-key") and arg_i + 1 < argv.len) {
             arg_i += 1;
             api_key = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--api-key-file") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            api_key_file = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--cache-file") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            cache_file_arg = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--no-warm-cache")) {
+            disable_warm_cache = true;
         } else if (std.mem.eql(u8, arg, "--mtp") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mtp = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
@@ -226,8 +239,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, use_expert_cache)) return 1;
     defer model_weights.deinit();
 
+    if (api_key_file.len > 0) {
+        const loaded_key = read_file_into(api_key_file, &api_key_buf) orelse {
+            tiger.print_stderr("Failed to read --api-key-file '{s}'\n", .{api_key_file});
+            return 1;
+        };
+        api_key = std.mem.trim(u8, loaded_key, " \t\r\n");
+    }
+
+    const cache_file_path: []const u8 = if (disable_warm_cache)
+        ""
+    else if (cache_file_arg.len > 0)
+        cache_file_arg
+    else
+        (std.fmt.bufPrint(&cache_file_default_buf, "{s}/.squid5060-warm-cache.bin", .{model_directory}) catch "");
+
     var engine: engine_mod.Engine = .{};
-    engine.init(&model_weights, ctx, use_graphs, kv_format, cache_mib, cache_headroom_mib);
+    engine.init(&model_weights, ctx, use_graphs, kv_format, cache_mib, cache_headroom_mib, cache_file_path);
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
