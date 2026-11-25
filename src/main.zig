@@ -8,6 +8,7 @@ const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const vision_mod = @import("vision.zig");
 const weights_mod = @import("weights.zig");
 
 const bench_runs_max: usize = 64;
@@ -27,6 +28,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var tokens_file: []const u8 = "";
     var prompt_text: []const u8 = "";
     var prompt_file: []const u8 = "";
+    var image_path: []const u8 = "";
     var mode_str: []const u8 = if (std.mem.eql(u8, command, "serve")) "fp8" else "exact";
     var mode_explicit: bool = false;
     var kv_str: []const u8 = "auto";
@@ -41,6 +43,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var api_key_file: []const u8 = "";
     var cache_file_arg: []const u8 = "";
     var no_warm_cache: bool = false;
+    var cpu_moe_mode: engine_mod.CpuMoeMode = .auto;
+    var idle_sleep_secs: u32 = 0;
+    var slot_keep: u32 = 4;
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
 
     var port: u16 = 8000;
@@ -84,6 +89,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--prompt-file") and arg_i + 1 < argv.len) {
             arg_i += 1;
             prompt_file = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--image") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            image_path = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--mode") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mode_str = std.mem.span(argv[arg_i]);
@@ -163,6 +171,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cache_file_arg = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--no-warm-cache")) {
             no_warm_cache = true;
+        } else if (std.mem.eql(u8, arg, "--cpu-moe") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const cm = std.mem.span(argv[arg_i]);
+            if (std.mem.eql(u8, cm, "off")) {
+                cpu_moe_mode = .off;
+            } else if (std.mem.eql(u8, cm, "on")) {
+                cpu_moe_mode = .on;
+            } else {
+                cpu_moe_mode = .auto;
+            }
+        } else if (std.mem.eql(u8, arg, "--idle-sleep") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            idle_sleep_secs = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--slot-keep") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            slot_keep = @min(std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 4, 8);
         } else if (std.mem.eql(u8, arg, "--expert-cache")) {
             expert_cache_opt = true;
         } else if (std.mem.eql(u8, arg, "--no-expert-cache")) {
@@ -236,7 +260,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 0;
     }
 
-    const need_tokenizer: bool = std.mem.eql(u8, command, "serve") or prompt_text.len > 0;
+    const need_tokenizer: bool = std.mem.eql(u8, command, "serve") or prompt_text.len > 0 or image_path.len > 0;
     var tokenizer: tokenizer_mod.Tokenizer = .{};
     if (need_tokenizer) {
         if (!tokenizer.load(model_directory)) return 1;
@@ -360,7 +384,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         break :blk p;
     };
     if (use_expert_cache) {
+        engine.cpu_moe_mode = cpu_moe_mode;
         engine.init_expert_cache(&model_weights, cache_mib, cache_headroom_mib, cache_file_path);
+        engine.init_cpu_moe(&model_weights);
     }
 
     if (std.mem.eql(u8, command, "serve")) {
@@ -377,6 +403,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
             .keep_history_thinking = keep_history_thinking,
+            .idle_sleep_secs = idle_sleep_secs,
+            .slot_keep = slot_keep,
         });
     }
 
@@ -606,6 +634,52 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer tiger.free_host_slice(i32, out_tokens_buf);
 
     if (std.mem.eql(u8, command, "generate")) {
+        var cli_img_embeds: []f32 = &.{};
+        defer if (cli_img_embeds.len > 0) tiger.free_host_slice(f32, cli_img_embeds);
+        var cli_img_spans: [1]vision_mod.ImageSpan = .{.{}};
+
+        if (image_path.len > 0) {
+            const img_file_buf = tiger.alloc_host_zeroed(u8, 32 * 1024 * 1024);
+            defer tiger.free_host_slice(u8, img_file_buf);
+            const img_bytes = read_file_into(image_path, img_file_buf) orelse {
+                tiger.print_stderr("Failed to read --image '{s}'\n", .{image_path});
+                return 1;
+            };
+            cli_img_embeds = tiger.alloc_host_zeroed(f32, @as(usize, vision_mod.max_image_tokens) * constants.hidden_dim);
+            const enc_img = engine.encode_image(img_bytes, cli_img_embeds) orelse {
+                tiger.print_stderr("Failed to encode --image '{s}' (supported: PNG, JPEG)\n", .{image_path});
+                return 1;
+            };
+
+            var scratch = tokenizer_mod.TokenizerScratch.init();
+            defer scratch.deinit();
+            var hdr_buf: [256]u8 = undefined;
+            var hw = tiger.ByteWriter.init(&hdr_buf);
+            _ = tokenizer_mod.Tokenizer.try_emit_thinking_effort(&hw, effort);
+            _ = hw.try_append_slice("<|message_user|><|content_image|>");
+
+            var plen: usize = tokenizer.encode_into(hw.slice(), true, &scratch, prompt_ids_buf);
+            const img_pos: u32 = @intCast(plen);
+            var ki: u32 = 0;
+            while (ki < enc_img.num_tokens and plen < prompt_ids_buf.len) : (ki += 1) {
+                prompt_ids_buf[plen] = vision_mod.image_token_id;
+                plen += 1;
+            }
+            plen += tokenizer.encode_into("<|end_message|><|message_user|><|content_text|>", true, &scratch, prompt_ids_buf[plen..]);
+            const user_q: []const u8 = if (prompt_text.len > 0) prompt_text else "Describe this image.";
+            plen += tokenizer.encode_into(user_q, false, &scratch, prompt_ids_buf[plen..]);
+            plen += tokenizer.encode_into("<|end_message|>", true, &scratch, prompt_ids_buf[plen..]);
+            prompt_len = plen;
+
+            cli_img_spans[0] = .{
+                .prompt_pos = img_pos,
+                .num_tokens = enc_img.num_tokens,
+                .embeds = cli_img_embeds[0 .. @as(usize, enc_img.num_tokens) * constants.hidden_dim],
+            };
+            engine.active_images = cli_img_spans[0..1];
+        }
+        defer engine.active_images = &.{};
+
         const st = engine.generate(prompt_ids_buf[0..prompt_len], max_tokens, mtp, out_tokens_buf, null, null);
         const dec_toks: f64 = @floatFromInt(if (st.generated_tokens > 0) st.generated_tokens - 1 else 0);
         const tps: f64 = if (st.decode_ms > 0.0) (dec_toks * 1000.0 / st.decode_ms) else 0.0;
@@ -760,8 +834,8 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5060 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini (8 GB RTX 5060 Edition)\n\n" ++
             "Usage:\n" ++
-            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 32768] [--mtp 0|2|7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
-            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 32768] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
+            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
             "  squid5060 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5060 longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv q4|fp8|bf16] [--ctx 131072]\n" ++
             "  squid5060 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4|fp8|exact] [--kv bf16|q4] [--ctx 8192]\n" ++

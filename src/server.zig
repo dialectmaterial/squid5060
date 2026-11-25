@@ -8,6 +8,7 @@ const constants = @import("constants.zig");
 const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const vision_mod = @import("vision.zig");
 
 const request_buffer_bytes: usize = 32 * 1024 * 1024;
 const prompt_render_bytes: usize = 32 * 1024 * 1024;
@@ -43,6 +44,8 @@ pub const ServerConfig = struct {
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
+    idle_sleep_secs: u32 = 0,
+    slot_keep: u32 = 4,
 };
 
 const StopList = struct {
@@ -93,6 +96,8 @@ const ServerBuffers = struct {
     sse_buf: []u8,
     prompt_tokens: []i32,
     tok_scratch: tokenizer_mod.TokenizerScratch,
+    image_decode_buf: []u8 = &.{},
+    image_embeds_buf: []f32 = &.{},
 
     fn init() ServerBuffers {
         return .{
@@ -110,6 +115,16 @@ const ServerBuffers = struct {
         };
     }
 
+    fn ensure_vision_buffers(self: *ServerBuffers) void {
+        if (self.image_decode_buf.len == 0) {
+            self.image_decode_buf = tiger.alloc_host_zeroed(u8, 24 * 1024 * 1024);
+        }
+        if (self.image_embeds_buf.len == 0) {
+            const total_floats: usize = vision_mod.max_images_per_req * @as(usize, vision_mod.max_image_tokens) * constants.hidden_dim;
+            self.image_embeds_buf = tiger.alloc_host_zeroed(f32, total_floats);
+        }
+    }
+
     fn deinit(self: *ServerBuffers) void {
         tiger.free_host_slice(u8, self.request_buf);
         tiger.free_host_slice(u8, self.render_buf);
@@ -121,6 +136,8 @@ const ServerBuffers = struct {
         tiger.free_host_slice(u8, self.scratch_str_buf);
         tiger.free_host_slice(u8, self.sse_buf);
         tiger.free_host_slice(i32, self.prompt_tokens);
+        if (self.image_decode_buf.len > 0) tiger.free_host_slice(u8, self.image_decode_buf);
+        if (self.image_embeds_buf.len > 0) tiger.free_host_slice(f32, self.image_embeds_buf);
         self.tok_scratch.deinit();
     }
 };
@@ -353,20 +370,36 @@ pub fn run_openai_server(
     }
 
     g_listen_fd.store(listen_fd, .release);
-    engine.enable_prefix_cache();
+    engine.enable_prefix_cache_with_slots(config.slot_keep);
     var buffers = ServerBuffers.init();
     defer buffers.deinit();
 
     var prng_state: u64 = tiger.clock_monotonic_ns() ^ 0x9e3779b97f4a7c15;
     if (prng_state == 0) prng_state = 0x9e3779b97f4a7c15;
+    var last_activity_ns: u64 = tiger.clock_monotonic_ns();
 
     tiger.print_stdout(
-        "[server] TigerStyle Zig OpenAI API listening on http://{s}:{d}/v1 (model={s}, ctx={d}, mtp={d}, zero-malloc=on)\n",
-        .{ config.host, config.port, config.model_name, config.context_tokens_max, config.default_mtp },
+        "[server] TigerStyle Zig OpenAI API listening on http://{s}:{d}/v1 (model={s}, ctx={d}, mtp={d}, idle_sleep={d}s, slot_keep={d}, zero-malloc=on)\n",
+        .{ config.host, config.port, config.model_name, config.context_tokens_max, config.default_mtp, config.idle_sleep_secs, config.slot_keep },
     );
 
     const sock_timeout: tiger.Timeval = .{ .tv_sec = 30, .tv_usec = 0 };
     while (!g_stop_requested.load(.acquire)) {
+        if (config.idle_sleep_secs > 0 and !engine.sleeping) {
+            const now_ns: u64 = tiger.clock_monotonic_ns();
+            const idle_ns: u64 = @as(u64, config.idle_sleep_secs) * 1_000_000_000;
+            if (now_ns >= last_activity_ns and (now_ns - last_activity_ns) >= idle_ns) {
+                engine.sleep_vram();
+            }
+        }
+        var pfd = [_]tiger.PollFd{.{ .fd = listen_fd, .events = tiger.POLLIN, .revents = 0 }};
+        const prc: i32 = tiger.poll(&pfd, 1, 1000);
+        if (prc == 0) continue;
+        if (prc < 0) {
+            if (g_stop_requested.load(.acquire)) break;
+            if (tiger.get_errno() == tiger.EINTR) continue;
+            continue;
+        }
         const client_fd: i32 = tiger.accept(listen_fd, null, null);
         if (client_fd < 0) {
             if (g_stop_requested.load(.acquire)) break;
@@ -378,7 +411,7 @@ pub fn run_openai_server(
         _ = tiger.setsockopt(client_fd, tiger.SOL_SOCKET, tiger.SO_RCVTIMEO, @ptrCast(&sock_timeout), @sizeOf(tiger.Timeval));
         _ = tiger.setsockopt(client_fd, tiger.SOL_SOCKET, tiger.SO_SNDTIMEO, @ptrCast(&sock_timeout), @sizeOf(tiger.Timeval));
 
-        handle_connection(client_fd, engine, tokenizer, &config, &buffers, &prng_state);
+        handle_connection(client_fd, engine, tokenizer, &config, &buffers, &prng_state, &last_activity_ns);
         _ = tiger.close(client_fd);
     }
 
@@ -505,6 +538,24 @@ fn read_http_request(fd: i32, buffer: []u8) HttpReadResult {
     } };
 }
 
+fn send_vram_status(fd: i32, engine: *const engine_mod.Engine, config: *const ServerConfig, buf: []u8) void {
+    const st = engine.vram_status();
+    var bw = tiger.ByteWriter.init(buf);
+    bw.append_fmt(
+        "{{\"sleeping\":{s},\"vram_used_mib\":{d:.1},\"vram_free_mib\":{d:.1},\"vram_total_mib\":{d:.1},\"parked_slots\":{d},\"slot_keep\":{d},\"idle_sleep_secs\":{d}}}",
+        .{
+            if (engine.sleeping) "true" else "false",
+            st.used_mib,
+            st.free_mib,
+            st.total_mib,
+            engine.parked_slot_count(),
+            config.slot_keep,
+            config.idle_sleep_secs,
+        },
+    );
+    send_json_response(fd, 200, bw.slice());
+}
+
 fn handle_connection(
     fd: i32,
     engine: *engine_mod.Engine,
@@ -512,6 +563,7 @@ fn handle_connection(
     config: *const ServerConfig,
     buffers: *ServerBuffers,
     prng_state: *u64,
+    last_activity_ns: *u64,
 ) void {
     const req = switch (read_http_request(fd, buffers.request_buf)) {
         .ok => |parsed| parsed,
@@ -543,7 +595,12 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"engine\":\"squid5060\"}}", .{ config.context_tokens_max, config.default_mtp });
+        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"sleeping\":{s},\"parked_slots\":{d},\"engine\":\"squid5060\"}}", .{
+            config.context_tokens_max,
+            config.default_mtp,
+            if (engine.sleeping) "true" else "false",
+            engine.parked_slot_count(),
+        });
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -558,6 +615,28 @@ fn handle_connection(
         }
     }
 
+    if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/v1/vram") or std.mem.eql(u8, req.path, "/vram"))) {
+        send_vram_status(fd, engine, config, buffers.response_buf);
+        return;
+    }
+
+    if (std.mem.eql(u8, req.method, "POST") and (std.mem.eql(u8, req.path, "/v1/vram") or std.mem.eql(u8, req.path, "/vram"))) {
+        var action_buf: [32]u8 = undefined;
+        const action = extract_string_field(req.body, "action", &action_buf) orelse "";
+        if (std.mem.eql(u8, action, "sleep")) {
+            engine.sleep_vram();
+            send_vram_status(fd, engine, config, buffers.response_buf);
+            return;
+        } else if (std.mem.eql(u8, action, "wake")) {
+            engine.wake_vram();
+            last_activity_ns.* = tiger.clock_monotonic_ns();
+            send_vram_status(fd, engine, config, buffers.response_buf);
+            return;
+        }
+        send_error_json(fd, 400, "Expected JSON body {\"action\":\"sleep\"|\"wake\"}", "invalid_request_error", buffers.response_buf);
+        return;
+    }
+
     if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/v1/models") or std.mem.eql(u8, req.path, "/models"))) {
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"object\":\"list\",\"data\":[{\"id\":");
@@ -568,12 +647,12 @@ fn handle_connection(
     }
 
     if (std.mem.eql(u8, req.method, "POST") and (std.mem.eql(u8, req.path, "/v1/chat/completions") or std.mem.eql(u8, req.path, "/chat/completions"))) {
-        handle_chat_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
+        handle_chat_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state, last_activity_ns);
         return;
     }
 
     if (std.mem.eql(u8, req.method, "POST") and (std.mem.eql(u8, req.path, "/v1/completions") or std.mem.eql(u8, req.path, "/completions"))) {
-        handle_text_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
+        handle_text_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state, last_activity_ns);
         return;
     }
 
@@ -588,6 +667,7 @@ fn handle_chat_completions(
     config: *const ServerConfig,
     buffers: *ServerBuffers,
     prng_state: *u64,
+    last_activity_ns: *u64,
 ) void {
     // Iterative single-pass JSON request extractor (zero DOM allocation!)
     var pos: usize = 0;
@@ -709,6 +789,7 @@ fn handle_chat_completions(
     // server-emitted control tags use parse_special=true, while all untrusted user/tool/assistant text
     // uses parse_special=false (blocking control-token spoofing AND avoiding 32 MiB intermediate overflow!).
     const enc_res = encode_chat_template_zero_alloc(
+        engine,
         tokenizer,
         messages_json,
         tools_json,
@@ -717,6 +798,10 @@ fn handle_chat_completions(
         enable_thinking,
         buffers,
     );
+    if (enc_res.vision_error) {
+        send_error_json(fd, 400, "Failed to decode or encode image_url (expected base64 PNG/JPEG data URI, max 4 images)", "invalid_request_error", buffers.response_buf);
+        return;
+    }
     if (enc_res.overflow) {
         send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", buffers.response_buf);
         return;
@@ -749,6 +834,11 @@ fn handle_chat_completions(
         .top_k = req_top_k,
         .seed = req_seed,
     };
+    if (engine.sleeping) engine.wake_vram();
+    last_activity_ns.* = tiger.clock_monotonic_ns();
+    defer last_activity_ns.* = tiger.clock_monotonic_ns();
+    engine.active_images = enc_res.images[0..enc_res.image_count];
+    defer engine.active_images = &.{};
 
     if (!stream) {
         const NonStreamCtx = struct {
@@ -969,6 +1059,7 @@ fn handle_text_completions(
     config: *const ServerConfig,
     buffers: *ServerBuffers,
     prng_state: *u64,
+    last_activity_ns: *u64,
 ) void {
     var pos: usize = 0;
     tokenizer_mod.skip_ws(body, &pos);
@@ -1073,6 +1164,9 @@ fn handle_text_completions(
         .top_k = req_top_k,
         .seed = req_seed,
     };
+    if (engine.sleeping) engine.wake_vram();
+    last_activity_ns.* = tiger.clock_monotonic_ns();
+    defer last_activity_ns.* = tiger.clock_monotonic_ns();
 
     if (!stream) {
         const CmplCtx = struct {
@@ -1299,6 +1393,9 @@ const ChatEncodeResult = struct {
     prompt_len: usize = 0,
     system_prefix_tokens: u32 = 0,
     overflow: bool = false,
+    vision_error: bool = false,
+    images: [vision_mod.max_images_per_req]vision_mod.ImageSpan = @splat(.{}),
+    image_count: usize = 0,
 };
 
 fn json_array_has_items(arr: []const u8) bool {
@@ -1331,6 +1428,7 @@ fn append_encoded_segment(
 /// Encodes server-controlled template markers with `parse_special=true` and all untrusted
 /// message/tool text with `parse_special=false`, blocking special-token spoofing attacks!
 fn encode_chat_template_zero_alloc(
+    engine: *engine_mod.Engine,
     tokenizer: *const tokenizer_mod.Tokenizer,
     messages_json: []const u8,
     tools_json: []const u8,
@@ -1341,6 +1439,9 @@ fn encode_chat_template_zero_alloc(
 ) ChatEncodeResult {
     var out_len: usize = 0;
     var overflow: bool = false;
+    var vision_error: bool = false;
+    var images: [vision_mod.max_images_per_req]vision_mod.ImageSpan = @splat(.{});
+    var image_count: usize = 0;
     const scratch = buffers.scratch_str_buf;
 
     if (json_array_has_items(tools_json)) {
@@ -1491,7 +1592,61 @@ fn encode_chat_template_zero_alloc(
                         const ps_start = ap;
                         tokenizer_mod.skip_json_value(c_raw, &ap);
                         const part_obj = c_raw[ps_start..ap];
-                        if (extract_string_field(part_obj, "text", scratch)) |ts| {
+                        var ptype_buf: [32]u8 = undefined;
+                        const ptype = extract_string_field(part_obj, "type", &ptype_buf) orelse "text";
+                        if (std.mem.eql(u8, ptype, "image_url") or std.mem.eql(u8, ptype, "image") or std.mem.eql(u8, ptype, "input_image")) {
+                            var img_url_opt: ?[]const u8 = null;
+                            if (extract_raw_field(part_obj, "image_url")) |iu_raw| {
+                                if (iu_raw.len > 0 and iu_raw[0] == '{') {
+                                    img_url_opt = extract_string_field(iu_raw, "url", scratch);
+                                } else if (iu_raw.len > 0 and iu_raw[0] == '"') {
+                                    var iup: usize = 0;
+                                    img_url_opt = tokenizer_mod.parse_json_string(iu_raw, &iup, scratch);
+                                }
+                            } else {
+                                img_url_opt = extract_string_field(part_obj, "url", scratch);
+                            }
+                            const img_url = img_url_opt orelse {
+                                vision_error = true;
+                                break;
+                            };
+                            if (image_count >= vision_mod.max_images_per_req) {
+                                vision_error = true;
+                                break;
+                            }
+                            buffers.ensure_vision_buffers();
+                            const img_bytes = vision_mod.decode_base64_url(img_url, buffers.image_decode_buf) orelse {
+                                vision_error = true;
+                                break;
+                            };
+                            const slot_stride: usize = @as(usize, vision_mod.max_image_tokens) * constants.hidden_dim;
+                            const embed_slot = buffers.image_embeds_buf[image_count * slot_stride .. (image_count + 1) * slot_stride];
+                            const enc_img = engine.encode_image(img_bytes, embed_slot) orelse {
+                                vision_error = true;
+                                break;
+                            };
+                            emitted_assistant_block = true;
+                            append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
+                            if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, &out_len, &overflow);
+                            if (!overflow and out_len + enc_img.num_tokens < buffers.prompt_tokens.len) {
+                                const img_pos: u32 = @intCast(out_len);
+                                var k_tok: u32 = 0;
+                                while (k_tok < enc_img.num_tokens) : (k_tok += 1) {
+                                    buffers.prompt_tokens[out_len] = vision_mod.image_token_id;
+                                    out_len += 1;
+                                }
+                                images[image_count] = .{
+                                    .prompt_pos = img_pos,
+                                    .num_tokens = enc_img.num_tokens,
+                                    .embeds = embed_slot[0 .. @as(usize, enc_img.num_tokens) * constants.hidden_dim],
+                                };
+                                image_count += 1;
+                            } else {
+                                overflow = true;
+                            }
+                            append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
+                        } else if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
                             if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
@@ -1583,6 +1738,9 @@ fn encode_chat_template_zero_alloc(
         .prompt_len = out_len,
         .system_prefix_tokens = system_prefix_tokens,
         .overflow = overflow,
+        .vision_error = vision_error,
+        .images = images,
+        .image_count = image_count,
     };
 }
 

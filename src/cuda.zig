@@ -387,11 +387,103 @@ pub extern "c" fn squid_launch_route_topk(
     stream: ?*anyopaque,
 ) void;
 
+pub const CCpuMoeDevState = extern struct {
+    seq: u32 = 0,
+    n_tasks: u32 = 0,
+    n_outs: u32 = 0,
+    enabled: u32 = 0,
+    split_num: u32 = 2,
+    split_round: u32 = 1,
+    split_den: u32 = 3,
+    max_batch: u32 = 8,
+    skip_mask: u64 = 0,
+    _pad: [24]u8 = @splat(0),
+};
+
+pub const CVisionLayerPtrs = extern struct {
+    ln1_w: ?*const anyopaque = null,
+    ln1_b: ?*const anyopaque = null,
+    q_w: ?*const anyopaque = null,
+    q_b: ?*const anyopaque = null,
+    k_w: ?*const anyopaque = null,
+    k_b: ?*const anyopaque = null,
+    v_w: ?*const anyopaque = null,
+    v_b: ?*const anyopaque = null,
+    o_w: ?*const anyopaque = null,
+    o_b: ?*const anyopaque = null,
+    ls1_gamma: ?*const anyopaque = null,
+    ln2_w: ?*const anyopaque = null,
+    ln2_b: ?*const anyopaque = null,
+    fc_w: ?*const anyopaque = null,
+    fc_b: ?*const anyopaque = null,
+    proj_w: ?*const anyopaque = null,
+    proj_b: ?*const anyopaque = null,
+    ls2_gamma: ?*const anyopaque = null,
+};
+
+pub const CVisionWeightsHost = extern struct {
+    class_embedding: ?*const anyopaque = null,
+    cls_position_embedding: ?*const anyopaque = null,
+    patch_embedding_w: ?*const anyopaque = null,
+    position_embedding: ?*const anyopaque = null,
+    ln_pre_w: ?*const anyopaque = null,
+    ln_pre_b: ?*const anyopaque = null,
+    layers: [23]CVisionLayerPtrs = @splat(.{}),
+    proj_in_w: ?*const anyopaque = null,
+    proj_out_w: ?*const anyopaque = null,
+};
+
+pub extern "c" fn squid_vision_encode_image(
+    img_bytes: [*]const u8,
+    img_len: usize,
+    weights: *const CVisionWeightsHost,
+    scratch_dev: ?*anyopaque,
+    scratch_bytes: usize,
+    max_tokens: i32,
+    out_embeds_host: [*]f32,
+    out_num_tokens: *i32,
+    out_cols: ?*i32,
+    out_rows: ?*i32,
+    stream: ?*anyopaque,
+) i32;
+
+pub extern "c" fn squid_cpu_moe_create(
+    h_bell: *anyopaque,
+    host_experts: [*]const ?[*]const u8,
+    host_scale_w13: [*]const f32,
+    host_scale_w2: [*]const f32,
+    num_threads: i32,
+) ?*anyopaque;
+pub extern "c" fn squid_cpu_moe_wake(pool: ?*anyopaque) void;
+pub extern "c" fn squid_cpu_moe_nap(pool: ?*anyopaque) void;
+pub extern "c" fn squid_cpu_moe_destroy(pool: ?*anyopaque) void;
+
+pub extern "c" fn squid_launch_moe_cpu_dispatch(
+    w13: *const CExpertBank,
+    layer_idx: i32,
+    x_h: *const anyopaque,
+    route_ids: [*]const i32,
+    route_w: [*]const f32,
+    groups: ?*const anyopaque,
+    d_bell: ?*anyopaque,
+    d_state: ?*anyopaque,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_moe_cpu_merge(
+    d_bell: ?*const anyopaque,
+    d_state: ?*const anyopaque,
+    out_slots: [*]f32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_moe_gate_up_h(
     w13: *const CExpertBank,
     x_h: *const anyopaque,
     route_ids: [*]const i32,
     groups: *const anyopaque,
+    cpu_state: ?*const anyopaque,
     out_act_h: *anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
@@ -403,6 +495,7 @@ pub extern "c" fn squid_launch_moe_down_h(
     route_ids: [*]const i32,
     route_w: [*]const f32,
     groups: *const anyopaque,
+    cpu_state: ?*const anyopaque,
     out_down: [*]f32,
     batch_size: i32,
     stream: ?*anyopaque,
@@ -519,7 +612,9 @@ pub extern "c" fn squid_adaptive_graph_create(
     d_anchor: *const i32,
     d_drafts: [*]const i32,
     d_draft_conf: [*]const f32,
+    d_sample_cfg: *const CSampleConfig,
     threshold: f32,
+    is_cached_gpu: u8,
     d_tokens: [*]i32,
     d_chosen_width: *i32,
     d_accepted: [*]const i32,
@@ -569,6 +664,8 @@ pub extern "c" fn squid_launch_assemble_verify_tokens(
 ) void;
 
 pub extern "c" fn squid_sizeof_expert_groups() usize;
+pub extern "c" fn squid_sizeof_cpu_moe_bell() usize;
+pub extern "c" fn squid_sizeof_cpu_moe_dev_state() usize;
 
 pub extern "c" fn squid_launch_prefill_warmup_cublas(stream: ?*anyopaque) void;
 

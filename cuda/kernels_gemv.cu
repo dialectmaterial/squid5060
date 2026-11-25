@@ -2295,6 +2295,199 @@ __device__ __forceinline__ float nvfp4_block32_dot_u4_h(uint4 w16, uint16_t sc2,
 }
 
 // HALF-WARP (16 threads/row, 8 rows/CTA, grid=(144, TOP_K)) Dual-Path Cached MoE Gate+Up (B=1)
+__device__ __forceinline__ void st_release_sys_u32(volatile uint32_t* ptr, uint32_t val) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ uint32_t ld_acquire_sys_u32(const volatile uint32_t* ptr) {
+    uint32_t val;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(ptr) : "memory");
+    return val;
+}
+
+// Hybrid CPU+GPU MoE miss dispatcher (1 CTA of 256 threads).
+// Checks slot_map in VRAM; if 0 misses or disabled, writes n_tasks=0 in VRAM and returns with ZERO PCIe traffic.
+__global__ void __launch_bounds__(256)
+moe_cpu_dispatch_kernel(
+    const int32_t* __restrict__ slot_map,
+    int layer_idx,
+    const __half* __restrict__ x_h,
+    const int32_t* __restrict__ route_ids,
+    const float* __restrict__ route_w,
+    const ExpertGroups* __restrict__ g,
+    CpuMoeBell* __restrict__ bell,
+    CpuMoeDevState* __restrict__ st,
+    int B) {
+    __shared__ int s_n_tasks;
+    __shared__ uint32_t s_next_seq;
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        s_n_tasks = 0;
+        if (st->enabled == 0 || B > (int)st->max_batch || st->split_num == 0 || bell->abort_flag != 0) {
+            st->n_tasks = 0;
+            st->n_outs = 0;
+            st->skip_mask = 0ULL;
+        } else {
+            int miss_idx[CPU_MOE_MAX_TASKS];
+            int miss_pop[CPU_MOE_MAX_TASKS];
+            int n_miss = 0;
+
+            if (B == 1) {
+                #pragma unroll
+                for (int s = 0; s < TOP_K; ++s) {
+                    int exp_id = route_ids[s];
+                    if (slot_map[exp_id] < 0) {
+                        miss_idx[n_miss] = s;
+                        miss_pop[n_miss] = 1;
+                        n_miss++;
+                    }
+                }
+            } else {
+                int nu = g->num_unique;
+                if (nu > CPU_MOE_MAX_TASKS) nu = CPU_MOE_MAX_TASKS;
+                for (int u = 0; u < nu; ++u) {
+                    int exp_id = g->expert_id[u];
+                    if (slot_map[exp_id] < 0) {
+                        miss_idx[n_miss] = u;
+                        miss_pop[n_miss] = __popc((uint32_t)g->token_mask[u]);
+                        n_miss++;
+                    }
+                }
+            }
+
+            int cpu_take = 0;
+            if (n_miss > 0) {
+                cpu_take = (int)(((uint32_t)n_miss * st->split_num + st->split_round) / st->split_den);
+                if (cpu_take > n_miss) cpu_take = n_miss;
+                if (cpu_take > CPU_MOE_MAX_TASKS) cpu_take = CPU_MOE_MAX_TASKS;
+            }
+
+            if (cpu_take <= 0) {
+                st->n_tasks = 0;
+                st->n_outs = 0;
+                st->skip_mask = 0ULL;
+            } else {
+                // Prefer lowest-popcount misses for CPU (highest bandwidth efficiency)
+                if (B > 1 && cpu_take < n_miss) {
+                    for (int i = 1; i < n_miss; ++i) {
+                        int kidx = miss_idx[i];
+                        int kpop = miss_pop[i];
+                        int j = i - 1;
+                        while (j >= 0 && miss_pop[j] > kpop) {
+                            miss_idx[j + 1] = miss_idx[j];
+                            miss_pop[j + 1] = miss_pop[j];
+                            --j;
+                        }
+                        miss_idx[j + 1] = kidx;
+                        miss_pop[j + 1] = kpop;
+                    }
+                }
+
+                uint64_t skip = 0ULL;
+                int out_cursor = 0;
+                for (int t = 0; t < cpu_take; ++t) {
+                    int idx = miss_idx[t];
+                    skip |= (1ULL << idx);
+                    bell->task_out_base[t] = (uint8_t)out_cursor;
+                    if (B == 1) {
+                        bell->task_expert[t] = route_ids[idx];
+                        bell->task_token_mask[t] = 1u;
+                        bell->out_tok[out_cursor] = 0;
+                        bell->out_slot[out_cursor] = (uint8_t)idx;
+                        bell->out_rw[out_cursor] = route_w[idx];
+                        out_cursor++;
+                    } else {
+                        bell->task_expert[t] = g->expert_id[idx];
+                        uint8_t mask = g->token_mask[idx];
+                        bell->task_token_mask[t] = mask;
+                        for (int b = 0; b < B; ++b) {
+                            if (mask & (1u << b)) {
+                                bell->out_tok[out_cursor] = (uint8_t)b;
+                                bell->out_slot[out_cursor] = g->slot_idx[idx][b];
+                                bell->out_rw[out_cursor] = g->route_w[idx][b];
+                                out_cursor++;
+                            }
+                        }
+                    }
+                }
+                bell->layer_idx = layer_idx;
+                bell->batch_size = B;
+                bell->n_tasks = cpu_take;
+                bell->n_outs = out_cursor;
+
+                uint32_t next_seq = st->seq + 1u;
+                st->seq = next_seq;
+                st->n_tasks = (uint32_t)cpu_take;
+                st->n_outs = (uint32_t)out_cursor;
+                st->skip_mask = skip;
+                s_n_tasks = cpu_take;
+                s_next_seq = next_seq;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (s_n_tasks == 0) return;
+
+    // Copy x_h [B, HIDDEN] to mapped bell->x_h via vectorized 16-byte stores
+    const int n_u4 = (B * HIDDEN) >> 3; // 288 * B
+    const uint4* src4 = reinterpret_cast<const uint4*>(x_h);
+    uint4* dst4 = reinterpret_cast<uint4*>(bell->x_h);
+    for (int i = tid; i < n_u4; i += 256) {
+        dst4[i] = src4[i];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence_system();
+        st_release_sys_u32(&bell->req_seq, s_next_seq);
+    }
+}
+
+__device__ __forceinline__ float4 ld_sys_cv_f4(const float4* ptr) {
+    float4 v;
+    asm volatile("ld.global.cv.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(ptr)
+                 : "memory");
+    return v;
+}
+
+// Hybrid CPU+GPU MoE wait & scatter kernel (1 CTA of 256 threads).
+// Zero PCIe traffic when d_state->n_tasks == 0!
+__global__ void __launch_bounds__(256)
+moe_cpu_merge_kernel(
+    const CpuMoeBell* __restrict__ bell,
+    const CpuMoeDevState* __restrict__ st,
+    float* __restrict__ out_slots) {
+    uint32_t n_tasks = st->n_tasks;
+    if (n_tasks == 0) return;
+
+    int tid = threadIdx.x;
+    uint32_t want_seq = st->seq;
+    if (tid == 0) {
+        while (ld_acquire_sys_u32(&bell->ack_seq) != want_seq) {
+            if (ld_acquire_sys_u32(&bell->abort_flag) != 0) break;
+            __nanosleep(64);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+
+    int n_outs = (int)st->n_outs;
+    constexpr int F4_PER_ROW = HIDDEN >> 2; // 576
+    for (int o = 0; o < n_outs; ++o) {
+        int tok = (int)bell->out_tok[o];
+        int slot = (int)bell->out_slot[o];
+        const float4* src = reinterpret_cast<const float4*>(bell->out_buf[o]);
+        float4* dst = reinterpret_cast<float4*>(out_slots + ((size_t)tok * TOP_K + slot) * HIDDEN);
+        for (int i = tid; i < F4_PER_ROW; i += 256) {
+            dst[i] = ld_sys_cv_f4(src + i);
+        }
+    }
+}
+
 __global__ void __launch_bounds__(128)
 moe_gate_up_nvfp4_b1_cached_kernel(
     const uint8_t* __restrict__ cache_pool,
@@ -2304,6 +2497,7 @@ moe_gate_up_nvfp4_b1_cached_kernel(
     const float* __restrict__ exp_scales,
     const __half* __restrict__ x_h,
     const int32_t* __restrict__ r_ids,
+    const CpuMoeDevState* __restrict__ cpu_state,
     __half* __restrict__ out_act_h) {
     int slot = blockIdx.y;
     int expert = r_ids[slot];
@@ -2311,6 +2505,7 @@ moe_gate_up_nvfp4_b1_cached_kernel(
     if (blockIdx.x == 0 && tid == 0 && touch_counts) {
         atomicAdd(&touch_counts[expert], 1u);
     }
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> slot) & 1ULL)) return;
 
     int hw = tid >> 4;   // 0..7 (8 j's/CTA)
     int lane = tid & 15; // 0..15
@@ -2395,8 +2590,10 @@ moe_down_nvfp4_b1_cached_kernel(
     const __half* __restrict__ act_h,
     const int32_t* __restrict__ r_ids,
     const float* __restrict__ r_w,
+    const CpuMoeDevState* __restrict__ cpu_state,
     float* __restrict__ out_slots) {
     int slot = blockIdx.y;
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> slot) & 1ULL)) return;
     int tid = threadIdx.x;
     int qw = tid >> 3;   // 0..15 (16 rows/CTA)
     int lane = tid & 7;  // 0..7
@@ -2466,6 +2663,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
     const float* __restrict__ exp_scales,
     const __half* __restrict__ x_h,
     const ExpertGroups* __restrict__ g,
+    const CpuMoeDevState* __restrict__ cpu_state,
     __half* __restrict__ out_act_h) {
     int u = blockIdx.y;
     if (u >= g->num_unique) return;
@@ -2476,6 +2674,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
     if (blockIdx.x == 0 && tid == 0 && touch_counts) {
         atomicAdd(&touch_counts[expert], 1u);
     }
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> u) & 1ULL)) return;
 
     int hw = tid >> 4;
     int lane = tid & 15;
@@ -2679,9 +2878,11 @@ moe_down_nvfp4_grouped_cached_kernel(
     const float* __restrict__ exp_scales,
     const __half* __restrict__ act_h,
     const ExpertGroups* __restrict__ g,
+    const CpuMoeDevState* __restrict__ cpu_state,
     float* __restrict__ out_down) {
     int u = blockIdx.y;
     if (u >= g->num_unique) return;
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> u) & 1ULL)) return;
     uint32_t mask = g->token_mask[u];
     int expert = g->expert_id[u];
     int tid = threadIdx.x;
@@ -2836,18 +3037,20 @@ moe_down_nvfp4_grouped_cached_kernel(
 
 template <int B_CONST>
 static void dispatch_moe_gu_cached(
-    const ExpertBank& w13, const __half* x_h, const ExpertGroups* groups, __half* out_act_h, cudaStream_t stream) {
+    const ExpertBank& w13, const __half* x_h, const ExpertGroups* groups,
+    const CpuMoeDevState* cpu_state, __half* out_act_h, cudaStream_t stream) {
     dim3 grid((INTERMEDIATE + 7) / 8, B_CONST * TOP_K);
     moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST><<<grid, 128, 0, stream>>>(
-        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, out_act_h);
+        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
 }
 
 template <int B_CONST>
 static void dispatch_moe_dn_cached(
-    const ExpertBank& w2, const __half* act_h, const ExpertGroups* groups, float* out_down, cudaStream_t stream) {
+    const ExpertBank& w2, const __half* act_h, const ExpertGroups* groups,
+    const CpuMoeDevState* cpu_state, float* out_down, cudaStream_t stream) {
     dim3 grid((HIDDEN + 15) / 16, B_CONST * TOP_K);
     moe_down_nvfp4_grouped_cached_kernel<B_CONST><<<grid, 128, 0, stream>>>(
-        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, out_down);
+        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
 }
 
 } // namespace
@@ -3029,23 +3232,38 @@ void launch_build_expert_groups(
     build_expert_groups_kernel<<<1, 1, 0, stream>>>(route_ids, route_w, groups, B);
 }
 
+void launch_moe_cpu_dispatch(
+    const ExpertBank& w13, int layer_idx, const __half* x_h, const int32_t* route_ids,
+    const float* route_w, const ExpertGroups* groups, CpuMoeBell* d_bell, CpuMoeDevState* d_state,
+    int B, cudaStream_t stream) {
+    if (w13.cache_pool == nullptr || d_bell == nullptr || d_state == nullptr) return;
+    moe_cpu_dispatch_kernel<<<1, 256, 0, stream>>>(
+        w13.slot_map, layer_idx, x_h, route_ids, route_w, groups, d_bell, d_state, B);
+}
+
+void launch_moe_cpu_merge(
+    const CpuMoeBell* d_bell, const CpuMoeDevState* d_state, float* out_slots, cudaStream_t stream) {
+    if (d_bell == nullptr || d_state == nullptr) return;
+    moe_cpu_merge_kernel<<<1, 256, 0, stream>>>(d_bell, d_state, out_slots);
+}
+
 void launch_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h, const int32_t* route_ids,
-    const ExpertGroups* groups, __half* out_act_h, int B, cudaStream_t stream) {
+    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, __half* out_act_h, int B, cudaStream_t stream) {
     if (w13.cache_pool != nullptr) {
         if (B == 1) {
             dim3 grid((INTERMEDIATE + 7) / 8, TOP_K);
             moe_gate_up_nvfp4_b1_cached_kernel<<<grid, 128, 0, stream>>>(
-                w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, out_act_h);
+                w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
         } else {
             switch (B) {
-                case 2: dispatch_moe_gu_cached<2>(w13, x_h, groups, out_act_h, stream); break;
-                case 3: dispatch_moe_gu_cached<3>(w13, x_h, groups, out_act_h, stream); break;
-                case 4: dispatch_moe_gu_cached<4>(w13, x_h, groups, out_act_h, stream); break;
-                case 5: dispatch_moe_gu_cached<5>(w13, x_h, groups, out_act_h, stream); break;
-                case 6: dispatch_moe_gu_cached<6>(w13, x_h, groups, out_act_h, stream); break;
-                case 7: dispatch_moe_gu_cached<7>(w13, x_h, groups, out_act_h, stream); break;
-                case 8: dispatch_moe_gu_cached<8>(w13, x_h, groups, out_act_h, stream); break;
+                case 2: dispatch_moe_gu_cached<2>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 3: dispatch_moe_gu_cached<3>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 4: dispatch_moe_gu_cached<4>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 5: dispatch_moe_gu_cached<5>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 6: dispatch_moe_gu_cached<6>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 7: dispatch_moe_gu_cached<7>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 8: dispatch_moe_gu_cached<8>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
             }
         }
         return;
@@ -3062,21 +3280,21 @@ void launch_moe_gate_up_h(
 
 void launch_moe_down_h(
     const ExpertBank& w2, const __half* act_h, const int32_t* route_ids, const float* route_w,
-    const ExpertGroups* groups, float* out_down, int B, cudaStream_t stream, bool /*already_zeroed*/) {
+    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, float* out_down, int B, cudaStream_t stream, bool /*already_zeroed*/) {
     if (w2.cache_pool != nullptr) {
         if (B == 1) {
             dim3 grid((HIDDEN + 15) / 16, TOP_K);
             moe_down_nvfp4_b1_cached_kernel<<<grid, 128, 0, stream>>>(
-                w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, out_down);
+                w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
         } else {
             switch (B) {
-                case 2: dispatch_moe_dn_cached<2>(w2, act_h, groups, out_down, stream); break;
-                case 3: dispatch_moe_dn_cached<3>(w2, act_h, groups, out_down, stream); break;
-                case 4: dispatch_moe_dn_cached<4>(w2, act_h, groups, out_down, stream); break;
-                case 5: dispatch_moe_dn_cached<5>(w2, act_h, groups, out_down, stream); break;
-                case 6: dispatch_moe_dn_cached<6>(w2, act_h, groups, out_down, stream); break;
-                case 7: dispatch_moe_dn_cached<7>(w2, act_h, groups, out_down, stream); break;
-                case 8: dispatch_moe_dn_cached<8>(w2, act_h, groups, out_down, stream); break;
+                case 2: dispatch_moe_dn_cached<2>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 3: dispatch_moe_dn_cached<3>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 4: dispatch_moe_dn_cached<4>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 5: dispatch_moe_dn_cached<5>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 6: dispatch_moe_dn_cached<6>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 7: dispatch_moe_dn_cached<7>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 8: dispatch_moe_dn_cached<8>(w2, act_h, groups, cpu_state, out_down, stream); break;
             }
         }
         return;

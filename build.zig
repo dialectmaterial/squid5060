@@ -50,7 +50,35 @@ pub fn build(b: *std.Build) void {
         "cuda/weights.hpp",
         "cuda/kernels.hpp",
         "cuda/kernels_common.cuh",
+        "cuda/cpu_moe.hpp",
+        "cuda/vision.hpp",
     };
+
+    // Compile AVX2+FMA+F16C Hybrid CPU MoE Worker Pool (host C++20)
+    {
+        const cxx = b.addSystemCommand(&.{
+            "g++",
+            "-O3",
+            "-march=native",
+            "-mavx2",
+            "-mfma",
+            "-mf16c",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-std=c++20",
+            "-I",
+        });
+        cxx.addDirectoryArg(b.path("cuda"));
+        cxx.addArg("-I");
+        cxx.addArg(b.fmt("{s}/include", .{cuda_path}));
+        cxx.addArg("-c");
+        cxx.addFileArg(b.path("cuda/cpu_moe.cpp"));
+        cxx.addArg("-o");
+        const cpu_obj = cxx.addOutputFileArg("cpu_moe.o");
+        cxx.addFileInput(b.path("cuda/config.hpp"));
+        cxx.addFileInput(b.path("cuda/cpu_moe.hpp"));
+        root_module.addObjectFile(cpu_obj);
+    }
 
     const cuda_sources = [_]struct { src: []const u8, obj: []const u8 }{
         .{ .src = "cuda/kernels_gemv.cu", .obj = "kernels_gemv.o" },
@@ -58,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
+        .{ .src = "cuda/vision.cu", .obj = "vision.o" },
     };
 
     for (cuda_sources) |cu| {
@@ -69,6 +98,7 @@ pub fn build(b: *std.Build) void {
             "-gencode",
             gencode,
             "--expt-relaxed-constexpr",
+            "-I/usr/include/libpng16",
             "-I",
         });
         nvcc.addDirectoryArg(b.path("cuda"));
@@ -89,6 +119,8 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("stdc++", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("pthread", .{});
+    root_module.linkSystemLibrary("png16", .{});
+    root_module.linkSystemLibrary("jpeg", .{});
 
     const exe = b.addExecutable(.{
         .name = "squid5060",

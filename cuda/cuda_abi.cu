@@ -227,30 +227,55 @@ __global__ void z_adaptive_select_width_kernel(
     const int32_t* __restrict__ d_anchor,
     const int32_t* __restrict__ d_drafts,
     const float* __restrict__ d_draft_conf,
+    const SampleConfig* __restrict__ d_sample_cfg,
     float threshold,
+    uint8_t is_cached_gpu,
     int32_t* __restrict__ d_tokens,
     int32_t* __restrict__ d_chosen_width,
     cudaGraphConditionalHandle cond_handle) {
     if (threadIdx.x != 0) return;
-    int n_conf = 0;
-    while (n_conf < MTP_MAX_DRAFTS && d_draft_conf[n_conf] >= threshold) {
-        ++n_conf;
+
+    // Power-law calibrated expected-throughput optimizer: pick w in {1, 2, 4, 8} maximizing E[acc(w)] / cost(w).
+    // Power-law p_k = conf_k^gamma preserves p -> 1 when DSpark is near-certain (conf > 0.98) while accurately
+    // damping overconfident mid-range probabilities and stochastic T > 0 acceptance decay.
+    // On 8 GB PCIe-cached GPUs, larger verify batches trigger ~linearly more unique experts & RAM misses,
+    // so calibrated step costs are {1.00, 1.30, 2.45, 4.50} vs full-VRAM {1.00, 1.05, 1.15, 1.35}.
+    float gamma = (is_cached_gpu ? 1.50f : 1.15f) * (fmaxf(threshold, 0.25f) / 0.90f);
+    if (d_sample_cfg != nullptr && d_sample_cfg->inv_temp > 0.0f) {
+        float temp = 1.0f / d_sample_cfg->inv_temp;
+        gamma *= (1.0f + 0.45f * fminf(temp, 1.2f));
     }
-    unsigned int case_idx;
-    int width;
-    if (n_conf == 0 && d_draft_conf[0] < threshold * 0.55f) {
-        case_idx = 0u;
-        width = 1;
-    } else if (n_conf <= 1) {
-        case_idx = 1u;
-        width = 2;
-    } else if (n_conf <= 3) {
-        case_idx = 2u;
-        width = 4;
-    } else {
-        case_idx = 3u;
-        width = 8;
+
+    float c1 = 1.00f;
+    float c2 = is_cached_gpu ? 1.30f : 1.05f;
+    float c4 = is_cached_gpu ? 2.45f : 1.15f;
+    float c8 = is_cached_gpu ? 4.50f : 1.35f;
+
+    float e1 = 1.0f;
+    float prod = 1.0f;
+    float e2 = 1.0f, e4 = 1.0f, e8 = 1.0f;
+    #pragma unroll
+    for (int k = 0; k < MTP_MAX_DRAFTS; ++k) {
+        float ck = fminf(1.0f, fmaxf(0.0f, d_draft_conf[k]));
+        float pk = __powf(ck, gamma);
+        prod *= pk;
+        if (k == 0) e2 = 1.0f + prod;
+        if (k < 3)  e4 += prod;
+        e8 += prod;
     }
+
+    float r1 = e1 / c1;
+    float r2 = e2 / c2;
+    float r4 = e4 / c4;
+    float r8 = e8 / c8;
+
+    unsigned int case_idx = 0u;
+    int width = 1;
+    float best_r = r1;
+    if (r2 > best_r) { best_r = r2; case_idx = 1u; width = 2; }
+    if (r4 > best_r) { best_r = r4; case_idx = 2u; width = 4; }
+    if (r8 > best_r) { best_r = r8; case_idx = 3u; width = 8; }
+
     d_tokens[0] = *d_anchor;
     for (int i = 0; i < width - 1; ++i) d_tokens[1 + i] = d_drafts[i];
     *d_chosen_width = width;
@@ -702,17 +727,38 @@ void squid_launch_route_topk(
         scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr, B, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_moe_cpu_dispatch(
+    const CExpertBank* w13, int32_t layer_idx, const void* x_h, const int32_t* route_ids,
+    const float* route_w, const void* groups, void* d_bell, void* d_state, int32_t B, void* stream) {
+    launch_moe_cpu_dispatch(
+        to_eb(*w13), layer_idx, static_cast<const __half*>(x_h), route_ids, route_w,
+        static_cast<const ExpertGroups*>(groups), static_cast<CpuMoeBell*>(d_bell),
+        static_cast<CpuMoeDevState*>(d_state), B, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_moe_cpu_merge(
+    const void* d_bell, const void* d_state, float* out_slots, void* stream) {
+    launch_moe_cpu_merge(
+        static_cast<const CpuMoeBell*>(d_bell), static_cast<const CpuMoeDevState*>(d_state),
+        out_slots, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_moe_gate_up_h(
-    const CExpertBank* w13, const void* x_h, const int32_t* route_ids, const void* groups, void* out_act_h, int32_t B, void* stream) {
+    const CExpertBank* w13, const void* x_h, const int32_t* route_ids, const void* groups,
+    const void* cpu_state, void* out_act_h, int32_t B, void* stream) {
     launch_moe_gate_up_h(to_eb(*w13), static_cast<const __half*>(x_h), route_ids,
-                         static_cast<const ExpertGroups*>(groups), static_cast<__half*>(out_act_h), B, static_cast<cudaStream_t>(stream));
+                         static_cast<const ExpertGroups*>(groups),
+                         static_cast<const CpuMoeDevState*>(cpu_state),
+                         static_cast<__half*>(out_act_h), B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_moe_down_h(
     const CExpertBank* w2, const void* act_h, const int32_t* route_ids, const float* route_w,
-    const void* groups, float* out_down, int32_t B, void* stream) {
+    const void* groups, const void* cpu_state, float* out_down, int32_t B, void* stream) {
     launch_moe_down_h(to_eb(*w2), static_cast<const __half*>(act_h), route_ids, route_w,
-                      static_cast<const ExpertGroups*>(groups), out_down, B, static_cast<cudaStream_t>(stream), true);
+                      static_cast<const ExpertGroups*>(groups),
+                      static_cast<const CpuMoeDevState*>(cpu_state),
+                      out_down, B, static_cast<cudaStream_t>(stream), true);
 }
 
 void squid_launch_mega_mlp_post_res(
@@ -791,7 +837,8 @@ void squid_launch_dspark_draft(
 }
 
 int32_t squid_adaptive_graph_create(
-    const int32_t* d_anchor, const int32_t* d_drafts, const float* d_draft_conf, float threshold,
+    const int32_t* d_anchor, const int32_t* d_drafts, const float* d_draft_conf,
+    const SampleConfig* d_sample_cfg, float threshold, uint8_t is_cached_gpu,
     int32_t* d_tokens, int32_t* d_chosen_width,
     const int32_t* d_accepted, int32_t* h_accepted,
     const int32_t* d_num_acc, int32_t* h_num_acc, int32_t* h_chosen_width,
@@ -807,7 +854,7 @@ int32_t squid_adaptive_graph_create(
     if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
 
     z_adaptive_select_width_kernel<<<1, 1, 0, s>>>(
-        d_anchor, d_drafts, d_draft_conf, threshold, d_tokens, d_chosen_width, ag->handle);
+        d_anchor, d_drafts, d_draft_conf, d_sample_cfg, threshold, is_cached_gpu, d_tokens, d_chosen_width, ag->handle);
 
     cudaStreamCaptureStatus status;
     cudaGraph_t g = nullptr;
@@ -910,6 +957,8 @@ void squid_launch_assemble_verify_tokens(const int32_t* d_anchor, const int32_t*
 }
 
 size_t squid_sizeof_expert_groups() { return sizeof(ExpertGroups); }
+size_t squid_sizeof_cpu_moe_bell() { return sizeof(CpuMoeBell); }
+size_t squid_sizeof_cpu_moe_dev_state() { return sizeof(CpuMoeDevState); }
 
 void squid_launch_prefill_warmup_cublas(void* stream) {
     launch_prefill_warmup_cublas(static_cast<cudaStream_t>(stream));

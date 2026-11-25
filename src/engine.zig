@@ -7,10 +7,17 @@ const constants = @import("constants.zig");
 const cuda = @import("cuda.zig");
 const expert_cache_mod = @import("expert_cache.zig");
 const tiger = @import("tiger.zig");
+const vision_mod = @import("vision.zig");
 const vram_arena = @import("vram_arena.zig");
 const weights_mod = @import("weights.zig");
 
 pub const TokenCallbackFn = *const fn (context: *anyopaque, token_id: i32) bool;
+
+pub const CpuMoeMode = enum(u8) {
+    auto = 0,
+    on = 1,
+    off = 2,
+};
 
 pub const SampleParams = struct {
     temperature: f32 = 0.0,
@@ -117,6 +124,7 @@ const PromptLookupIndex = struct {
 };
 
 const prefix_checkpoint_count: usize = 4;
+const parked_slots_max: usize = 8;
 const side_shield_max_tokens: u32 = 4096;
 const prefill_batch_max: u32 = 2048;
 const prefill_local_attn_sub: u32 = 256;
@@ -133,19 +141,37 @@ const LocalStateCheckpoint = struct {
     data: []u8 = &.{},
 };
 
+const ParkedSlot = struct {
+    valid: bool = false,
+    len: u32 = 0,
+    prefill_len: u32 = 0,
+    cap_tokens: u32 = 0,
+    use_mtp: bool = false,
+    last_used_tick: u64 = 0,
+    tokens: []i32 = &.{},
+    local_state: []u8 = &.{},
+    prefill_local_state: []u8 = &.{},
+    global_kv: []u8 = &.{},
+};
+
 const PrefixCache = struct {
     enabled: bool = false,
     local_state_bytes: usize = 0,
     session_tokens: []i32 = &.{},
     session_len: u32 = 0,
     session_use_mtp: bool = false,
+    gpu_global_kv_valid: bool = false,
     gpu_live_at_pos: i32 = -1,
     checkpoints: [prefix_checkpoint_count]LocalStateCheckpoint = @splat(.{}),
     side_shield_buf: []u8 = &.{},
+    parked_max: u32 = 4,
+    parked_tick: u64 = 0,
+    parked: [parked_slots_max]ParkedSlot = @splat(.{}),
 };
 
 pub const Engine = struct {
-    weights: ?*const weights_mod.ModelWeights = null,
+    weights: ?*weights_mod.ModelWeights = null,
+    sleeping: bool = false,
     context_tokens_max: u32 = 0,
     use_graphs: bool = true,
     kv_format: constants.KVFormat = .fp8,
@@ -181,10 +207,18 @@ pub const Engine = struct {
     prefix_cache: PrefixCache = .{},
     prompt_lookup: PromptLookupIndex = .{},
     expert_cache: expert_cache_mod.ExpertCache = .{},
+    cpu_moe_mode: CpuMoeMode = .auto,
+    cpu_moe_cfg: cuda.CCpuMoeDevState = .{},
+    h_cpu_bell: ?*anyopaque = null,
+    d_cpu_bell: ?*anyopaque = null,
+    d_cpu_state: ?*anyopaque = null,
+    cpu_moe_pool: ?*anyopaque = null,
     prefill_batch_cap: u32 = prefill_batch_max,
     prefill_tail_slots: u32 = 0,
     prefill_aliased: bool = false,
     share_loop_kv: bool = false,
+    active_images: []const vision_mod.ImageSpan = &.{},
+    prefill_cur_prompt_pos: u32 = std.math.maxInt(u32),
 
     // Per-visit KV caches and sconv rings
     kv_cap: [constants.visit_count]i32 = @splat(0),
@@ -299,7 +333,7 @@ pub const Engine = struct {
 
     pub fn init(
         self: *Engine,
-        weights: *const weights_mod.ModelWeights,
+        weights: *weights_mod.ModelWeights,
         context_tokens_max: u32,
         use_graphs: bool,
         kv_format: constants.KVFormat,
@@ -308,6 +342,7 @@ pub const Engine = struct {
         tiger.assert(self.arena.base_ptr == null);
 
         self.weights = weights;
+        self.sleeping = false;
         self.context_tokens_max = context_tokens_max;
         self.use_graphs = use_graphs;
         self.kv_format = kv_format;
@@ -327,16 +362,55 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_event_create(&self.join_event, 1));
         tiger.assert_cuda(cuda.squid_cuda_event_create(&self.done_event, 1));
 
+        const b_max: u64 = constants.mtp_block_size_max;
+        var h_acc_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_acc_raw, @intCast(b_max * @sizeOf(i32)), 0));
+        self.h_accepted = @ptrCast(@alignCast(h_acc_raw.?));
+
+        var h_nacc_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_nacc_raw, @sizeOf(i32), 0));
+        self.h_num_accepted = @ptrCast(@alignCast(h_nacc_raw.?));
+
+        var h_cw_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_cw_raw, @sizeOf(i32), 0));
+        self.h_chosen_width = @ptrCast(@alignCast(h_cw_raw.?));
+        var h_ld_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ld_raw, constants.mtp_draft_count_max * @sizeOf(i32), 0));
+        self.h_lookup_drafts = @ptrCast(@alignCast(h_ld_raw.?));
+
+        const alias_prefill: bool = weights.use_expert_cache;
+        self.prefill_aliased = alias_prefill;
+        self.prefill_batch_cap = if (alias_prefill) 1024 else prefill_batch_max;
+
+        self.alloc_and_bind_runtime_arena();
+
+        // Pre-initialize cuBLAS handle during startup so Chunk 0 prefill pays 0ms cold handle creation.
+        cuda.squid_launch_prefill_warmup_cublas(self.stream);
+
+        const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
+        tiger.print_stdout(
+            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices, prefill_alias={d}) | graphs={s}\n",
+            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, @as(u8, if (alias_prefill) 1 else 0), if (use_graphs) "on" else "off" },
+        );
+        self.reset();
+    }
+
+    fn alloc_and_bind_runtime_arena(self: *Engine) void {
+        tiger.assert(self.arena.base_ptr == null);
+        const weights = self.weights.?;
+        const context_tokens_max = self.context_tokens_max;
+        const kv_format = self.kv_format;
+        const alias_prefill = self.prefill_aliased;
+
         const expert_groups_bytes: u64 = cuda.squid_sizeof_expert_groups();
         tiger.assert(expert_groups_bytes > 0);
+        const cpu_moe_state_bytes: u64 = cuda.squid_sizeof_cpu_moe_dev_state();
+        tiger.assert(cpu_moe_state_bytes == @sizeOf(cuda.CCpuMoeDevState));
         const has_dspark: bool = (weights.dspark.loaded != 0);
         const draft_vocab_size: u32 = if (has_dspark and weights.dspark.draft_vocab_size > 0)
             @intCast(weights.dspark.draft_vocab_size)
         else
             constants.vocab_unpadded_count;
-        const alias_prefill: bool = weights.use_expert_cache;
-        self.prefill_aliased = alias_prefill;
-        self.prefill_batch_cap = if (alias_prefill) 1024 else prefill_batch_max;
 
         // Pass 1: compute exact aligned runtime VRAM requirement -> 1 single cudaMalloc!
         const runtime_bytes: u64 = compute_runtime_vram_bytes(
@@ -349,6 +423,7 @@ pub const Engine = struct {
             draft_vocab_size,
             alias_prefill,
             expert_groups_bytes,
+            cpu_moe_state_bytes,
         );
         self.arena = vram_arena.VRAMArena.init(runtime_bytes);
 
@@ -395,21 +470,6 @@ pub const Engine = struct {
         self.d_chosen_width = self.arena.alloc_one(i32);
         self.d_accepted = self.arena.alloc_many(i32, b_max);
         self.d_num_acc = self.arena.alloc_one(i32);
-
-        var h_acc_raw: ?*anyopaque = null;
-        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_acc_raw, @intCast(b_max * @sizeOf(i32)), 0));
-        self.h_accepted = @ptrCast(@alignCast(h_acc_raw.?));
-
-        var h_nacc_raw: ?*anyopaque = null;
-        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_nacc_raw, @sizeOf(i32), 0));
-        self.h_num_accepted = @ptrCast(@alignCast(h_nacc_raw.?));
-
-        var h_cw_raw: ?*anyopaque = null;
-        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_cw_raw, @sizeOf(i32), 0));
-        self.h_chosen_width = @ptrCast(@alignCast(h_cw_raw.?));
-        var h_ld_raw: ?*anyopaque = null;
-        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ld_raw, constants.mtp_draft_count_max * @sizeOf(i32), 0));
-        self.h_lookup_drafts = @ptrCast(@alignCast(h_ld_raw.?));
 
         self.hidden = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.prelude = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -461,13 +521,15 @@ pub const Engine = struct {
         self.d_draft_q_sel = self.arena.alloc_many(f32, constants.mtp_draft_count_max);
         self.d_draft_is_delta = self.arena.alloc_one(i32);
         self.d_sample_cfg = self.arena.alloc_one(cuda.CSampleConfig);
+        self.d_cpu_state = self.arena.alloc_raw(cpu_moe_state_bytes);
         const zero_cfg: cuda.CSampleConfig = .{};
         const zero_i32: i32 = 0;
+        const cpu_cfg_upload: cuda.CCpuMoeDevState = self.cpu_moe_cfg;
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_draft_is_delta), @ptrCast(&zero_i32), @sizeOf(i32), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.d_cpu_state.?, @ptrCast(&cpu_cfg_upload), @sizeOf(cuda.CCpuMoeDevState), self.stream));
 
         if (!alias_prefill) {
-            // Fast batched prefill arena (carved permanently in VRAM on >=16 GB GPUs)
             const p_bytes: u64 = compute_prefill_scratch_bytes(prefill_batch_max);
             const p_base: [*]u8 = @ptrCast(self.arena.alloc_raw(p_bytes));
             self.bind_prefill_scratch_from_base(p_base, prefill_batch_max);
@@ -475,16 +537,6 @@ pub const Engine = struct {
 
         // Paired TigerStyle invariant: Pass 1 == Pass 2!
         self.arena.assert_exact_fill();
-
-        // Pre-initialize cuBLAS handle during startup so Chunk 0 prefill pays 0ms cold handle creation.
-        cuda.squid_launch_prefill_warmup_cublas(self.stream);
-
-        const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
-        tiger.print_stdout(
-            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices, prefill_alias={d}) | graphs={s}\n",
-            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, @as(u8, if (alias_prefill) 1 else 0), if (use_graphs) "on" else "off" },
-        );
-        self.reset();
     }
 
     pub fn init_expert_cache(
@@ -540,6 +592,82 @@ pub const Engine = struct {
                 .{ chosen_pb, chosen_slots, @as(f64, @floatFromInt(@as(u64, chosen_slots) * slot_bytes)) / (1024.0 * 1024.0) },
             );
         }
+    }
+
+    pub fn init_cpu_moe(self: *Engine, weights: *const weights_mod.ModelWeights) void {
+        if (!weights.use_expert_cache or self.cpu_moe_mode == .off) return;
+        if (self.cpu_moe_pool != null) return;
+
+        const bell_bytes: usize = cuda.squid_sizeof_cpu_moe_bell();
+        tiger.assert(bell_bytes > 0);
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&self.h_cpu_bell, bell_bytes, 1));
+        tiger.assert(self.h_cpu_bell != null);
+        @memset(@as([*]u8, @ptrCast(self.h_cpu_bell.?))[0..bell_bytes], 0);
+        tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&self.d_cpu_bell, self.h_cpu_bell.?));
+        tiger.assert(self.d_cpu_bell != null);
+
+        var num_threads: i32 = 0; // auto (8-10 on hybrid CPUs)
+        if (tiger.getenv("SQUID_CPU_MOE_THREADS")) |env_t| {
+            num_threads = std.fmt.parseInt(i32, std.mem.span(env_t), 10) catch 0;
+        }
+        var split_num: u32 = 1;
+        var split_round: u32 = 1;
+        var split_den: u32 = 2;
+        if (tiger.getenv("SQUID_CPU_MOE_SPLIT")) |env_s| {
+            const s = std.mem.span(env_s);
+            if (std.mem.eql(u8, s, "all") or std.mem.eql(u8, s, "1/1")) {
+                split_num = 1;
+                split_round = 0;
+                split_den = 1;
+            } else if (std.mem.eql(u8, s, "3/4")) {
+                split_num = 3;
+                split_round = 2;
+                split_den = 4;
+            } else if (std.mem.eql(u8, s, "1/2")) {
+                split_num = 1;
+                split_round = 1;
+                split_den = 2;
+            } else if (std.mem.eql(u8, s, "1/3")) {
+                split_num = 1;
+                split_round = 1;
+                split_den = 3;
+            }
+        }
+        var max_batch: u32 = 8;
+        if (tiger.getenv("SQUID_CPU_MOE_MAX_B")) |env_b| {
+            const parsed = std.fmt.parseInt(u32, std.mem.span(env_b), 10) catch 8;
+            if (parsed >= 1 and parsed <= 8) max_batch = parsed;
+        }
+
+        self.cpu_moe_cfg = .{
+            .seq = 0,
+            .n_tasks = 0,
+            .n_outs = 0,
+            .enabled = 1,
+            .split_num = split_num,
+            .split_round = split_round,
+            .split_den = split_den,
+            .max_batch = max_batch,
+            .skip_mask = 0,
+        };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(self.d_cpu_state.?, @ptrCast(&self.cpu_moe_cfg), @sizeOf(cuda.CCpuMoeDevState)));
+
+        var host_ptrs: [constants.layer_count]?[*]const u8 = @splat(null);
+        for (0..constants.layer_count) |li| {
+            host_ptrs[li] = weights.host_experts_h[li];
+        }
+        self.cpu_moe_pool = cuda.squid_cpu_moe_create(
+            self.h_cpu_bell.?,
+            &host_ptrs,
+            &weights.host_scale_w13,
+            &weights.host_scale_w2,
+            num_threads,
+        );
+        tiger.assert(self.cpu_moe_pool != null);
+        tiger.print_stdout(
+            "[cpu-moe] Hybrid AVX2 FP32-NVFP4 miss executor enabled (threads={d}, split={d}/{d}, max_B={d}, bell={d:.1} KiB)\n",
+            .{ num_threads, split_num, split_den, max_batch, @as(f64, @floatFromInt(bell_bytes)) / 1024.0 },
+        );
     }
 
     fn bind_prefill_scratch_from_base(self: *Engine, base: [*]u8, pb_u32: u32) void {
@@ -598,18 +726,179 @@ pub const Engine = struct {
         tiger.assert(off == compute_prefill_scratch_bytes(pb_u32));
     }
 
-    pub fn deinit(self: *Engine) void {
-        if (self.b1_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+    fn destroy_graphs(self: *Engine) void {
+        if (self.b1_graph_exec) |g| {
+            tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+            self.b1_graph_exec = null;
+        }
         for (&self.spec_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
             g.* = null;
         }
-        if (self.draft_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
-        if (self.verify_b8_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
-        if (self.adaptive_graph) |g| tiger.assert_cuda(cuda.squid_adaptive_graph_destroy(g));
+        if (self.draft_graph_exec) |g| {
+            tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+            self.draft_graph_exec = null;
+        }
+        if (self.verify_b8_graph_exec) |g| {
+            tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+            self.verify_b8_graph_exec = null;
+        }
+        if (self.adaptive_graph) |g| {
+            tiger.assert_cuda(cuda.squid_adaptive_graph_destroy(g));
+            self.adaptive_graph = null;
+            self.adaptive_graph_threshold = -1.0;
+        }
         for (&self.prefill_b8_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
             g.* = null;
+        }
+    }
+
+    /// Release nearly all VRAM (~7.4 GiB -> CUDA context overhead only) while keeping host RAM mirrors
+    /// and parking the active conversation so the next request wakes in < 0.5 s with zero re-prefill!
+    pub fn sleep_vram(self: *Engine) void {
+        if (self.sleeping) return;
+        const t0 = tiger.clock_monotonic_ns();
+        const w = self.weights.?;
+
+        if (self.prefix_cache.enabled and self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 128) {
+            self.park_live_session(null);
+        }
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        if (self.cpu_moe_pool != null and self.d_cpu_state != null) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(&self.cpu_moe_cfg), self.d_cpu_state.?, @sizeOf(cuda.CCpuMoeDevState)));
+            self.cpu_moe_cfg.n_tasks = 0;
+            self.cpu_moe_cfg.n_outs = 0;
+            self.cpu_moe_cfg.skip_mask = 0;
+            cuda.squid_cpu_moe_nap(self.cpu_moe_pool);
+        }
+        self.destroy_graphs();
+        self.expert_cache.sleep_vram(w, self.stream);
+        self.arena.deinit();
+        w.sleep_vram();
+        self.prefix_cache.gpu_global_kv_valid = false;
+        self.prefix_cache.gpu_live_at_pos = -1;
+        for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
+        self.sleeping = true;
+
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        _ = cuda.squid_cuda_mem_get_info(&free_b, &total_b);
+        const used_mib: f64 = @as(f64, @floatFromInt(if (total_b > free_b) total_b - free_b else 0)) / (1024.0 * 1024.0);
+        const ms: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1_000_000.0;
+        tiger.print_stdout("[vram] Entered idle sleep in {d:.1}ms (GPU used={d:.0} MiB, parked_slots={d})\n", .{ ms, used_mib, self.parked_slot_count() });
+    }
+
+    /// Re-allocate VRAM arenas and H2D-restore packed weights + hottest experts from host RAM (< 0.5 s).
+    pub fn wake_vram(self: *Engine) void {
+        if (!self.sleeping) return;
+        const t0 = tiger.clock_monotonic_ns();
+        const w = self.weights.?;
+
+        w.wake_vram();
+        self.alloc_and_bind_runtime_arena();
+        self.expert_cache.wake_vram(w, self.stream);
+        self.reset();
+        self.prefix_cache.gpu_global_kv_valid = false;
+        self.prefix_cache.gpu_live_at_pos = -1;
+        self.sleeping = false;
+
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        _ = cuda.squid_cuda_mem_get_info(&free_b, &total_b);
+        const used_mib: f64 = @as(f64, @floatFromInt(if (total_b > free_b) total_b - free_b else 0)) / (1024.0 * 1024.0);
+        const ms: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1_000_000.0;
+        tiger.print_stdout("[vram] Woke up in {d:.1}ms (GPU used={d:.0} MiB)\n", .{ ms, used_mib });
+    }
+
+    pub const VramStatus = struct {
+        used_mib: f64,
+        free_mib: f64,
+        total_mib: f64,
+    };
+
+    pub fn vram_status(self: *const Engine) VramStatus {
+        _ = self;
+        var free_b: usize = 0;
+        var total_b: usize = 0;
+        _ = cuda.squid_cuda_mem_get_info(&free_b, &total_b);
+        const used_b: usize = if (total_b > free_b) total_b - free_b else 0;
+        const inv_mib: f64 = 1.0 / (1024.0 * 1024.0);
+        return .{
+            .used_mib = @as(f64, @floatFromInt(used_b)) * inv_mib,
+            .free_mib = @as(f64, @floatFromInt(free_b)) * inv_mib,
+            .total_mib = @as(f64, @floatFromInt(total_b)) * inv_mib,
+        };
+    }
+
+    pub fn parked_slot_count(self: *const Engine) u32 {
+        var n: u32 = 0;
+        for (self.prefix_cache.parked) |sl| {
+            if (sl.valid) n += 1;
+        }
+        return n;
+    }
+
+    /// On-demand image encoder (0 MiB permanent VRAM): borrows prefill tail scratch on 8 GB GPUs,
+    /// runs the 23-layer BF16 Tensor Core ViT + 2x2 merge projector, and returns slots immediately.
+    pub fn encode_image(self: *Engine, img_bytes: []const u8, out_embeds: []f32) ?vision_mod.EncodeResult {
+        if (self.sleeping) self.wake_vram();
+        const w = self.weights.?;
+        var scratch_dev: ?*anyopaque = null;
+        var scratch_bytes: usize = 0;
+        var borrowed: bool = false;
+        if (self.prefill_aliased and self.expert_cache.enabled and self.expert_cache.prefill_reserved_tail == 0 and self.prefill_tail_slots > 0) {
+            scratch_dev = @ptrCast(self.expert_cache.acquire_prefill_scratch(self.prefill_tail_slots, self.stream));
+            scratch_bytes = @as(usize, self.prefill_tail_slots) * constants.expert_slot_bytes;
+            borrowed = true;
+        }
+        defer if (borrowed) {
+            self.expert_cache.release_prefill_scratch(self.stream, true);
+        };
+        return vision_mod.encode_image_bytes(
+            w.model_dir(),
+            img_bytes,
+            scratch_dev,
+            scratch_bytes,
+            vision_mod.max_image_tokens,
+            out_embeds,
+            self.stream,
+        );
+    }
+
+    fn inject_active_images(self: *Engine, hidden_buf: [*]f32, chunk_start: u32, batch_len: u32) void {
+        if (self.active_images.len == 0 or chunk_start == std.math.maxInt(u32)) return;
+        const chunk_end: u32 = chunk_start + batch_len;
+        for (self.active_images) |img| {
+            const img_start: u32 = img.prompt_pos;
+            const img_end: u32 = img.prompt_pos + img.num_tokens;
+            const ov_lo: u32 = @max(chunk_start, img_start);
+            const ov_hi: u32 = @min(chunk_end, img_end);
+            if (ov_lo >= ov_hi) continue;
+            const cnt: u32 = ov_hi - ov_lo;
+            const src_row: usize = ov_lo - img_start;
+            const dst_row: usize = ov_lo - chunk_start;
+            const dst_ptr: [*]f32 = hidden_buf + dst_row * constants.hidden_dim;
+            const src_ptr: [*]const f32 = img.embeds.ptr + src_row * constants.hidden_dim;
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                @ptrCast(dst_ptr),
+                @ptrCast(src_ptr),
+                @as(usize, cnt) * constants.hidden_dim * @sizeOf(f32),
+                self.stream,
+            ));
+        }
+    }
+
+    pub fn deinit(self: *Engine) void {
+        self.destroy_graphs();
+        if (self.cpu_moe_pool) |p| {
+            cuda.squid_cpu_moe_destroy(p);
+            self.cpu_moe_pool = null;
+        }
+        if (self.h_cpu_bell) |p| {
+            tiger.assert_cuda(cuda.squid_cuda_free_host(p));
+            self.h_cpu_bell = null;
+            self.d_cpu_bell = null;
         }
         if (self.h_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_num_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
@@ -645,10 +934,18 @@ pub const Engine = struct {
     }
 
     /// Allocate static host-RAM prefix KV cache (zero extra VRAM, zero malloc per request).
-    /// Stores 4 local-state+ring checkpoints (~193 MiB each) + a 4K-token global-KV side-request shield.
+    /// Stores 4 local-state+ring checkpoints + side-request shield + up to `slot_keep` LRU parked sessions.
     pub fn enable_prefix_cache(self: *Engine) void {
+        self.enable_prefix_cache_with_slots(4);
+    }
+
+    pub fn enable_prefix_cache_with_slots(self: *Engine, slot_keep_in: u32) void {
         tiger.assert(self.weights != null);
-        if (self.prefix_cache.enabled) return;
+        const clamped_slots: u32 = @min(slot_keep_in, @as(u32, @intCast(parked_slots_max)));
+        if (self.prefix_cache.enabled) {
+            self.prefix_cache.parked_max = clamped_slots;
+            return;
+        }
 
         const local_bytes: usize = self.compute_local_state_bytes();
         const shield_bytes: usize = self.compute_global_kv_prefix_bytes(side_shield_max_tokens);
@@ -663,13 +960,16 @@ pub const Engine = struct {
         }
         self.prefix_cache.side_shield_buf = tiger.alloc_host_zeroed(u8, shield_bytes);
         self.prefix_cache.session_len = 0;
+        self.prefix_cache.gpu_global_kv_valid = false;
         self.prefix_cache.gpu_live_at_pos = -1;
+        self.prefix_cache.parked_max = clamped_slots;
+        self.prefix_cache.parked_tick = 0;
         self.prefix_cache.enabled = true;
 
         const host_mib: f64 = @as(f64, @floatFromInt(local_bytes * prefix_checkpoint_count + shield_bytes + self.context_tokens_max * 4)) / (1024.0 * 1024.0);
         tiger.print_stdout(
-            "[cache] Prefix KV cache enabled ({d} checkpoints + {d}-tok side-request shield, host RAM={d:.1} MiB, extra VRAM=0.0 MiB)\n",
-            .{ prefix_checkpoint_count, side_shield_max_tokens, host_mib },
+            "[cache] Prefix KV cache enabled ({d} checkpoints + {d}-tok shield + {d} host-RAM parked slots, base RAM={d:.1} MiB, extra VRAM=0.0 MiB)\n",
+            .{ prefix_checkpoint_count, side_shield_max_tokens, clamped_slots, host_mib },
         );
     }
 
@@ -680,6 +980,12 @@ pub const Engine = struct {
             if (ckpt.data.len > 0) tiger.free_host_slice(u8, ckpt.data);
         }
         if (self.prefix_cache.side_shield_buf.len > 0) tiger.free_host_slice(u8, self.prefix_cache.side_shield_buf);
+        for (&self.prefix_cache.parked) |*sl| {
+            if (sl.tokens.len > 0) tiger.free_host_slice(i32, sl.tokens);
+            if (sl.local_state.len > 0) tiger.free_host_slice(u8, sl.local_state);
+            if (sl.prefill_local_state.len > 0) tiger.free_host_slice(u8, sl.prefill_local_state);
+            if (sl.global_kv.len > 0) tiger.free_host_slice(u8, sl.global_kv);
+        }
         self.prefix_cache = .{};
     }
 
@@ -732,10 +1038,8 @@ pub const Engine = struct {
         return total;
     }
 
-    fn save_local_state_checkpoint(self: *Engine, slot_idx: usize, pos: u32) void {
-        tiger.assert(self.prefix_cache.enabled and slot_idx < prefix_checkpoint_count);
-        const ckpt = &self.prefix_cache.checkpoints[slot_idx];
-        const dst = ckpt.data;
+    fn save_local_state_buf(self: *Engine, dst: []u8) void {
+        tiger.assert(dst.len == self.prefix_cache.local_state_bytes);
         var off: usize = 0;
 
         var vi: u32 = 0;
@@ -783,15 +1087,10 @@ pub const Engine = struct {
         }
         tiger.assert(off == self.prefix_cache.local_state_bytes);
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
-        ckpt.pos = pos;
-        ckpt.valid = true;
     }
 
-    fn restore_local_state_checkpoint(self: *Engine, slot_idx: usize) void {
-        tiger.assert(self.prefix_cache.enabled and slot_idx < prefix_checkpoint_count);
-        const ckpt = &self.prefix_cache.checkpoints[slot_idx];
-        tiger.assert(ckpt.valid);
-        const src = ckpt.data;
+    fn restore_local_state_buf(self: *Engine, src: []const u8) void {
+        tiger.assert(src.len == self.prefix_cache.local_state_bytes);
         var off: usize = 0;
 
         var vi: u32 = 0;
@@ -840,9 +1139,23 @@ pub const Engine = struct {
         tiger.assert(off == self.prefix_cache.local_state_bytes);
     }
 
-    fn copy_global_kv_shield(self: *Engine, token_count: u32, save_d2h: bool) void {
-        tiger.assert(self.prefix_cache.enabled and token_count > 0 and token_count <= side_shield_max_tokens);
-        const buf = self.prefix_cache.side_shield_buf;
+    fn save_local_state_checkpoint(self: *Engine, slot_idx: usize, pos: u32) void {
+        tiger.assert(self.prefix_cache.enabled and slot_idx < prefix_checkpoint_count);
+        const ckpt = &self.prefix_cache.checkpoints[slot_idx];
+        self.save_local_state_buf(ckpt.data);
+        ckpt.pos = pos;
+        ckpt.valid = true;
+    }
+
+    fn restore_local_state_checkpoint(self: *Engine, slot_idx: usize) void {
+        tiger.assert(self.prefix_cache.enabled and slot_idx < prefix_checkpoint_count);
+        const ckpt = &self.prefix_cache.checkpoints[slot_idx];
+        tiger.assert(ckpt.valid);
+        self.restore_local_state_buf(ckpt.data);
+    }
+
+    fn copy_global_kv_buf(self: *Engine, buf: []u8, token_count: u32, save_d2h: bool) void {
+        tiger.assert(self.prefix_cache.enabled and token_count > 0 and token_count <= self.context_tokens_max);
         const sz = global_kv_bytes_for_tokens(self.kv_format, token_count);
         var off: usize = 0;
 
@@ -904,6 +1217,145 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
     }
 
+    fn copy_global_kv_shield(self: *Engine, token_count: u32, save_d2h: bool) void {
+        tiger.assert(token_count <= side_shield_max_tokens);
+        self.copy_global_kv_buf(self.prefix_cache.side_shield_buf, token_count, save_d2h);
+    }
+
+    /// Snapshot the current live conversation (tokens + local state + optional prefill_end local state + full global KV)
+    /// into an LRU host-RAM parked slot so switching back later or waking from idle-sleep restores in ~15-50 ms!
+    fn park_live_session(self: *Engine, protect_slot: ?usize) void {
+        const pc = &self.prefix_cache;
+        if (!pc.enabled or pc.parked_max == 0 or !pc.gpu_global_kv_valid or pc.session_len < 128) return;
+
+        const max_slots: usize = @min(@as(usize, pc.parked_max), parked_slots_max);
+        var park_len: u32 = 0;
+        var ckpt_src_idx: ?usize = null;
+        if (pc.gpu_live_at_pos > 0 and @as(u32, @intCast(pc.gpu_live_at_pos)) <= pc.session_len) {
+            park_len = @intCast(pc.gpu_live_at_pos);
+        } else {
+            // After a shielded side request, global KV is still live while local state lives in checkpoints[2..3].
+            for (pc.checkpoints, 0..) |ckpt, ci| {
+                if (ckpt.valid and ckpt.pos >= 128 and ckpt.pos <= pc.session_len and ckpt.pos > park_len) {
+                    park_len = ckpt.pos;
+                    ckpt_src_idx = ci;
+                }
+            }
+        }
+        if (park_len < 128) return;
+
+        // Deduplicate: if an existing slot is an ancestor/continuation of the same conversation, update it in place.
+        var dst_idx: ?usize = null;
+        var si: usize = 0;
+        while (si < max_slots) : (si += 1) {
+            if (protect_slot != null and protect_slot.? == si) continue;
+            const sl = &pc.parked[si];
+            if (!sl.valid) continue;
+            const cmp_len: u32 = @min(sl.len, park_len);
+            var common: u32 = 0;
+            while (common < cmp_len and sl.tokens[common] == pc.session_tokens[common]) : (common += 1) {}
+            if (common >= 128 and (common == sl.len or common * 4 >= cmp_len * 3)) {
+                dst_idx = si;
+                break;
+            }
+        }
+        if (dst_idx == null) {
+            // Pick first empty slot, else LRU slot (excluding protect_slot).
+            var best_tick: u64 = std.math.maxInt(u64);
+            si = 0;
+            while (si < max_slots) : (si += 1) {
+                if (protect_slot != null and protect_slot.? == si) continue;
+                if (!pc.parked[si].valid) {
+                    dst_idx = si;
+                    break;
+                }
+                if (pc.parked[si].last_used_tick < best_tick) {
+                    best_tick = pc.parked[si].last_used_tick;
+                    dst_idx = si;
+                }
+            }
+        }
+        const slot_i = dst_idx orelse return;
+        const sl = &pc.parked[slot_i];
+        const t0 = tiger.clock_monotonic_ns();
+
+        if (sl.local_state.len != pc.local_state_bytes) {
+            if (sl.local_state.len > 0) tiger.free_host_slice(u8, sl.local_state);
+            sl.local_state = tiger.alloc_host_zeroed(u8, pc.local_state_bytes);
+        }
+        if (sl.cap_tokens < park_len) {
+            const aligned: u32 = @intCast(@min(@as(u64, self.context_tokens_max), tiger.align_up_u64(park_len, 2048)));
+            if (sl.tokens.len > 0) tiger.free_host_slice(i32, sl.tokens);
+            if (sl.global_kv.len > 0) tiger.free_host_slice(u8, sl.global_kv);
+            sl.tokens = tiger.alloc_host_zeroed(i32, aligned);
+            sl.global_kv = tiger.alloc_host_zeroed(u8, self.compute_global_kv_prefix_bytes(aligned));
+            sl.cap_tokens = aligned;
+        }
+
+        @memcpy(sl.tokens[0..park_len], pc.session_tokens[0..park_len]);
+        if (ckpt_src_idx) |ci| {
+            @memcpy(sl.local_state, pc.checkpoints[ci].data);
+        } else if (pc.checkpoints[3].valid and pc.checkpoints[3].pos == park_len) {
+            @memcpy(sl.local_state, pc.checkpoints[3].data);
+        } else {
+            self.save_local_state_buf(sl.local_state);
+        }
+
+        // Also preserve prefill_end checkpoint (slot 2) so thinking-stripped multi-turn continuations hit 100%!
+        if (pc.checkpoints[2].valid and pc.checkpoints[2].pos >= 128 and pc.checkpoints[2].pos < park_len) {
+            if (sl.prefill_local_state.len != pc.local_state_bytes) {
+                if (sl.prefill_local_state.len > 0) tiger.free_host_slice(u8, sl.prefill_local_state);
+                sl.prefill_local_state = tiger.alloc_host_zeroed(u8, pc.local_state_bytes);
+            }
+            @memcpy(sl.prefill_local_state, pc.checkpoints[2].data);
+            sl.prefill_len = pc.checkpoints[2].pos;
+        } else {
+            sl.prefill_len = 0;
+        }
+
+        self.copy_global_kv_buf(sl.global_kv, park_len, true);
+        pc.parked_tick += 1;
+        sl.len = park_len;
+        sl.use_mtp = pc.session_use_mtp;
+        sl.last_used_tick = pc.parked_tick;
+        sl.valid = true;
+
+        const ms: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1_000_000.0;
+        tiger.print_stdout("[cache] Parked session into host slot {d} ({d} tok, prefill_ckpt={d}, {d:.1}ms)\n", .{ slot_i, park_len, sl.prefill_len, ms });
+    }
+
+    /// Restore a host-RAM parked conversation back into GPU VRAM (local state + global KV) in ~15-50 ms.
+    fn restore_parked_session(self: *Engine, slot_i: usize, use_prefill_ckpt: bool) u32 {
+        const pc = &self.prefix_cache;
+        const sl = &pc.parked[slot_i];
+        tiger.assert(sl.valid);
+        const t0 = tiger.clock_monotonic_ns();
+
+        const restore_len: u32 = if (use_prefill_ckpt) sl.prefill_len else sl.len;
+        const local_src: []const u8 = if (use_prefill_ckpt) sl.prefill_local_state else sl.local_state;
+        tiger.assert(restore_len >= 128 and local_src.len == pc.local_state_bytes);
+
+        self.restore_local_state_buf(local_src);
+        self.copy_global_kv_buf(sl.global_kv, restore_len, false);
+
+        @memcpy(pc.session_tokens[0..restore_len], sl.tokens[0..restore_len]);
+        pc.session_len = restore_len;
+        pc.session_use_mtp = sl.use_mtp;
+        pc.gpu_global_kv_valid = true;
+        pc.gpu_live_at_pos = @intCast(restore_len);
+        for (&pc.checkpoints) |*ckpt| ckpt.valid = false;
+        @memcpy(pc.checkpoints[2].data, local_src);
+        pc.checkpoints[2].pos = restore_len;
+        pc.checkpoints[2].valid = true;
+
+        pc.parked_tick += 1;
+        sl.last_used_tick = pc.parked_tick;
+
+        const ms: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1_000_000.0;
+        tiger.print_stdout("[cache] Restored parked slot {d} ({d} tok in {d:.1}ms)\n", .{ slot_i, restore_len, ms });
+        return restore_len;
+    }
+
     /// Generate up to `max_new_tokens` into `out_tokens` (and optionally invoke `on_token`).
     /// ZERO heap allocations occur during the entire prefill + decode execution!
     pub fn generate(
@@ -955,57 +1407,95 @@ pub const Engine = struct {
         };
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&cfg_h), @sizeOf(cuda.CSampleConfig), self.stream));
 
-        // --- PREFIX KV CACHE MATCHING & SIDE-REQUEST SHIELDING ---
+        // --- PREFIX KV CACHE MATCHING, HOST-RAM SESSION PARKING & SIDE-REQUEST SHIELDING ---
         const prefill_start_ns: u64 = tiger.clock_monotonic_ns();
         var start_pos: u32 = 0;
         var shield_tokens: u32 = 0;
 
         if (self.prefix_cache.enabled) {
-            const max_match: u32 = @min(self.prefix_cache.session_len, if (prompt_len > 1) prompt_len - 1 else 0);
+            const prompt_match_cap: u32 = if (prompt_len > 1) prompt_len - 1 else 0;
+            const live_max_match: u32 = if (self.prefix_cache.gpu_global_kv_valid)
+                @min(self.prefix_cache.session_len, prompt_match_cap)
+            else
+                0;
             var common: u32 = 0;
-            while (common < max_match and self.prefix_cache.session_tokens[common] == prompt[common]) : (common += 1) {}
+            while (common < live_max_match and self.prefix_cache.session_tokens[common] == prompt[common] and prompt[common] != vision_mod.image_token_id) : (common += 1) {}
 
-            // Short non-matching side request while holding a long session? Shield global KV prefix!
+            // Evaluate best restorable position in the live GPU session.
+            var live_pos: u32 = 0;
+            var live_best_slot: ?usize = null;
+            var live_matched_gpu: bool = false;
+            if (self.prefix_cache.gpu_global_kv_valid and common > 0 and use_mtp == self.prefix_cache.session_use_mtp) {
+                if (self.prefix_cache.gpu_live_at_pos > 0 and @as(u32, @intCast(self.prefix_cache.gpu_live_at_pos)) <= common) {
+                    live_pos = @intCast(self.prefix_cache.gpu_live_at_pos);
+                    live_matched_gpu = true;
+                }
+                for (self.prefix_cache.checkpoints, 0..) |ckpt, sidx| {
+                    if (ckpt.valid and ckpt.pos <= common and ckpt.pos > live_pos) {
+                        live_pos = ckpt.pos;
+                        live_best_slot = sidx;
+                        live_matched_gpu = false;
+                    }
+                }
+            }
+
+            // Evaluate best restorable position across host-RAM parked conversations.
+            var parked_pos: u32 = 0;
+            var parked_best_idx: ?usize = null;
+            var parked_use_prefill: bool = false;
+            const max_parked: usize = @min(@as(usize, self.prefix_cache.parked_max), parked_slots_max);
+            var pi: usize = 0;
+            while (pi < max_parked) : (pi += 1) {
+                const sl = &self.prefix_cache.parked[pi];
+                if (!sl.valid or sl.use_mtp != use_mtp) continue;
+                const p_cap: u32 = @min(sl.len, prompt_match_cap);
+                if (p_cap < 128) continue;
+                var p_common: u32 = 0;
+                while (p_common < p_cap and sl.tokens[p_common] == prompt[p_common] and prompt[p_common] != vision_mod.image_token_id) : (p_common += 1) {}
+                if (sl.len <= p_common and sl.len > parked_pos) {
+                    parked_pos = sl.len;
+                    parked_best_idx = pi;
+                    parked_use_prefill = false;
+                } else if (sl.prefill_len >= 128 and sl.prefill_len <= p_common and sl.prefill_local_state.len == self.prefix_cache.local_state_bytes and sl.prefill_len > parked_pos) {
+                    parked_pos = sl.prefill_len;
+                    parked_best_idx = pi;
+                    parked_use_prefill = true;
+                }
+            }
+
             const side_need: u32 = prompt_len + max_new_tokens + 16;
-            if (self.prefix_cache.session_len >= 1024 and common < 512 and side_need <= side_shield_max_tokens) {
+            const is_tiny_side: bool = if (max_parked > 0)
+                (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 2048 and common < 128 and prompt_len < 512 and side_need <= 1024)
+            else
+                (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 1024 and common < 512 and side_need <= side_shield_max_tokens);
+
+            if (parked_pos > live_pos and parked_pos >= 128) {
+                if (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 128) {
+                    self.park_live_session(parked_best_idx);
+                }
+                start_pos = self.restore_parked_session(parked_best_idx.?, parked_use_prefill);
+                self.current_position = @intCast(start_pos);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+                stats.cached_tokens = start_pos;
+            } else if (is_tiny_side) {
                 shield_tokens = @min(self.prefix_cache.session_len, side_need);
                 self.copy_global_kv_shield(shield_tokens, true);
                 self.reset();
-            } else if (common > 0 and use_mtp == self.prefix_cache.session_use_mtp) {
-                // Target global KV caches hold full `context_tokens_max` (up to 1M) without wrapping.
-                // DSpark's global KV ring (64K at 1M ctx) only proposes draft tokens that are strictly
-                // verified by the target model, so never clamp target prefix reuse at 65,536!
-                const reusable_limit: u32 = common;
-
-                // Check 1: exact live GPU match (0 ms restore!)
-                var matched_live: bool = false;
-                if (self.prefix_cache.gpu_live_at_pos > 0 and @as(u32, @intCast(self.prefix_cache.gpu_live_at_pos)) <= reusable_limit) {
-                    start_pos = @intCast(self.prefix_cache.gpu_live_at_pos);
-                    matched_live = true;
+            } else if (live_pos > 0) {
+                start_pos = live_pos;
+                if (!live_matched_gpu) {
+                    self.restore_local_state_checkpoint(live_best_slot.?);
                 }
-                // Check 2: best host-RAM checkpoint (may be strictly further than live, e.g. prefill_end or system_prefix!)
-                var best_slot: ?usize = null;
-                for (self.prefix_cache.checkpoints, 0..) |ckpt, sidx| {
-                    if (ckpt.valid and ckpt.pos <= reusable_limit and ckpt.pos > start_pos) {
-                        start_pos = ckpt.pos;
-                        best_slot = sidx;
-                        matched_live = false;
-                    }
-                }
-
-                if (start_pos > 0) {
-                    if (!matched_live) {
-                        self.restore_local_state_checkpoint(best_slot.?);
-                    }
-                    self.current_position = @intCast(start_pos);
-                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-                    stats.cached_tokens = start_pos;
-                } else {
-                    self.reset();
-                    for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
-                }
+                self.current_position = @intCast(start_pos);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+                stats.cached_tokens = start_pos;
             } else {
+                if (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 128) {
+                    self.park_live_session(null);
+                }
                 self.reset();
+                self.prefix_cache.gpu_global_kv_valid = false;
+                self.prefix_cache.gpu_live_at_pos = -1;
                 for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
             }
         } else {
@@ -1072,6 +1562,7 @@ pub const Engine = struct {
             @memcpy(self.prefix_cache.session_tokens[start_pos..prompt_len], prompt[start_pos..prompt_len]);
             self.prefix_cache.session_len = prompt_len;
             self.prefix_cache.session_use_mtp = use_mtp;
+            self.prefix_cache.gpu_global_kv_valid = true;
             self.prefix_cache.gpu_live_at_pos = @intCast(prompt_len);
             for (&self.prefix_cache.checkpoints) |*ckpt| {
                 if (ckpt.valid and ckpt.pos > prompt_len) ckpt.valid = false;
@@ -1105,6 +1596,8 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
         // --- DECODE ---
+        if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_wake(self.cpu_moe_pool);
+        defer if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_nap(self.cpu_moe_pool);
         var prev_fed_tok: i32 = first_tok;
         var decode_stop_now: bool = false;
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
@@ -1114,7 +1607,7 @@ pub const Engine = struct {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
                     self.expert_cache.record_zero_touches(self.stream);
-                    self.record_target_forward(1, false, true, false);
+                    self.record_target_forward(1, false, true, false, true);
                     cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 }
                 self.expert_cache.copy_touches_d2h_async(self.stream);
@@ -1273,7 +1766,7 @@ pub const Engine = struct {
                     );
                     cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
                     self.expert_cache.record_zero_touches(self.stream);
-                    self.record_target_forward(batch, true, true, true);
+                    self.record_target_forward(batch, true, true, true, true);
                     cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
                 }
 
@@ -1330,7 +1823,7 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
                 self.expert_cache.record_zero_touches(self.stream);
-                self.record_target_forward(1, true, true, false);
+                self.record_target_forward(1, true, true, false, true);
                 cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 self.expert_cache.copy_touches_d2h_async(self.stream);
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
@@ -1375,7 +1868,7 @@ pub const Engine = struct {
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
         }
-        if (self.use_graphs and end_i - i >= constants.mtp_block_size_max) {
+        if (self.use_graphs and self.active_images.len == 0 and end_i - i >= constants.mtp_block_size_max) {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max <= end_i and (!compute_last_lm or i + constants.mtp_block_size_max < end_i)) {
@@ -1395,7 +1888,9 @@ pub const Engine = struct {
             const is_last: bool = compute_last_lm and (i + batch == end_i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
+            self.prefill_cur_prompt_pos = i;
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false, false);
+            self.prefill_cur_prompt_pos = std.math.maxInt(u32);
             self.current_position += @intCast(batch);
             i += batch;
         }
@@ -1413,7 +1908,7 @@ pub const Engine = struct {
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp);
             i += chunk;
         }
-        if (self.use_graphs and prompt_len - i > constants.mtp_block_size_max) {
+        if (self.use_graphs and self.active_images.len == 0 and prompt_len - i > constants.mtp_block_size_max) {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max < prompt_len) {
@@ -1434,7 +1929,9 @@ pub const Engine = struct {
             const is_last: bool = (i + batch == prompt_len);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
+            self.prefill_cur_prompt_pos = i;
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false, false);
+            self.prefill_cur_prompt_pos = std.math.maxInt(u32);
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;
@@ -1468,6 +1965,7 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_tokens), @ptrCast(prompt[start_i..].ptr), b_usize * @sizeOf(i32), self.stream));
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.p_tokens, self.p_hidden, b_i32, self.stream);
+        self.inject_active_images(self.p_hidden, start_i, chunk_len);
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -2075,6 +2573,9 @@ pub const Engine = struct {
         if (!use_mtp) self.ensure_b1_graph() else self.ensure_spec_graph(num_drafts);
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
+        if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_wake(self.cpu_moe_pool);
+        defer if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_nap(self.cpu_moe_pool);
+
         const graph_exec = if (use_mtp) self.spec_graph_exec[num_drafts].? else self.b1_graph_exec.?;
         var warmup: u32 = 0;
         while (warmup < 4) : (warmup += 1) {
@@ -2164,12 +2665,15 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
         }
 
+        if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_wake(self.cpu_moe_pool);
+        defer if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_nap(self.cpu_moe_pool);
+
         var i: usize = 0;
         while (i < tokens.len) {
             const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), false, true, false);
+            self.record_target_forward(@intCast(batch), false, true, false, true);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
                 @ptrCast(chunk_buf.ptr),
                 @ptrCast(self.lm_logits),
@@ -2199,12 +2703,15 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
         }
 
+        if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_wake(self.cpu_moe_pool);
+        defer if (self.cpu_moe_pool != null) cuda.squid_cpu_moe_nap(self.cpu_moe_pool);
+
         var i: usize = 0;
         while (i < tokens.len) {
             const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), false, true, false);
+            self.record_target_forward(@intCast(batch), false, true, false, true);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
                 @ptrCast(out_logits_host[i * vocab ..].ptr),
                 @ptrCast(self.lm_logits),
@@ -2217,7 +2724,7 @@ pub const Engine = struct {
         }
     }
 
-    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool, is_verify: bool) void {
+    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool, is_verify: bool, use_cpu_moe: bool) void {
         tiger.assert(batch_size >= 1 and batch_size <= constants.mtp_block_size_max);
         const w = self.weights.?;
         const b_usize: usize = @intCast(batch_size);
@@ -2227,6 +2734,9 @@ pub const Engine = struct {
         const moe_out_ptr: [*]f32 = if (moe_slotted != 0) self.moe_slot_out else self.moe_down;
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
+        if (self.active_images.len > 0 and self.prefill_cur_prompt_pos != std.math.maxInt(u32)) {
+            self.inject_active_images(self.hidden, self.prefill_cur_prompt_pos, @intCast(batch_size));
+        }
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -2573,8 +3083,26 @@ pub const Engine = struct {
                     self.stream,
                 );
             }
-            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, self.moe_act_h, batch_size, self.stream);
-            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, moe_out_ptr, batch_size, self.stream);
+            const active_cpu_state: ?*anyopaque = if (use_cpu_moe and self.cpu_moe_pool != null and self.expert_cache.enabled) self.d_cpu_state else null;
+            if (active_cpu_state != null) {
+                cuda.squid_launch_moe_cpu_dispatch(
+                    &lw.w13,
+                    @intCast(l),
+                    self.mlp_normed_h,
+                    self.route_ids,
+                    self.route_w,
+                    if (batch_size > 1) self.exp_groups else null,
+                    self.d_cpu_bell,
+                    active_cpu_state,
+                    batch_size,
+                    self.stream,
+                );
+            }
+            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, active_cpu_state, self.moe_act_h, batch_size, self.stream);
+            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, active_cpu_state, moe_out_ptr, batch_size, self.stream);
+            if (active_cpu_state != null) {
+                cuda.squid_launch_moe_cpu_merge(self.d_cpu_bell, active_cpu_state, moe_out_ptr, self.stream);
+            }
 
             if (vi == 17 or vi == 29) {
                 const mlp_abl = ablation_slice(w, true, vi);
@@ -2699,7 +3227,7 @@ pub const Engine = struct {
         if (self.b1_graph_exec != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
         self.expert_cache.record_zero_touches(self.stream);
-        self.record_target_forward(1, false, true, false);
+        self.record_target_forward(1, false, true, false, true);
         cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.b1_graph_exec));
         tiger.assert(self.b1_graph_exec != null);
@@ -2709,7 +3237,7 @@ pub const Engine = struct {
         const slot: usize = if (commit_dspark) 1 else 0;
         if (self.prefill_b8_graph_exec[slot] != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false, false);
+        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false, false, false);
         cuda.squid_launch_inc_pos_by(self.d_pos, constants.mtp_block_size_max, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.prefill_b8_graph_exec[slot]));
         tiger.assert(self.prefill_b8_graph_exec[slot] != null);
@@ -2750,7 +3278,7 @@ pub const Engine = struct {
         );
         cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
         self.expert_cache.record_zero_touches(self.stream);
-        self.record_target_forward(batch, true, true, true);
+        self.record_target_forward(batch, true, true, true, true);
         cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.spec_graph_exec[num_drafts]));
         tiger.assert(self.spec_graph_exec[num_drafts] != null);
@@ -2796,7 +3324,7 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
             cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, constants.mtp_draft_count_max, self.stream);
             self.expert_cache.record_zero_touches(self.stream);
-            self.record_target_forward(constants.mtp_block_size_max, true, true, true);
+            self.record_target_forward(constants.mtp_block_size_max, true, true, true, true);
             cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, constants.mtp_block_size_max, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_num_accepted.?), @ptrCast(self.d_num_acc), @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_accepted), constants.mtp_block_size_max * @sizeOf(i32), self.stream));
@@ -2814,7 +3342,9 @@ pub const Engine = struct {
             self.d_anchor,
             self.d_drafts,
             self.d_draft_conf,
+            self.d_sample_cfg,
             self.spec_threshold,
+            if (w.use_expert_cache) 1 else 0,
             self.d_tokens,
             self.d_chosen_width,
             self.d_accepted,
@@ -2829,7 +3359,7 @@ pub const Engine = struct {
         for (widths, 0..) |width, bidx| {
             tiger.assert_cuda(cuda.squid_adaptive_graph_branch_begin(self.adaptive_graph, @intCast(bidx), self.stream));
             self.expert_cache.record_zero_touches(self.stream);
-            self.record_target_forward(width, true, true, width > 1);
+            self.record_target_forward(width, true, true, width > 1, true);
             cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, width, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
             tiger.assert_cuda(cuda.squid_adaptive_graph_branch_end(self.stream));
         }
@@ -2901,6 +3431,7 @@ fn compute_runtime_vram_bytes(
     draft_vocab_size: u32,
     alias_prefill: bool,
     expert_groups_bytes: u64,
+    cpu_moe_state_bytes: u64,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -2980,6 +3511,7 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(constants.mtp_draft_count_max * 4, a); // d_draft_q_sel
     total += tiger.align_up_u64(4, a); // d_draft_is_delta
     total += tiger.align_up_u64(@sizeOf(cuda.CSampleConfig), a); // d_sample_cfg
+    total += tiger.align_up_u64(cpu_moe_state_bytes, a); // d_cpu_state
 
     if (!alias_prefill) {
         total += tiger.align_up_u64(compute_prefill_scratch_bytes(prefill_batch_max), a);

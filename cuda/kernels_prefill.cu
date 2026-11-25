@@ -34,6 +34,14 @@ static cublasHandle_t get_cublas(cudaStream_t stream) {
     return g_cublas;
 }
 
+} // namespace
+
+cublasHandle_t squid_get_shared_cublas(cudaStream_t stream) {
+    return get_cublas(stream);
+}
+
+namespace {
+
 __global__ void p_f32_to_f16_kernel(const float* __restrict__ src, __half* __restrict__ dst, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(src[i]);

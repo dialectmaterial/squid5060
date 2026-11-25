@@ -87,6 +87,14 @@ pub const Timeval = extern struct {
     tv_usec: i64,
 };
 
+pub const PollFd = extern struct {
+    fd: i32,
+    events: i16,
+    revents: i16,
+};
+
+pub const POLLIN: i16 = 0x0001;
+
 pub const SockaddrIn = extern struct {
     sin_family: u16,
     sin_port: u16,
@@ -152,6 +160,7 @@ pub extern "c" fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const a
 pub extern "c" fn bind(fd: i32, addr: *const SockaddrIn, addrlen: u32) i32;
 pub extern "c" fn listen(fd: i32, backlog: i32) i32;
 pub extern "c" fn accept(fd: i32, addr: ?*SockaddrIn, addrlen: ?*u32) i32;
+pub extern "c" fn poll(fds: [*]PollFd, nfds: u64, timeout: i32) i32;
 pub extern "c" fn recv(fd: i32, buffer: [*]u8, length: usize, flags: i32) isize;
 pub extern "c" fn send(fd: i32, buffer: [*]const u8, length: usize, flags: i32) isize;
 pub extern "c" fn inet_pton(af: i32, src: [*:0]const u8, dst: *u32) i32;

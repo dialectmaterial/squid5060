@@ -8,6 +8,7 @@
 const std = @import("std");
 const constants = @import("constants.zig");
 const cuda = @import("cuda.zig");
+const hot_experts = @import("hot_experts.zig");
 const tiger = @import("tiger.zig");
 const weights_mod = @import("weights.zig");
 
@@ -73,8 +74,10 @@ pub const ExpertCache = struct {
     nonloop_clock_max: u8 = 3,
     lrfu_decay: f32 = 0.998,
     lrfu_hysteresis: f32 = 1.50,
+    warm_prior_max: f32 = 4.0,
     max_promotes_per_decode: u32 = 8,
     max_promotes_per_prefill_warm: u32 = 64,
+    sleeping: bool = false,
 
     // Telemetry counters
     decode_accesses: u64 = 0,
@@ -118,6 +121,9 @@ pub const ExpertCache = struct {
         }
         if (parse_env_u32("SQUID_CACHE_HYST")) |v| {
             if (v >= 100 and v <= 500) self.lrfu_hysteresis = @as(f32, @floatFromInt(v)) / 100.0;
+        }
+        if (parse_env_u32("SQUID_WARM_PRIOR")) |v| {
+            if (v >= 1 and v <= 1000) self.warm_prior_max = @as(f32, @floatFromInt(v)) / 10.0;
         }
         if (tiger.getenv("SQUID_CACHE_POLICY")) |p| {
             const ps = std.mem.span(p);
@@ -241,8 +247,101 @@ pub const ExpertCache = struct {
             @memcpy(self.cache_file_buf[0..cache_file_path.len], cache_file_path);
             self.cache_file_buf[cache_file_path.len] = 0;
             self.cache_file_len = cache_file_path.len;
-            self.load_warm_snapshot(weights, stream);
+            if (!self.load_warm_snapshot(weights, stream)) {
+                self.load_builtin_profile(weights, stream);
+            }
         }
+    }
+
+    /// Release all VRAM allocations owned by the expert cache while retaining live LRFU scores in host RAM.
+    pub fn sleep_vram(self: *ExpertCache, weights: *weights_mod.ModelWeights, stream: ?*anyopaque) void {
+        if (!self.enabled or self.sleeping) return;
+        self.flush_async(stream);
+        tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
+        if (self.d_cache_pool) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+        if (self.d_slot_map) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+        if (self.d_touch_counts) |p| tiger.assert_cuda(cuda.squid_cuda_free(@ptrCast(p)));
+        self.d_cache_pool = null;
+        self.d_slot_map = null;
+        self.d_touch_counts = null;
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            weights.layers[l].w13.cache_pool = null;
+            weights.layers[l].w13.slot_map = null;
+            weights.layers[l].w13.touch_counts = null;
+            weights.layers[l].w2.cache_pool = null;
+            weights.layers[l].w2.slot_map = null;
+            weights.layers[l].w2.touch_counts = null;
+        }
+        self.sleeping = true;
+    }
+
+    /// Re-allocate VRAM pool and bulk-DMA-reload the hottest experts from live LRFU scores (~250 ms).
+    pub fn wake_vram(self: *ExpertCache, weights: *weights_mod.ModelWeights, stream: ?*anyopaque) void {
+        if (!self.enabled or !self.sleeping) return;
+        const slots: u32 = self.num_slots;
+        const pool_bytes: u64 = self.capacity_bytes;
+
+        var raw_pool: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&raw_pool, @intCast(pool_bytes)));
+        self.d_cache_pool = @ptrCast(raw_pool.?);
+
+        var raw_smap: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&raw_smap, total_experts * @sizeOf(i32)));
+        self.d_slot_map = @ptrCast(@alignCast(raw_smap.?));
+
+        var raw_touch: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc(&raw_touch, total_experts * @sizeOf(u32)));
+        self.d_touch_counts = @ptrCast(@alignCast(raw_touch.?));
+
+        // Reset slot tracking and re-reserve async staging slots
+        for (self.slot_owner) |*o| o.* = -1;
+        @memset(self.clock_bits, 0);
+        @memset(self.slot_reserved, false);
+        self.free_list_len = 0;
+        self.free_slots_used = 0;
+        self.prefill_reserved_tail = 0;
+        self.clock_hand = 0;
+        self.ready_free_len = 0;
+        self.quarantine_len = 0;
+        self.inflight_len = 0;
+        @memset(&self.is_inflight, false);
+        if (self.async_promote) {
+            var k: usize = 0;
+            while (k < async_staging_slots) : (k += 1) {
+                const s: u32 = slots - 1 - @as(u32, @intCast(k));
+                self.slot_reserved[s] = true;
+                self.ready_free[k] = s;
+            }
+            self.ready_free_len = async_staging_slots;
+        }
+
+        var eid: usize = 0;
+        while (eid < total_experts) : (eid += 1) {
+            self.h_slot_map.?[eid] = -1;
+            self.h_touch_counts.?[eid] = 0;
+        }
+        tiger.assert_cuda(cuda.squid_cuda_memset_async(
+            @ptrCast(self.d_touch_counts.?),
+            0,
+            total_experts * @sizeOf(u32),
+            stream,
+        ));
+
+        var l: u32 = 0;
+        while (l < constants.layer_count) : (l += 1) {
+            const base_off: usize = @as(usize, l) * constants.expert_count;
+            const lw = &weights.layers[l];
+            lw.w13.cache_pool = self.d_cache_pool;
+            lw.w13.slot_map = self.d_slot_map.? + base_off;
+            lw.w13.touch_counts = self.d_touch_counts.? + base_off;
+            lw.w2.cache_pool = self.d_cache_pool;
+            lw.w2.slot_map = self.d_slot_map.? + base_off;
+            lw.w2.touch_counts = null;
+        }
+
+        self.sleeping = false;
+        self.bulk_load_from_scores(weights, stream, "wake");
     }
 
     pub fn deinit(self: *ExpertCache) void {
@@ -887,10 +986,10 @@ pub const ExpertCache = struct {
         @panic("expert_cache: no evictable slot available");
     }
 
-    fn load_warm_snapshot(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque) void {
-        if (self.cache_file_len == 0) return;
+    fn load_warm_snapshot(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque) bool {
+        if (self.cache_file_len == 0) return false;
         const fd = tiger.open(@ptrCast(&self.cache_file_buf), tiger.O_RDONLY);
-        if (fd < 0) return;
+        if (fd < 0) return false;
         defer _ = tiger.close(fd);
 
         const magic: []const u8 = "SQ5060C1";
@@ -903,17 +1002,47 @@ pub const ExpertCache = struct {
             if (n <= 0) break;
             got += @intCast(n);
         }
-        if (got != expected_bytes or !std.mem.eql(u8, buf[0..8], magic)) return;
+        if (got != expected_bytes or !std.mem.eql(u8, buf[0..8], magic)) return false;
 
-        const t0 = tiger.clock_monotonic_ns();
-        var n_cands: usize = 0;
+        var max_sc: f32 = 0.0;
+        var raw_scores: [total_experts]f32 = @splat(0.0);
         var eid: usize = 0;
         while (eid < total_experts) : (eid += 1) {
             const bits = std.mem.readInt(u32, buf[8 + eid * 4 ..][0..4], .little);
             const sc: f32 = @bitCast(bits);
             if (std.math.isFinite(sc) and sc > 0.0) {
-                self.ewma_score[eid] = sc;
-                const scaled: u32 = @intFromFloat(@min(sc * 1000.0, 4_000_000_000.0));
+                raw_scores[eid] = sc;
+                if (sc > max_sc) max_sc = sc;
+            }
+        }
+        if (max_sc <= 0.0) return false;
+
+        const scale: f32 = self.warm_prior_max / max_sc;
+        eid = 0;
+        while (eid < total_experts) : (eid += 1) {
+            self.ewma_score[eid] = raw_scores[eid] * scale;
+        }
+        self.bulk_load_from_scores(weights, stream, "snapshot");
+        return true;
+    }
+
+    fn load_builtin_profile(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque) void {
+        const inv_max: f32 = self.warm_prior_max / 65535.0;
+        var eid: usize = 0;
+        while (eid < total_experts) : (eid += 1) {
+            self.ewma_score[eid] = @as(f32, @floatFromInt(hot_experts.default_scores[eid])) * inv_max;
+        }
+        self.bulk_load_from_scores(weights, stream, "built-in profile");
+    }
+
+    fn bulk_load_from_scores(self: *ExpertCache, weights: *const weights_mod.ModelWeights, stream: ?*anyopaque, source_label: []const u8) void {
+        const t0 = tiger.clock_monotonic_ns();
+        var n_cands: usize = 0;
+        var eid: usize = 0;
+        while (eid < total_experts) : (eid += 1) {
+            const sc: f32 = self.ewma_score[eid];
+            if (std.math.isFinite(sc) and sc > 0.0) {
+                const scaled: u32 = @intFromFloat(@min(sc * 10000.0, 4_000_000_000.0));
                 self.cand_buf[n_cands] = .{ .eid = @intCast(eid), .score = if (scaled == 0) 1 else scaled };
                 n_cands += 1;
             }
@@ -957,8 +1086,8 @@ pub const ExpertCache = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
         const ms: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - t0)) / 1e6;
         tiger.print_stdout(
-            "[moe-cache] Warm-loaded {d} experts from snapshot in {d:.1}ms\n",
-            .{ loaded, ms },
+            "[moe-cache] Warm-loaded {d} experts from {s} in {d:.1}ms (prior_max={d:.1})\n",
+            .{ loaded, source_label, ms, self.warm_prior_max },
         );
     }
 

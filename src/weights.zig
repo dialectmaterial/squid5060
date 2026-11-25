@@ -62,11 +62,19 @@ pub const AblationWeights = struct {
 pub const ModelWeights = struct {
     mode: constants.QuantMode = .nvfp4,
     use_expert_cache: bool = false,
+    model_dir_buf: [1024]u8 = @splat(0),
+    model_dir_len: usize = 0,
     arena: vram_arena.VRAMArena = .{},
+    arena_mirror: []u8 = &.{},
+    saved_arena_base: usize = 0,
+    saved_arena_capacity: u64 = 0,
+    sleeping: bool = false,
     pinned_host_embed: ?*anyopaque = null,
     pinned_host_markov_w1: ?*anyopaque = null,
     host_experts_h: [constants.layer_count]?[*]u8 = @splat(null),
     host_experts_dev: [constants.layer_count]?[*]u8 = @splat(null),
+    host_scale_w13: [constants.layer_count * constants.expert_count]f32 = @splat(1.0),
+    host_scale_w2: [constants.layer_count * constants.expert_count]f32 = @splat(1.0),
 
     embed: ?*anyopaque = null,
     embed_norm: ?*anyopaque = null,
@@ -85,6 +93,10 @@ pub const ModelWeights = struct {
 
     pub fn deinit(self: *ModelWeights) void {
         self.arena.deinit();
+        if (self.arena_mirror.len > 0) {
+            tiger.free_host_slice(u8, self.arena_mirror);
+            self.arena_mirror = &.{};
+        }
         if (self.pinned_host_embed) |host_ptr| {
             tiger.assert_cuda(cuda.squid_cuda_free_host(host_ptr));
             self.pinned_host_embed = null;
@@ -102,6 +114,10 @@ pub const ModelWeights = struct {
         self.* = .{};
     }
 
+    pub fn model_dir(self: *const ModelWeights) []const u8 {
+        return self.model_dir_buf[0..self.model_dir_len];
+    }
+
     pub fn load(
         self: *ModelWeights,
         model_directory: []const u8,
@@ -111,7 +127,7 @@ pub const ModelWeights = struct {
         use_expert_cache: bool,
         ablation_path: []const u8,
     ) bool {
-        tiger.assert(model_directory.len > 0);
+        tiger.assert(model_directory.len > 0 and model_directory.len < self.model_dir_buf.len);
         tiger.assert(self.arena.base_ptr == null);
         if (use_expert_cache) {
             tiger.assert(quant_mode != .exact);
@@ -120,6 +136,8 @@ pub const ModelWeights = struct {
         const start_ns: u64 = tiger.clock_monotonic_ns();
         self.mode = quant_mode;
         self.use_expert_cache = use_expert_cache;
+        @memcpy(self.model_dir_buf[0..model_directory.len], model_directory);
+        self.model_dir_len = model_directory.len;
         const embed_on_host: bool = embed_on_host_in or use_expert_cache;
 
         var main_path_buf: [1024]u8 = undefined;
@@ -709,6 +727,11 @@ pub const ModelWeights = struct {
                     h_scales[ei] = amax_val * inv_denom;
                 }
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(scale_dsts[idx]), @ptrCast(&h_scales), @sizeOf(@TypeOf(h_scales))));
+                if (idx == 0) {
+                    @memcpy(self.host_scale_w13[layer_idx * constants.expert_count ..][0..constants.expert_count], &h_scales);
+                } else {
+                    @memcpy(self.host_scale_w2[layer_idx * constants.expert_count ..][0..constants.expert_count], &h_scales);
+                }
             }
         } else {
             // Physical layers 20..23: MXFP8 -> NVFP4 on GPU in 32-expert chunks using d_stage (no extra VRAM!)
@@ -791,6 +814,16 @@ pub const ModelWeights = struct {
                     }
                 }
             }
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(
+                @ptrCast(&self.host_scale_w13[layer_idx * constants.expert_count]),
+                @ptrCast(lw.w13.expert_scale.?),
+                constants.expert_count * @sizeOf(f32),
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(
+                @ptrCast(&self.host_scale_w2[layer_idx * constants.expert_count]),
+                @ptrCast(lw.w2.expert_scale.?),
+                constants.expert_count * @sizeOf(f32),
+            ));
         }
     }
 
@@ -1058,6 +1091,146 @@ pub const ModelWeights = struct {
 
         self.ablation.active = true;
         self.ablation.has_detectors = has_detectors;
+    }
+
+    /// Snapshot packed dense/DSpark weights arena to host RAM (once) and free GPU VRAM.
+    pub fn sleep_vram(self: *ModelWeights) void {
+        if (self.sleeping or self.arena.base_ptr == null) return;
+        const cap: usize = @intCast(self.arena.capacity_bytes);
+        if (self.arena_mirror.len == 0) {
+            self.arena_mirror = tiger.alloc_host_zeroed(u8, cap);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h(@ptrCast(self.arena_mirror.ptr), @ptrCast(self.arena.base_ptr.?), cap));
+        }
+        self.saved_arena_base = @intFromPtr(self.arena.base_ptr.?);
+        self.saved_arena_capacity = self.arena.capacity_bytes;
+        self.arena.deinit();
+        self.sleeping = true;
+    }
+
+    /// Re-allocate contiguous weights arena, H2D-restore packed weights (~35 ms), and rebase device pointers.
+    pub fn wake_vram(self: *ModelWeights) void {
+        if (!self.sleeping) return;
+        tiger.assert(self.arena_mirror.len > 0 and self.saved_arena_capacity > 0);
+        const old_lo: usize = self.saved_arena_base;
+        const cap: usize = @intCast(self.saved_arena_capacity);
+        const old_hi: usize = old_lo + cap;
+
+        self.arena = vram_arena.VRAMArena.init(self.saved_arena_capacity);
+        self.arena.offset_bytes = self.arena.capacity_bytes;
+        const new_lo: usize = @intFromPtr(self.arena.base_ptr.?);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.arena.base_ptr.?), @ptrCast(self.arena_mirror.ptr), cap));
+
+        if (new_lo != old_lo) {
+            self.rebase_arena_ptrs(old_lo, old_hi, new_lo);
+        }
+        self.saved_arena_base = new_lo;
+        self.sleeping = false;
+    }
+
+    fn rebase_opt(ptr: anytype, old_lo: usize, old_hi: usize, new_lo: usize) void {
+        if (ptr.*) |p| {
+            const addr = @intFromPtr(p);
+            if (addr >= old_lo and addr < old_hi) {
+                ptr.* = @ptrFromInt(new_lo + (addr - old_lo));
+            }
+        }
+    }
+
+    fn rebase_linear(lw: *cuda.CLinearWeight, old_lo: usize, old_hi: usize, new_lo: usize) void {
+        rebase_opt(&lw.data, old_lo, old_hi, new_lo);
+        rebase_opt(&lw.scales, old_lo, old_hi, new_lo);
+        rebase_opt(&lw.row_scales, old_lo, old_hi, new_lo);
+    }
+
+    fn rebase_expert_bank(eb: *cuda.CExpertBank, old_lo: usize, old_hi: usize, new_lo: usize) void {
+        rebase_opt(&eb.data, old_lo, old_hi, new_lo);
+        rebase_opt(&eb.scales, old_lo, old_hi, new_lo);
+        rebase_opt(&eb.expert_scale, old_lo, old_hi, new_lo);
+    }
+
+    fn rebase_arena_ptrs(self: *ModelWeights, old_lo: usize, old_hi: usize, new_lo: usize) void {
+        rebase_opt(&self.embed, old_lo, old_hi, new_lo);
+        rebase_opt(&self.embed_norm, old_lo, old_hi, new_lo);
+        rebase_opt(&self.final_norm, old_lo, old_hi, new_lo);
+        rebase_linear(&self.unembed, old_lo, old_hi, new_lo);
+
+        for (&self.attn_queries) |*p| rebase_opt(p, old_lo, old_hi, new_lo);
+        for (&self.mlp_queries) |*p| rebase_opt(p, old_lo, old_hi, new_lo);
+        rebase_opt(&self.output_query, old_lo, old_hi, new_lo);
+        rebase_opt(&self.cross_pass_queries, old_lo, old_hi, new_lo);
+        rebase_opt(&self.cross_pass_kv_queries, old_lo, old_hi, new_lo);
+
+        for (&self.layers) |*lw| {
+            rebase_opt(&lw.attn_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.q_in_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.k_in_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.v_in_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.mlp_norm, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.w_qrgs, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.w_kv, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.w_k, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.w_v, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.w_o, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.k_sconv_w, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.v_sconv_w, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.k_sconv_proj, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.v_sconv_proj, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.attn_sconv_w, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.mlp_sconv_w, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.q_clip_scale, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.rel_clip_scale, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.rel_logits_proj, old_lo, old_hi, new_lo);
+            for (&lw.ctrl) |*c| {
+                rebase_opt(&c.down_w, old_lo, old_hi, new_lo);
+                rebase_opt(&c.forget_w, old_lo, old_hi, new_lo);
+                rebase_opt(&c.gain_w, old_lo, old_hi, new_lo);
+                rebase_linear(&c.down_nvfp4, old_lo, old_hi, new_lo);
+                rebase_linear(&c.forget_nvfp4, old_lo, old_hi, new_lo);
+                rebase_linear(&c.gain_nvfp4, old_lo, old_hi, new_lo);
+            }
+            rebase_opt(&lw.router_w, old_lo, old_hi, new_lo);
+            rebase_linear(&lw.router_nvfp4, old_lo, old_hi, new_lo);
+            rebase_opt(&lw.router_bias, old_lo, old_hi, new_lo);
+            rebase_expert_bank(&lw.w13, old_lo, old_hi, new_lo);
+            rebase_expert_bank(&lw.w2, old_lo, old_hi, new_lo);
+        }
+
+        rebase_opt(&self.dspark.fuse_alpha, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.mask_embed, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.norm_w, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.markov_dflare_norm, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.markov_w1, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.rnn_w_sp, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.rnn_w_h, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.rnn_w_f, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.rnn_bias, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.hidden_out_w, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.hidden_out_b, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.draft_vocab_ids, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.inv_draft_vocab_ids, old_lo, old_hi, new_lo);
+        rebase_linear(&self.dspark.unembed_draft, old_lo, old_hi, new_lo);
+        rebase_linear(&self.dspark.fold_w, old_lo, old_hi, new_lo);
+        rebase_opt(&self.dspark.fold_b, old_lo, old_hi, new_lo);
+        for (&self.dspark.layers) |*dl| {
+            rebase_opt(&dl.input_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&dl.post_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&dl.dflare_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&dl.q_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&dl.k_norm, old_lo, old_hi, new_lo);
+            rebase_opt(&dl.k_norm_ctx, old_lo, old_hi, new_lo);
+            rebase_linear(&dl.w_qkv, old_lo, old_hi, new_lo);
+            rebase_linear(&dl.w_o, old_lo, old_hi, new_lo);
+            rebase_linear(&dl.w_gu, old_lo, old_hi, new_lo);
+            rebase_linear(&dl.w_down, old_lo, old_hi, new_lo);
+            rebase_linear(&dl.w_kv_ctx, old_lo, old_hi, new_lo);
+        }
+
+        rebase_opt(&self.ablation.attn_dirs, old_lo, old_hi, new_lo);
+        rebase_opt(&self.ablation.attn_det, old_lo, old_hi, new_lo);
+        rebase_opt(&self.ablation.attn_params, old_lo, old_hi, new_lo);
+        rebase_opt(&self.ablation.mlp_dirs, old_lo, old_hi, new_lo);
+        rebase_opt(&self.ablation.mlp_det, old_lo, old_hi, new_lo);
+        rebase_opt(&self.ablation.mlp_params, old_lo, old_hi, new_lo);
     }
 };
 

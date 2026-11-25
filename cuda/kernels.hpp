@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "cpu_moe.hpp"
 #include "weights.hpp"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -92,12 +93,33 @@ void launch_qkvrg_fused(
 
 void launch_f32_to_f16(const float* src, __half* dst, int n, cudaStream_t stream);
 
+// Hybrid CPU+GPU MoE miss dispatch (runs before moe_gate_up_h; zero PCIe when n_misses==0)
+void launch_moe_cpu_dispatch(
+    const ExpertBank& w13,
+    int layer_idx,
+    const __half* x_h,
+    const int32_t* route_ids,
+    const float* route_w,
+    const ExpertGroups* groups,
+    CpuMoeBell* d_bell,
+    CpuMoeDevState* d_state,
+    int B,
+    cudaStream_t stream);
+
+// Hybrid CPU+GPU MoE wait & scatter (runs after moe_down_h; zero PCIe when n_tasks==0)
+void launch_moe_cpu_merge(
+    const CpuMoeBell* d_bell,
+    const CpuMoeDevState* d_state,
+    float* out_slots,
+    cudaStream_t stream);
+
 // MoE Gate+Up + Softcapped SwiGLU (reads half x, writes half out_act!)
 void launch_moe_gate_up_h(
     const ExpertBank& w13,
     const __half* x_h,         // [B, HIDDEN]
     const int32_t* route_ids,  // [B, TOP_K]
     const ExpertGroups* groups,// used when B > 1
+    const CpuMoeDevState* cpu_state, // optional hybrid CPU skip mask
     __half* out_act_h,         // [B, TOP_K, INTERMEDIATE]
     int B,
     cudaStream_t stream);
@@ -109,6 +131,7 @@ void launch_moe_down_h(
     const int32_t* route_ids,  // [B, TOP_K]
     const float* route_w,      // [B, TOP_K]
     const ExpertGroups* groups,// used when B > 1
+    const CpuMoeDevState* cpu_state, // optional hybrid CPU skip mask
     float* out_down,           // [B, HIDDEN]
     int B,
     cudaStream_t stream,
