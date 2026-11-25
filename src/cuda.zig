@@ -11,6 +11,11 @@ pub const CSampleConfig = extern struct {
     seed: u64 = 0,
 };
 
+pub const CLoopCDConfig = extern struct {
+    omega: f32 = 0.0,
+    ref_pass: i32 = 1,
+};
+
 pub const CLinearWeight = extern struct {
     kind: u8 = 0,
     rows: i32 = 0,
@@ -318,6 +323,41 @@ pub extern "c" fn squid_launch_mega_local_sconv_prep_store(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_attn_cluster_decode(
+    qrgs: [*]const f32,
+    k_proj: [*]const f32,
+    v_proj: [*]const f32,
+    in_k: [*]const f32,
+    in_v: [*]const f32,
+    k_sw: *const anyopaque,
+    v_sw: *const anyopaque,
+    k_sp: ?*const anyopaque,
+    v_sp: ?*const anyopaque,
+    k_ring: [*]f32,
+    v_ring: [*]f32,
+    q_cs: *const anyopaque,
+    r_cs: *const anyopaque,
+    rel_proj: *const anyopaque,
+    k_cache: *anyopaque,
+    v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    k_bulk_cache: ?*const anyopaque,
+    v_bulk_cache: ?*const anyopaque,
+    k_bulk_scale: ?*const anyopaque,
+    v_bulk_scale: ?*const anyopaque,
+    bulk_kv_cap: i32,
+    kv_fmt: u8,
+    split_buf: [*]f32,
+    out_gated: ?[*]f32,
+    out_gated_h: ?*anyopaque,
+    kv_cap: i32,
+    is_global: u8,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_relative_attention_gated(
     qrgs: [*]const f32,
     rel_proj: *const anyopaque,
@@ -508,11 +548,20 @@ pub extern "c" fn squid_launch_mega_mlp_post_res(
     mlp_ring: [*]f32,
     residual: [*]const f32,
     hidden_out: [*]f32,
+    loopcd_save_out: ?[*]f32,
     batch_size: i32,
     d_pos: *const i32,
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_loopcd_hidden_apply(
+    hidden: [*]f32,
+    ref_hidden: [*]const f32,
+    omega: f32,
+    batch_size: i32,
     stream: ?*anyopaque,
 ) void;
 
@@ -544,6 +593,9 @@ pub extern "c" fn squid_launch_mega_mlp_post_next_depth_norm(
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    loopcd_h1: ?[*]const f32,
+    loopcd_h2: ?[*]const f32,
+    loopcd_cfg: ?*const CLoopCDConfig,
     stream: ?*anyopaque,
 ) void;
 
@@ -815,6 +867,26 @@ pub extern "c" fn squid_launch_prefill_route_and_sort(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_prefill_dspark_commit(
+    dw: *const CDsparkWeights,
+    taps: [*]const f32,
+    ctx_k: [*]const ?*anyopaque,
+    ctx_v: [*]const ?*anyopaque,
+    ctx_ks: [*]const ?*anyopaque,
+    ctx_vs: [*]const ?*anyopaque,
+    ctx_cap: [*]const i32,
+    global_kv_fmt: u8,
+    f_ring: [*]f32,
+    mix_h0: *anyopaque,
+    mix_h1: *anyopaque,
+    mix_h2: *anyopaque,
+    scratch_kv: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
     w13: *const CExpertBank,
     x_h: *const anyopaque,
@@ -822,6 +894,7 @@ pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
     sorted_tok: [*]const i32,
     sorted_slot: [*]const i32,
     out_act_h: *anyopaque,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -834,6 +907,7 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     sorted_slot: [*]const i32,
     sorted_w: [*]const f32,
     out_slots: [*]f32,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;

@@ -253,6 +253,22 @@ void launch_attn_prep_store(
     int B, const int32_t* d_pos,
     cudaStream_t stream);
 
+// 1-Launch Cluster Fused Decode Attention (BF16/FP8/Q4 KV + optional Last-Loop Shared Global KV):
+// Collapses sconv+prep+store + bulk_splitk + tail_attn + merge_sink_gate into ONE PDL cluster launch.
+void launch_attn_cluster_decode(
+    const float* qrgs, const float* k_proj, const float* v_proj,
+    const float* in_k, const float* in_v,
+    const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
+    const __nv_bfloat16* k_sconv_proj, const __nv_bfloat16* v_sconv_proj,
+    float* k_ring, float* v_ring,
+    const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
+    const __nv_bfloat16* rel_proj,
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale,
+    const void* k_bulk_cache, const void* v_bulk_cache,
+    const __half* k_bulk_scale, const __half* v_bulk_scale, int bulk_kv_cap,
+    KVFormat kv_fmt, float* split_buf, float* out_gated, __half* out_gated_h,
+    int kv_cap, bool is_global, int B, const int32_t* d_pos, cudaStream_t stream);
+
 // Relative Bias + Attention with Sink + Gated Output (out * sigmoid(gate)):
 // For local visits (window > 0): runs inline relative-bias FlashDecoding on BF16 SWA KV cache.
 // For global visits (window == 0): runs 192-CTA GQA*B-shared Split-K FlashDecoding over bulk [0 .. tail_start)
@@ -388,6 +404,9 @@ void launch_mega_mlp_post_next_depth_norm(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* loopcd_h1,
+    const float* loopcd_h2,
+    const LoopCDConfig* loopcd_cfg,
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -439,10 +458,18 @@ void launch_mega_mlp_post_res(
     float* mlp_ring,
     const float* residual,
     float* hidden_out,
+    float* loopcd_save_out,
     int B, const int32_t* d_pos,
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    cudaStream_t stream);
+
+void launch_loopcd_hidden_apply(
+    float* hidden,
+    const float* ref_hidden,
+    float omega,
+    int B,
     cudaStream_t stream);
 
 // Simple vector ops
@@ -640,6 +667,25 @@ void launch_prefill_route_and_sort(
     int B,
     cudaStream_t stream);
 
+void launch_prefill_dspark_commit(
+    const DsparkWeights& dw,
+    const float* taps,
+    void* ctx_k[MTP_LAYERS],
+    void* ctx_v[MTP_LAYERS],
+    __half* ctx_ks[MTP_LAYERS],
+    __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* f_ring,
+    __half* mix_h0,
+    __half* mix_h1,
+    __half* mix_h2,
+    float* scratch_kv,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
 void launch_prefill_moe_gate_up_h(
     const ExpertBank& w13,
     const __half* x_h,
@@ -647,6 +693,7 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* sorted_tok,
     const int32_t* sorted_slot,
     __half* out_act_h,
+    void* scratch_q,
     int B,
     cudaStream_t stream);
 
@@ -658,6 +705,7 @@ void launch_prefill_moe_down_h(
     const int32_t* sorted_slot,
     const float* sorted_w,
     float* out_slots,
+    void* scratch_q,
     int B,
     cudaStream_t stream);
 

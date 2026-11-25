@@ -57,6 +57,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var top_p: f32 = 0.95;
     var top_k: i32 = 0;
     var seed: u64 = 0;
+    var loopcd_omega: f32 = 0.0;
+    var loopcd_ref: i32 = 1;
     var max_tokens: u32 = 128;
     var runs: u32 = 6;
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
@@ -150,6 +152,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--seed") and arg_i + 1 < argv.len) {
             arg_i += 1;
             seed = std.fmt.parseInt(u64, std.mem.span(argv[arg_i]), 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--loopcd-omega") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.0;
+            loopcd_omega = if (std.math.isFinite(v) and v >= -1.0 and v <= 2.0) v else 0.0;
+        } else if (std.mem.eql(u8, arg, "--loopcd-ref") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const v = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 1;
+            loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
             max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
@@ -371,6 +381,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         .top_p = top_p,
         .top_k = top_k,
         .seed = if (seed != 0) seed else tiger.clock_monotonic_ns(),
+        .loopcd_omega = loopcd_omega,
+        .loopcd_ref = loopcd_ref,
     };
     defer engine.deinit();
 
@@ -400,6 +412,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .default_temperature = temperature,
             .default_top_p = top_p,
             .default_top_k = top_k,
+            .default_loopcd_omega = loopcd_omega,
+            .default_loopcd_ref = loopcd_ref,
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
             .keep_history_thinking = keep_history_thinking,
@@ -834,9 +848,9 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5060 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini (8 GB RTX 5060 Edition)\n\n" ++
             "Usage:\n" ++
-            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 32768] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
-            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
-            "  squid5060 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 32768] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
+            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5060 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5060 longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv q4|fp8|bf16] [--ctx 131072]\n" ++
             "  squid5060 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4|fp8|exact] [--kv bf16|q4] [--ctx 8192]\n" ++
             "  squid5060 kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 8192]\n" ++

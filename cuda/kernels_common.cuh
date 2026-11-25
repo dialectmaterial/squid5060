@@ -103,6 +103,15 @@ __device__ __forceinline__ float ld_dep_f32(const float* p) {
     return v;
 }
 
+__device__ __forceinline__ float4 ld_dep_f4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
+}
+
 __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
     float& d0, float& d1, float& d2, float& d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -682,9 +691,10 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     }
 }
 
-// Stateless SplitMix64 uniform (0, 1) and Gumbel(0, 1) noise helpers for CUDA-graph sampling.
-// Strictly inside [2^-24, 1 - 2^-24] in float32 -> never produces 0.0f, 1.0f, NaN, or Inf.
-__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+// Stateless SplitMix64 uniform (0, 1) and full-64-bit Gumbel(0, 1) noise helpers for CUDA-graph sampling.
+// 64-bit floating-point Gumbel technique adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0):
+// keeps 24 significant bits down to 2^-64 so far-tail tokens (down to ~e^-44) sample accurately without Inf/NaN.
+__device__ __forceinline__ uint64_t hash_u64(uint64_t seed, int32_t pos, int32_t tok) {
     uint64_t h = seed ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ULL)
                       ^ ((uint64_t)(uint32_t)tok * 0xBF58476D1CE4E5B9ULL);
     h ^= h >> 30;
@@ -692,11 +702,100 @@ __device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t to
     h ^= h >> 27;
     h *= 0x94D049BB133111EBULL;
     h ^= h >> 31;
+    return h;
+}
+
+__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+    uint64_t h = hash_u64(seed, pos, tok);
     return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f);
 }
 
 __device__ __forceinline__ float hash_gumbel(uint64_t seed, int32_t pos, int32_t tok) {
-    return -__logf(-__logf(hash_u01(seed, pos, tok)));
+    uint64_t k = hash_u64(seed, pos, tok);
+    int z = min(__clzll(static_cast<long long>(k)), 40);
+    float m = static_cast<float>(static_cast<uint32_t>(k >> (40 - z))) + (z == 40 ? 0.5f : 0.0f);
+    float v = m * __int_as_float((127 - 24 - z) << 23); // strictly in (0, 1)
+    float e = (v < 0.5f) ? -log1pf(-v) : -logf(1.0f - v);
+    return -logf(e);
+}
+
+// Blackwell / Hopper Thread-Block Cluster + DSMEM mbarrier primitives (CUDA 13.1+ sm_120a safe).
+// Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
+__device__ __forceinline__ uint32_t cluster_smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ uint32_t cluster_remote_u32(uint32_t addr, int dst_rank) {
+    uint32_t r;
+    asm("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(addr), "r"(dst_rank));
+    return r;
+}
+
+__device__ __forceinline__ void cluster_mb_init(uint32_t mb) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(mb) : "memory");
+}
+
+__device__ __forceinline__ void cluster_fence_mb_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_mb_expect_tx(uint32_t mb, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                 :: "r"(mb), "r"(bytes) : "memory");
+}
+
+__device__ __forceinline__ void cluster_mb_wait(uint32_t mb, uint32_t parity = 0u) {
+    uint32_t done = 0u;
+    while (!done) {
+        asm volatile("{\n.reg .pred p;\n"
+                     "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], %2;\n"
+                     "selp.b32 %0, 1, 0, p;\n}"
+                     : "=r"(done) : "r"(mb), "r"(parity) : "memory");
+    }
+}
+
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_wait_acquire() {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_st_async_f4(uint32_t dst_addr, float4 v, uint32_t remote_mb) {
+    asm volatile("st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1,%2,%3,%4}, [%5];"
+                 :: "r"(dst_addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(remote_mb) : "memory");
+}
+
+__device__ __forceinline__ void cp_async16_cg(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 :: "r"(cluster_smem_u32(smem_dst)), "l"(gmem_src) : "memory");
+}
+
+template <class... KArgs, class... Args>
+inline void launch_pdl_cluster(
+    void (*kernel)(KArgs...), dim3 grid, int block, int smem_bytes, int cluster_x,
+    cudaStream_t stream, Args&&... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(block);
+    cfg.dynamicSmemBytes = static_cast<size_t>(smem_bytes);
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[2];
+    int n_attr = 0;
+    attr[n_attr].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[n_attr].val.programmaticStreamSerializationAllowed = 1;
+    ++n_attr;
+    if (cluster_x > 1) {
+        attr[n_attr].id = cudaLaunchAttributeClusterDimension;
+        attr[n_attr].val.clusterDim.x = static_cast<unsigned int>(cluster_x);
+        attr[n_attr].val.clusterDim.y = 1u;
+        attr[n_attr].val.clusterDim.z = 1u;
+        ++n_attr;
+    }
+    cfg.attrs = attr;
+    cfg.numAttrs = n_attr;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
 } // namespace squid

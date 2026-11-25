@@ -5,9 +5,12 @@ namespace squid {
 
 namespace {
 
-// Mix 4 target taps [4, B, HIDDEN] using fuse_alpha[m, 0..3], RMSNorm + dflare_norm -> out_mix[m, b, HIDDEN]
-// m = 0,1,2 -> draft layers 0..2; m = 3 -> markov f stored into f_ring[(pos+b) & 15]
-__global__ void dspark_mix_kernel(
+// Vectorized 576-thread (float4, zero SMEM buf, PDL) DSpark tap mixer:
+// Mix 4 target taps [4, B, HIDDEN] using fuse_alpha[m, 0..3], RMSNorm + dflare_norm
+// m = 0,1,2 -> draft layers 0..2 (writes __half to out_mix_h when non-null, else float to out_mix)
+// m = 3 -> markov f stored in FP32 into f_ring[(pos+b) & 15]
+__global__ void __launch_bounds__(576)
+dspark_mix_kernel(
     const float* __restrict__ taps,       // [4, B, HIDDEN]
     int B,
     const float* __restrict__ fuse_alpha, // [4, 4]
@@ -15,55 +18,73 @@ __global__ void dspark_mix_kernel(
     const __nv_bfloat16* __restrict__ n1,
     const __nv_bfloat16* __restrict__ n2,
     const __nv_bfloat16* __restrict__ n3,
-    float* __restrict__ out_mix,          // [3, B, HIDDEN]
+    float* __restrict__ out_mix,          // [3, B, HIDDEN] (nullptr when out_mix_h used)
+    __half* __restrict__ out_mix_h,       // [3, B, HIDDEN] (nullptr for BF16 weights)
     float* __restrict__ f_ring,           // [16, HIDDEN]
     const int32_t* __restrict__ d_pos) {
-    int b = blockIdx.x;
-    int m = blockIdx.y; // 0..3
-    int tid = threadIdx.x;
-    const float a0 = fuse_alpha[m * 4 + 0];
-    const float a1 = fuse_alpha[m * 4 + 1];
-    const float a2 = fuse_alpha[m * 4 + 2];
-    const float a3 = fuse_alpha[m * 4 + 3];
+    const int b = blockIdx.x;
+    const int m = blockIdx.y; // 0..3
+    const int tid = threadIdx.x; // 0..575
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int c4 = tid << 2;
 
-    const float* t0 = taps + ((size_t)0 * B + b) * HIDDEN;
-    const float* t1 = taps + ((size_t)1 * B + b) * HIDDEN;
-    const float* t2 = taps + ((size_t)2 * B + b) * HIDDEN;
-    const float* t3 = taps + ((size_t)3 * B + b) * HIDDEN;
-
-    __shared__ float buf[HIDDEN];
-    float sum_sq = 0.0f;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        float v = a0 * t0[d] + a1 * t1[d] + a2 * t2[d] + a3 * t3[d];
-        buf[d] = v;
-        sum_sq = fmaf(v, v, sum_sq);
-    }
-    sum_sq = warp_sum(sum_sq);
-    __shared__ float sm[8];
-    if ((tid & 31) == 0) sm[tid >> 5] = sum_sq;
-    __syncthreads();
-    __shared__ float inv_rms;
-    if (tid == 0) {
-        float tot = 0.0f;
-        for (int i = 0; i < 8; ++i) tot += sm[i];
-        inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
-    }
-    __syncthreads();
-
+    const float4 af = *reinterpret_cast<const float4*>(fuse_alpha + m * 4);
     const __nv_bfloat16* nw = (m == 0) ? n0 : (m == 1 ? n1 : (m == 2 ? n2 : n3));
-    float* dst = (m < 3)
-        ? (out_mix + ((size_t)m * B + b) * HIDDEN)
-        : (f_ring + (size_t)(((*d_pos) + b) & 15) * HIDDEN);
-    float s = inv_rms;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        dst[d] = buf[d] * s * __bfloat162float(nw[d]);
+    const uint2 nw4 = __ldg(reinterpret_cast<const uint2*>(nw + c4));
+    const __nv_bfloat162* nb = reinterpret_cast<const __nv_bfloat162*>(&nw4);
+    const float2 nf0 = __bfloat1622float2(nb[0]), nf1 = __bfloat1622float2(nb[1]);
+
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+
+    const float4 t0 = ld_dep_f4(taps + ((size_t)0 * B + b) * HIDDEN + c4);
+    const float4 t1 = ld_dep_f4(taps + ((size_t)1 * B + b) * HIDDEN + c4);
+    const float4 t2 = ld_dep_f4(taps + ((size_t)2 * B + b) * HIDDEN + c4);
+    const float4 t3 = ld_dep_f4(taps + ((size_t)3 * B + b) * HIDDEN + c4);
+
+    float4 v;
+    v.x = fmaf(af.x, t0.x, fmaf(af.y, t1.x, fmaf(af.z, t2.x, af.w * t3.x)));
+    v.y = fmaf(af.x, t0.y, fmaf(af.y, t1.y, fmaf(af.z, t2.y, af.w * t3.y)));
+    v.z = fmaf(af.x, t0.z, fmaf(af.y, t1.z, fmaf(af.z, t2.z, af.w * t3.z)));
+    v.w = fmaf(af.x, t0.w, fmaf(af.y, t1.w, fmaf(af.z, t2.w, af.w * t3.w)));
+
+    float sum_sq = warp_sum(fmaf(v.x, v.x, fmaf(v.y, v.y, fmaf(v.z, v.z, v.w * v.w))));
+    __shared__ float sm[18];
+    __shared__ float inv_rms;
+    if (lane == 0) sm[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = warp_sum((lane < 18) ? sm[lane] : 0.0f);
+        if (lane == 0) inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+    }
+    __syncthreads();
+
+    const float s = inv_rms;
+    v.x *= s * nf0.x;
+    v.y *= s * nf0.y;
+    v.z *= s * nf1.x;
+    v.w *= s * nf1.y;
+
+    if (m == 3) {
+        *reinterpret_cast<float4*>(f_ring + (size_t)(((*d_pos) + b) & 15) * HIDDEN + c4) = v;
+    } else if (out_mix_h) {
+        __half2 h0 = __floats2half2_rn(v.x, v.y);
+        __half2 h1 = __floats2half2_rn(v.z, v.w);
+        uint2 packed;
+        packed.x = *reinterpret_cast<uint32_t*>(&h0);
+        packed.y = *reinterpret_cast<uint32_t*>(&h1);
+        *reinterpret_cast<uint2*>(out_mix_h + ((size_t)m * B + b) * HIDDEN + c4) = packed;
+    } else {
+        *reinterpret_cast<float4*>(out_mix + ((size_t)m * B + b) * HIDDEN + c4) = v;
     }
 }
 
 // NeoX RoPE (theta = 1e6) + per-head RMSNorm -> store ctx K & V into draft KV cache (BF16/FP8/Q4!)
 // Input kv [B, 2*KV_DIM] (K at 0..1023, V at 1024..2047)
 template <int KV_FMT>
-__global__ void dspark_store_ctx_kv_kernel(
+__global__ void __launch_bounds__(128)
+dspark_store_ctx_kv_kernel(
     const float* __restrict__ kv,
     const __nv_bfloat16* __restrict__ k_norm, // [128]
     void* __restrict__ k_cache,
@@ -75,6 +96,9 @@ __global__ void dspark_store_ctx_kv_kernel(
     int b = blockIdx.x;
     int h = blockIdx.y; // 0..7
     int tid = threadIdx.x; // 0..127 (full head_dim!)
+    float knw = __bfloat162float(__ldg(k_norm + tid));
+    pdl_wait_fenced(0u);
+    pdl_trigger();
     int pos = (*d_pos) + b;
     int slot = pos % cap;
 
@@ -83,11 +107,11 @@ __global__ void dspark_store_ctx_kv_kernel(
 
     __shared__ float sm[4];
     // Store V
-    store_kv_head_128<KV_FMT>(vp[tid], slot, h, tid, v_cache, v_scale, sm);
+    store_kv_head_128<KV_FMT>(ld_dep_f32(vp + tid), slot, h, tid, v_cache, v_scale, sm);
     __syncthreads();
 
     // RMSNorm K per head
-    float kv_val = kp[tid];
+    float kv_val = ld_dep_f32(kp + tid);
     float sq = warp_sum(kv_val * kv_val);
     if ((tid & 31) == 0) sm[tid >> 5] = sq;
     __syncthreads();
@@ -98,7 +122,7 @@ __global__ void dspark_store_ctx_kv_kernel(
     __syncthreads();
 
     __shared__ float kn[HEAD_DIM];
-    kn[tid] = kv_val * inv_rms * __bfloat162float(k_norm[tid]);
+    kn[tid] = kv_val * inv_rms * knw;
     __syncthreads();
 
     // NeoX RoPE: pair (i, i + 64) for i in 0..63
@@ -115,48 +139,56 @@ __global__ void dspark_store_ctx_kv_kernel(
 }
 
 // Initialize DSpark 8-row block: row 0 = embed_norm(anchor), rows 1..7 = mask_embed
-__global__ void dspark_init_block_kernel(
+__global__ void __launch_bounds__(576)
+dspark_init_block_kernel(
     const __nv_bfloat16* __restrict__ embed,
     const __nv_bfloat16* __restrict__ embed_norm,
     const __nv_bfloat16* __restrict__ mask_embed,
     const int32_t* __restrict__ d_anchor,
     float* __restrict__ block_x) { // [8, HIDDEN]
     int r = blockIdx.x; // 0..7
-    int tid = threadIdx.x; // 256
-    float* dst = block_x + (size_t)r * HIDDEN;
+    int tid = threadIdx.x; // 0..575
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int c4 = tid << 2;
+    float* dst = block_x + (size_t)r * HIDDEN + c4;
     if (r == 0) {
-        int tok = *d_anchor;
-        const __nv_bfloat16* row = embed + (size_t)tok * HIDDEN;
-        float sum_sq = 0.0f;
-        for (int d = tid; d < HIDDEN; d += 256) {
-            float v = __bfloat162float(row[d]);
-            sum_sq = fmaf(v, v, sum_sq);
-        }
-        sum_sq = warp_sum(sum_sq);
-        __shared__ float sm[8];
-        if ((tid & 31) == 0) sm[tid >> 5] = sum_sq;
-        __syncthreads();
+        uint2 nw4 = __ldg(reinterpret_cast<const uint2*>(embed_norm + c4));
+        const __nv_bfloat162* nb = reinterpret_cast<const __nv_bfloat162*>(&nw4);
+        float2 nf0 = __bfloat1622float2(nb[0]), nf1 = __bfloat1622float2(nb[1]);
+        pdl_wait_fenced(0u);
+        pdl_trigger();
+        int tok = ld_dep_i32(d_anchor);
+        uint2 ew4 = __ldg(reinterpret_cast<const uint2*>(embed + (size_t)tok * HIDDEN + c4));
+        const __nv_bfloat162* eb = reinterpret_cast<const __nv_bfloat162*>(&ew4);
+        float2 ef0 = __bfloat1622float2(eb[0]), ef1 = __bfloat1622float2(eb[1]);
+        float sum_sq = warp_sum(fmaf(ef0.x, ef0.x, fmaf(ef0.y, ef0.y, fmaf(ef1.x, ef1.x, ef1.y * ef1.y))));
+        __shared__ float sm[18];
         __shared__ float inv_rms;
-        if (tid == 0) {
-            float tot = 0.0f;
-            for (int i = 0; i < 8; ++i) tot += sm[i];
-            inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+        if (lane == 0) sm[warp] = sum_sq;
+        __syncthreads();
+        if (warp == 0) {
+            float tot = warp_sum((lane < 18) ? sm[lane] : 0.0f);
+            if (lane == 0) inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
         }
         __syncthreads();
         float s = inv_rms;
-        for (int d = tid; d < HIDDEN; d += 256) {
-            dst[d] = __bfloat162float(row[d]) * s * __bfloat162float(embed_norm[d]);
-        }
+        *reinterpret_cast<float4*>(dst) = make_float4(
+            ef0.x * s * nf0.x, ef0.y * s * nf0.y, ef1.x * s * nf1.x, ef1.y * s * nf1.y);
     } else {
-        for (int d = tid; d < HIDDEN; d += 256) {
-            dst[d] = __bfloat162float(mask_embed[d]);
-        }
+        uint2 mw4 = __ldg(reinterpret_cast<const uint2*>(mask_embed + c4));
+        const __nv_bfloat162* mb = reinterpret_cast<const __nv_bfloat162*>(&mw4);
+        float2 mf0 = __bfloat1622float2(mb[0]), mf1 = __bfloat1622float2(mb[1]);
+        pdl_wait_fenced(0u);
+        pdl_trigger();
+        *reinterpret_cast<float4*>(dst) = make_float4(mf0.x, mf0.y, mf1.x, mf1.y);
     }
 }
 
 // DSpark Q/K RMSNorm + NeoX RoPE on the 8-row block (positions p..p+7)
 // qkv layout: [8, 5120] (Q: 0..3071, K: 3072..4095, V: 4096..5119)
-__global__ void dspark_block_qk_rope_kernel(
+__global__ void __launch_bounds__(128)
+dspark_block_qk_rope_kernel(
     float* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm,
@@ -164,15 +196,17 @@ __global__ void dspark_block_qk_rope_kernel(
     int r = blockIdx.x; // 0..7
     int h = blockIdx.y; // 0..23: Q, 24..31: K
     int tid = threadIdx.x; // 0..127
-    int pos = (*d_pos) + r;
     constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
 
     float* vec = (h < 24)
         ? (qkv + (size_t)r * QKV_STRIDE + h * HEAD_DIM)
         : (qkv + (size_t)r * QKV_STRIDE + Q_DIM + (h - 24) * HEAD_DIM);
-    const __nv_bfloat16* nw = (h < 24) ? q_norm : k_norm;
+    float nw = __bfloat162float(__ldg(((h < 24) ? q_norm : k_norm) + tid));
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    int pos = (*d_pos) + r;
 
-    float val = vec[tid];
+    float val = ld_dep_f32(vec + tid);
     float sq = warp_sum(val * val);
     __shared__ float sm[4];
     if ((tid & 31) == 0) sm[tid >> 5] = sq;
@@ -182,7 +216,7 @@ __global__ void dspark_block_qk_rope_kernel(
     __syncthreads();
 
     __shared__ float vn[HEAD_DIM];
-    vn[tid] = val * inv_rms * __bfloat162float(nw[tid]);
+    vn[tid] = val * inv_rms * nw;
     __syncthreads();
 
     if (tid < 64) {
@@ -195,36 +229,47 @@ __global__ void dspark_block_qk_rope_kernel(
     }
 }
 
-// Fast RMSNorm producing __half directly for DSpark's NVFP4 linear_h layers!
-__global__ void dspark_rmsnorm_h_kernel(
+// Fast 576-thread vectorized float4 PDL RMSNorm producing __half directly for DSpark's linear_h layers!
+__global__ void __launch_bounds__(576)
+dspark_rmsnorm_h_kernel(
     const float* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     float* __restrict__ out_f,
     __half* __restrict__ out_h) {
     int r = blockIdx.x;
     int tid = threadIdx.x;
-    const float* xb = x + (size_t)r * HIDDEN;
-    float sq = 0.0f;
-    for (int d = tid; d < HIDDEN; d += 256) { float v = xb[d]; sq = fmaf(v, v, sq); }
-    sq = warp_sum(sq);
-    __shared__ float sm[8];
-    if ((tid & 31) == 0) sm[tid >> 5] = sq;
-    __syncthreads();
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int c4 = tid << 2;
+
+    uint2 nw4 = __ldg(reinterpret_cast<const uint2*>(w + c4));
+    const __nv_bfloat162* nb = reinterpret_cast<const __nv_bfloat162*>(&nw4);
+    float2 nf0 = __bfloat1622float2(nb[0]), nf1 = __bfloat1622float2(nb[1]);
+
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+
+    float4 xv = ld_dep_f4(x + (size_t)r * HIDDEN + c4);
+    float sq = warp_sum(fmaf(xv.x, xv.x, fmaf(xv.y, xv.y, fmaf(xv.z, xv.z, xv.w * xv.w))));
+    __shared__ float sm[18];
     __shared__ float inv_rms;
-    if (tid == 0) {
-        float tot = 0;
-        for (int i = 0; i < 8; ++i) tot += sm[i];
-        inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+    if (lane == 0) sm[warp] = sq;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = warp_sum((lane < 18) ? sm[lane] : 0.0f);
+        if (lane == 0) inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
     }
     __syncthreads();
+
     float ir = inv_rms;
-    float* of = out_f ? (out_f + (size_t)r * HIDDEN) : nullptr;
-    __half* oh = out_h + (size_t)r * HIDDEN;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        float v = xb[d] * ir * __bfloat162float(w[d]);
-        oh[d] = __float2half(v);
-        if (of) of[d] = v;
-    }
+    float4 ov = make_float4(xv.x * ir * nf0.x, xv.y * ir * nf0.y, xv.z * ir * nf1.x, xv.w * ir * nf1.y);
+    __half2 h0 = __floats2half2_rn(ov.x, ov.y);
+    __half2 h1 = __floats2half2_rn(ov.z, ov.w);
+    uint2 packed;
+    packed.x = *reinterpret_cast<uint32_t*>(&h0);
+    packed.y = *reinterpret_cast<uint32_t*>(&h1);
+    *reinterpret_cast<uint2*>(out_h + (size_t)r * HIDDEN + c4) = packed;
+    if (out_f) *reinterpret_cast<float4*>(out_f + (size_t)r * HIDDEN + c4) = ov;
 }
 
 // 256-CTA Blackwell Tensor Core (m16n8k16) Split-K FlashDecoding for DSpark Global Layer 1!
@@ -240,6 +285,8 @@ dspark_global_attn_bulk_splitk_kernel(
     int cap,
     const int32_t* __restrict__ d_pos,
     float* __restrict__ split_buf) {
+    pdl_wait();
+    pdl_trigger();
     int p = *d_pos;
     if (p <= 0) return;
 
@@ -278,6 +325,9 @@ dspark_block_attn_kernel(
     int lane = tid & 31;
     int kvh = h / GQA_RATIO;
     constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
+
+    pdl_wait();
+    pdl_trigger();
 
     int p = *d_pos;
     bool has_bulk = (window == 0 && split_buf != nullptr && p > 0);
@@ -383,13 +433,15 @@ dspark_block_attn_kernel(
 
 // Standard SwiGLU for DSpark MLP writing __half directly for w_down linear_h!
 __global__ void dspark_swiglu_kernel(const float* __restrict__ gu, float* __restrict__ out, __half* __restrict__ out_h, int B) {
+    pdl_wait();
+    pdl_trigger();
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = B * MTP_INTERMEDIATE;
     if (idx >= total) return;
     int b = idx / MTP_INTERMEDIATE;
     int j = idx % MTP_INTERMEDIATE;
-    float g = gu[(size_t)b * (2 * MTP_INTERMEDIATE) + j];
-    float u = gu[(size_t)b * (2 * MTP_INTERMEDIATE) + MTP_INTERMEDIATE + j];
+    float g = ld_dep_f32(gu + (size_t)b * (2 * MTP_INTERMEDIATE) + j);
+    float u = ld_dep_f32(gu + (size_t)b * (2 * MTP_INTERMEDIATE) + MTP_INTERMEDIATE + j);
     float v = (g * fast_sigmoid(g)) * u;
     if (out) out[idx] = v;
     if (out_h) out_h[idx] = __float2half(v);
@@ -544,7 +596,6 @@ dspark_base_logits_nvfp4_mma_kernel(
     const int c_base = warp * (4 * U) + t;
 
     pdl_wait_fenced(zero);
-    pdl_trigger();
 
     int total_x = K_CONST * HIDDEN;
     for (int i = tid; i < total_x; i += 192) {
@@ -646,6 +697,7 @@ dspark_base_logits_nvfp4_mma_kernel(
         }
         __syncthreads();
     }
+    pdl_trigger();
 }
 
 constexpr int MARKOV_BLOCKS_MAX = 512;
@@ -966,6 +1018,8 @@ __global__ void markov_fold_argmax_stage2_kernel(
 __global__ void copy_f_prev_zero_state_kernel(
     const float* __restrict__ f_ring, const int32_t* __restrict__ d_pos,
     float* __restrict__ out_f, float* __restrict__ state) {
+    pdl_wait();
+    pdl_trigger();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < HIDDEN) {
         int prev_p = (*d_pos) - 1;
@@ -1011,22 +1065,29 @@ void launch_dspark_commit(
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt,
     float* f_ring, float* scratch_mix, float* scratch_kv,
     int B, const int32_t* d_pos, cudaStream_t stream) {
-    dspark_mix_kernel<<<dim3(B, 4), 256, 0, stream>>>(
+    const bool use_half = (dw.layers[0].w_kv_ctx.kind != WeightKind::BF16) && (B <= 8);
+    __half* scratch_mix_h = use_half ? reinterpret_cast<__half*>(scratch_mix) : nullptr;
+    launch_pdl(dspark_mix_kernel, dim3(B, 4), 576, stream,
         taps, B, dw.fuse_alpha,
         dw.layers[0].dflare_norm, dw.layers[1].dflare_norm, dw.layers[2].dflare_norm,
-        dw.markov_dflare_norm, scratch_mix, f_ring, d_pos);
+        dw.markov_dflare_norm, use_half ? nullptr : scratch_mix, scratch_mix_h, f_ring, d_pos);
     for (int l = 0; l < MTP_LAYERS; ++l) {
-        const float* mix_l = scratch_mix + (size_t)l * B * HIDDEN;
-        launch_linear(dw.layers[l].w_kv_ctx, mix_l, scratch_kv, B, false, stream);
+        if (use_half) {
+            const __half* mix_lh = scratch_mix_h + (size_t)l * B * HIDDEN;
+            launch_linear_h(dw.layers[l].w_kv_ctx, mix_lh, scratch_kv, B, false, stream);
+        } else {
+            const float* mix_l = scratch_mix + (size_t)l * B * HIDDEN;
+            launch_linear(dw.layers[l].w_kv_ctx, mix_l, scratch_kv, B, false, stream);
+        }
         KVFormat lfmt = dw.layers[l].is_local ? KVFormat::BF16 : global_kv_fmt;
         if (lfmt == KVFormat::FP8) {
-            dspark_store_ctx_kv_kernel<1><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+            launch_pdl(dspark_store_ctx_kv_kernel<1>, dim3(B, NUM_KV_HEADS), HEAD_DIM, stream,
                 scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
         } else if (lfmt == KVFormat::Q4) {
-            dspark_store_ctx_kv_kernel<2><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+            launch_pdl(dspark_store_ctx_kv_kernel<2>, dim3(B, NUM_KV_HEADS), HEAD_DIM, stream,
                 scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
         } else {
-            dspark_store_ctx_kv_kernel<0><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+            launch_pdl(dspark_store_ctx_kv_kernel<0>, dim3(B, NUM_KV_HEADS), HEAD_DIM, stream,
                 scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
         }
     }
@@ -1070,35 +1131,35 @@ void launch_dspark_draft(
     bool use_half = (dw.layers[0].w_qkv.kind != WeightKind::BF16);
 
     // 1. Build 8-row block [anchor, mask x7]
-    dspark_init_block_kernel<<<MTP_BLOCK_SIZE, 256, 0, stream>>>(
+    launch_pdl(dspark_init_block_kernel, dim3(MTP_BLOCK_SIZE), 576, stream,
         mw.embed, mw.embed_norm, dw.mask_embed, d_anchor_token, block_x);
 
-    // 2. Run 3 dense DSpark layers over all 8 rows (ZERO inner-loop F32->F16 conversions!)
+    // 2. Run 3 dense DSpark layers over all 8 rows (100% PDL-chained!)
     for (int l = 0; l < MTP_LAYERS; ++l) {
         const DsparkLayerWeights& dl = dw.layers[l];
         if (use_half) {
-            dspark_rmsnorm_h_kernel<<<MTP_BLOCK_SIZE, 256, 0, stream>>>(block_x, dl.input_norm, nullptr, normed_h);
+            launch_pdl(dspark_rmsnorm_h_kernel, dim3(MTP_BLOCK_SIZE), 576, stream, block_x, dl.input_norm, nullptr, normed_h);
             launch_linear_h(dl.w_qkv, normed_h, qkv, MTP_BLOCK_SIZE, false, stream);
         } else {
             launch_rmsnorm(block_x, dl.input_norm, normed, MTP_BLOCK_SIZE, HIDDEN, HIDDEN, RMS_EPS, stream);
             launch_linear(dl.w_qkv, normed, qkv, MTP_BLOCK_SIZE, false, stream);
         }
-        dspark_block_qk_rope_kernel<<<dim3(MTP_BLOCK_SIZE, NUM_HEADS + NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+        launch_pdl(dspark_block_qk_rope_kernel, dim3(MTP_BLOCK_SIZE, NUM_HEADS + NUM_KV_HEADS), HEAD_DIM, stream,
             qkv, dl.q_norm, dl.k_norm, d_pos);
         if (!dl.is_local) {
             dim3 sgrid(NUM_KV_HEADS, KV_SPLIT_K);
             if (global_kv_fmt == KVFormat::FP8) {
-                dspark_global_attn_bulk_splitk_kernel<1><<<sgrid, 128, 0, stream>>>(
+                launch_pdl(dspark_global_attn_bulk_splitk_kernel<1>, sgrid, 128, stream,
                     qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos, split_buf);
             } else if (global_kv_fmt == KVFormat::Q4) {
-                dspark_global_attn_bulk_splitk_kernel<2><<<sgrid, 128, 0, stream>>>(
+                launch_pdl(dspark_global_attn_bulk_splitk_kernel<2>, sgrid, 128, stream,
                     qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos, split_buf);
             } else {
-                dspark_global_attn_bulk_splitk_kernel<0><<<sgrid, 128, 0, stream>>>(
+                launch_pdl(dspark_global_attn_bulk_splitk_kernel<0>, sgrid, 128, stream,
                     qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos, split_buf);
             }
         }
-        dspark_block_attn_kernel<<<dim3(NUM_HEADS, MTP_BLOCK_SIZE), 256, 0, stream>>>(
+        launch_pdl(dspark_block_attn_kernel, dim3(NUM_HEADS, MTP_BLOCK_SIZE), 256, stream,
             qkv, static_cast<const __nv_bfloat16*>(ctx_k[l]), static_cast<const __nv_bfloat16*>(ctx_v[l]),
             dl.is_local ? nullptr : split_buf, ctx_cap[l], dl.is_local ? SWA_WINDOW : 0, d_pos,
             use_half ? nullptr : attn_out, use_half ? attn_out_h : nullptr);
@@ -1106,25 +1167,25 @@ void launch_dspark_draft(
         else          launch_linear(dl.w_o, attn_out, block_x, MTP_BLOCK_SIZE, true, stream);
 
         if (use_half) {
-            dspark_rmsnorm_h_kernel<<<MTP_BLOCK_SIZE, 256, 0, stream>>>(block_x, dl.post_norm, nullptr, normed_h);
+            launch_pdl(dspark_rmsnorm_h_kernel, dim3(MTP_BLOCK_SIZE), 576, stream, block_x, dl.post_norm, nullptr, normed_h);
             launch_linear_h(dl.w_gu, normed_h, gu, MTP_BLOCK_SIZE, false, stream);
-            dspark_swiglu_kernel<<<(MTP_BLOCK_SIZE * MTP_INTERMEDIATE + 255) / 256, 256, 0, stream>>>(
+            launch_pdl(dspark_swiglu_kernel, dim3((MTP_BLOCK_SIZE * MTP_INTERMEDIATE + 255) / 256), 256, stream,
                 gu, nullptr, swiglu_h, MTP_BLOCK_SIZE);
             launch_linear_h(dl.w_down, swiglu_h, block_x, MTP_BLOCK_SIZE, true, stream);
         } else {
             launch_rmsnorm(block_x, dl.post_norm, normed, MTP_BLOCK_SIZE, HIDDEN, HIDDEN, RMS_EPS, stream);
             launch_linear(dl.w_gu, normed, gu, MTP_BLOCK_SIZE, false, stream);
-            dspark_swiglu_kernel<<<(MTP_BLOCK_SIZE * MTP_INTERMEDIATE + 255) / 256, 256, 0, stream>>>(
+            launch_pdl(dspark_swiglu_kernel, dim3((MTP_BLOCK_SIZE * MTP_INTERMEDIATE + 255) / 256), 256, stream,
                 gu, swiglu, nullptr, MTP_BLOCK_SIZE);
             launch_linear(dl.w_down, swiglu, block_x, MTP_BLOCK_SIZE, true, stream);
         }
     }
 
     // 3. Final norm on rows 1..num_drafts -> normed (F32 for rnn_w_h) + normed_h (F16 for unembed_draft!)
-    dspark_rmsnorm_h_kernel<<<num_drafts, 256, 0, stream>>>(block_x + HIDDEN, dw.norm_w, normed, normed_h);
+    launch_pdl(dspark_rmsnorm_h_kernel, dim3(num_drafts), 576, stream, block_x + HIDDEN, dw.norm_w, normed, normed_h);
 
     // 4. Precompute Markov inputs + zero RNN state in ONE kernel (no cudaMemsetAsync!)
-    copy_f_prev_zero_state_kernel<<<(HIDDEN + 255) / 256, 256, 0, stream>>>(f_ring, d_pos, f_prev, state);
+    launch_pdl(copy_f_prev_zero_state_kernel, dim3((HIDDEN + 255) / 256), 256, stream, f_ring, d_pos, f_prev, state);
     launch_bf16_linear(dw.rnn_w_f, f_prev, c_f, 1, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
     launch_bf16_linear(dw.rnn_w_h, normed, c_h, num_drafts, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
 

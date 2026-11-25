@@ -2,9 +2,9 @@
 
 **A single-binary, zero-Python TigerStyle Zig + Blackwell CUDA (`sm_120a`) inference engine and OpenAI-compatible HTTP/SSE server for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (26.4B looped MoE + native ViT vision) — engineered for 8 GB Blackwell GPUs (RTX 5060 Laptop / Desktop, `sm_120a`).**
 
-Forked from [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), `squid5060` v3.0 brings native NVFP4 Blackwell PTX inference, persistent CUDA Graphs, **Hybrid AVX2 FP32 CPU + GPU PCIe MoE miss execution**, **temperature-aware 4-way `{1, 2, 4, 8}` adaptive DSpark speculative decoding + Hybrid O(1) Prompt-Lookup**, **pre-warmed multi-domain expert cache**, **tail-aliased `B=1024` hybrid VRAM/PCIe Tensor Core prefill**, **FP8 local SWA + shared-loop Q4 global KV caches**, **auto idle-sleep (`7.5 GiB → 222 MiB` VRAM, 326 ms wake)**, **host-RAM multi-session conversation parking (~22 ms swap)**, **on-demand PNG/JPEG vision (`0.0 MiB` permanent VRAM)**, and **up to 256K context** into **< 7.5 GiB VRAM** — beating tuned `llama.cpp` (`UD-Q3_K_XL` + MoE-cache loop dedup) by **2.31× on single-stream decode (`85.8 tok/s` median, `96.8 tok/s` peak)** and **5.9×–9.4× on cold prefill**.
+Forked from [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), `squid5060` v3.1 combines upstream Blackwell **`sm_120a` native block-scaled Tensor Core prefill MoE** (`m16n8k64` NVFP4 with 128B PCIe cachelines & preloaded scales), **1-launch PDL Cluster Attention** (`CS=4` local / `CS=8` global on 26-SM RTX 5060), **128-CTA multi-block PDL stochastic sampling**, and **zero-overhead LoopCD-Hidden (`arXiv:2610.02185`)** with `squid5060`'s 8 GB architecture — **Hybrid AVX2 FP32 CPU + GPU PCIe MoE miss execution**, **temperature-aware 4-way `{1, 2, 4, 8}` adaptive DSpark speculative decoding**, **pre-warmed multi-domain expert cache**, **FP8 local SWA + shared-loop Q4 global KV caches**, **auto idle-sleep (`7.47 GiB → 0.22 GiB` VRAM, 326 ms wake)**, **host-RAM conversation parking (~22 ms swap)**, **on-demand PNG/JPEG vision (`0.0 MiB` permanent VRAM)**, and **up to 256K context** in **< 7.5 GiB VRAM** — hitting **`2,025 tok/s` prefill (`13.6×` `llama.cpp`)**, **`97.9 tok/s` decode at 24K context (`3.05×` `llama.cpp`)**, and **`105.4 tok/s` peak single-stream decode**.
 
-![squid5060 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp and v2.1](assets/benchmark-5060.png)
+![squid5060 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp and v3.0](assets/benchmark-5060.png)
 
 > **Upfront Attribution:** `squid5060` tracks [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090) (which builds on [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine), and [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill)). Training-free last-loop KV sharing was inspired by [2DSD (SqueezeAILab)](https://github.com/SqueezeAILab/2DSD). Full attributions live in [`NOTICE`](NOTICE).
 >
@@ -16,51 +16,56 @@ Forked from [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), `
 
 Measured strictly single-stream (`c=1`, sequential — zero multi-user batching) on an **NVIDIA GeForce RTX 5060 Laptop GPU** (`sm_120a`, 26 SMs, 32 MiB L2, 7.8 GiB usable VRAM, PCIe Gen5 x8) + **Intel Core Ultra 7 255H** (16 cores, DDR5) using the exact same OpenAI-SSE `bench.py` harness (6 diverse prompts × 512 decode, cold 3.3K & 12.9K random-filler prefill, long-context Needle-in-a-Haystack retrieval, continuous `nvidia-smi` peak VRAM probe):
 
-| Metric (`c=1`, RTX 5060 Laptop 8 GB) | `llama.cpp` `ink-dedup` (`UD-Q3_K_XL`, `T=0.6`) | `squid5060` v2.1 (GPU-only) | **`squid5060` v3.0 (`T=0.6` exact match)** | **`squid5060` v3.0 (`T=0.0` greedy)** | **v3.0 Gain vs. `llama.cpp`** |
+| Metric (`c=1`, RTX 5060 Laptop 8 GB) | `llama.cpp` `ink-dedup` (`UD-Q3_K_XL`, `T=0.6`) | `squid5060` v3.0 | **`squid5060` v3.1 (`T=0.6` / `T=1.0`)** | **`squid5060` v3.1 (`T=0.0` greedy)** | **v3.1 Gain vs. `llama.cpp`** |
 |---|---:|---:|---:|---:|---:|
-| **6-prompt `c=1` decode median** | `37.2 tok/s` | `58.6 tok/s` | **`85.8 tok/s`** *(up to `91.3`)* | **`83.1 tok/s`** *(peak **`96.8`**)* | **2.31× faster (+131%)** |
-| **Long-ctx Needle decode (23.9K)** | `32.1 tok/s` | `68.4 / 71.1 tok/s` | **`70.4 tok/s`** *(battery)* | **`80.9 tok/s`** *(battery)* | **2.52× faster** |
-| **Cold prefill (3.3K random filler)** | `174 tok/s` | `1,031 tok/s` | **`981 tok/s`** | **`1,031 tok/s`** | **5.64× – 5.92× faster** |
-| **Cold prefill (12.9K random filler)** | `168 tok/s` | `1,319 tok/s` | **`1,319 tok/s`** | **`1,315 tok/s`** | **7.86× faster** |
-| **Long-ctx Needle prefill** | `149 tok/s` *(204s)* | `1,398 tok/s` *(17.1s)* | **`1,398 tok/s`** *(17.1s)* | **`1,392 tok/s`** *(17.2s)* | **9.37× faster** |
+| **Long-ctx Needle decode (23.9K)** | `32.1 tok/s` | `80.9 tok/s` | **`97.9 tok/s`** | **`97.9 tok/s`** | **3.05× faster (+205%)** |
+| **Peak single-prompt decode (`c=1`)** | `37.9 tok/s` | `96.8 tok/s` | **`105.4 tok/s`** *(warm CLI `116.7`)* | **`93.8 tok/s`** *(warm CLI `115.7`)* | **2.78× faster (+178%)** |
+| **6-prompt `c=1` decode median** | `37.2 tok/s` | `85.8 tok/s` | **`80.0 / 80.9 tok/s`** *(unbiased stoch.)* | **`82.4 tok/s`** | **2.15× – 2.22× faster** |
+| **Short-prompt TTFT** | — | `245.3 ms` | **`229.5 ms`** | **`271.5 ms`** | **1.07× faster vs v3.0** |
+| **Cold prefill (3.3K random filler)** | `174 tok/s` | `1,031 tok/s` | **`1,143 / 1,182 tok/s`** | **`1,167 tok/s`** | **6.57× – 6.79× faster** |
+| **Cold prefill (12.9K random filler)** | `168 tok/s` | `1,319 tok/s` | **`1,792 / 1,777 tok/s`** | **`1,793 tok/s`** | **10.7× faster** |
+| **Long-ctx Needle prefill (23.9K)** | `149 tok/s` *(204s)* | `1,398 tok/s` *(17.1s)* | **`2,025 tok/s`** *(**11.8s**)* | **`2,025 tok/s`** *(**11.8s**)* | **13.6× faster** |
 | **Needle-in-a-Haystack accuracy** | `3/3` | `3/3` PASS | **`3/3` PASS** | **`3/3` PASS** | **100% exact** |
-| **Peak VRAM / Idle-Sleep VRAM** | `7.35 GiB` / — | `7.47 GiB` / — | **`7.47 GiB` / `0.22 GiB`** *(326 ms wake)* | **`7.47 GiB` / `0.22 GiB`** | **7.25 GiB freed idle** |
-| **Multi-chat swap (4 parked slots)** | — | cold re-prefill | **`22–27 ms`** *(1.8K–2.3K tok)* | **`22–27 ms`** | **Zero re-prefill** |
-| **On-demand Vision (PNG/JPEG)** | — | — | **`158 ms`** *(128 tok, `+0.0 MiB` VRAM)* | **`158 ms`** | **0 MiB permanent VRAM** |
+| **Peak VRAM / Idle-Sleep VRAM** | `7.35 GiB` / — | `7.47 GiB` / `0.22 GiB` | **`7.47 GiB` / `0.22 GiB`** *(329 ms wake)* | **`7.47 GiB` / `0.22 GiB`** | **7.25 GiB freed idle** |
+| **Multi-chat swap (4 parked slots)** | — | `22–27 ms` | **`11–28 ms`** *(host-RAM LRU)* | **`11–28 ms`** | **Zero re-prefill** |
+| **On-demand Vision (PNG/JPEG)** | — | `158 ms` (`+0.0 MiB`) | **`+0.0 MiB` VRAM** *(23-layer BF16 ViT)* | **`+0.0 MiB` VRAM** | **0 MiB permanent VRAM** |
 | **256K context (`--ctx 262144 --kv q4`)** | — | `1,192` experts | **`1,192` experts (`7.25 GiB` VRAM)** | — | **Fits 256K in 8 GB** |
 
-- **Quality verified:** Exact FP64 KLD on `--raw` `tools/kld_corpus.txt` (3,026 tokens):
-  - **Hybrid AVX2 FP32 CPU+GPU MoE (`--cpu-moe on` vs `--cpu-moe off`):** **`mean_KLD = 0.004581`, `med = 0.000146`, `top1 = 98.81%`, `ref_PPL = 2.1770`, `cand_PPL = 2.1760` (`dPPL = -0.0011` — slightly *lower* perplexity from exact FP32 CPU accumulation!)**.
-  - **FP8 local SWA + Q4 global KV vs. BF16 local KV:** `mean_KLD = 0.009121`, `top1 = 97.20%`, `dPPL = -0.0298`.
-  - **Training-free Last-Loop KV Sharing (`W=1,024` native tail window on Layers 11 & 17):** **`mean_KLD = 0.006537`, `med = 0.000000`, `top1 = 98.65%`, `dPPL = -0.0105`**, plus `3/3` verbatim 23.9K needle retrieval.
-- **Stochastic sampling (`--temp 1.0 --top-p 0.95`):** Uses exact Leviathan/Chen rejection sampling with residual resampling inside the CUDA Graph (zero-overhead GPU sampling matching Inkling-2-Mini's official `generation_config.json`).
+- **Quality verified:** Exact FP64 KLD on `--raw` `tools/kld_corpus.txt`:
+  - **Self-determinism (`--kv bf16`, `--cpu-moe off`):** **`mean_KLD = 0.000000`, `max = 0.000000`, `top1 = 100.00%`**.
+  - **v3.1 Q4 global + FP8 local SWA + shared-loop KV (`CS=4/8` PDL Cluster Attention) vs. BF16 KV:** **`mean_KLD = 0.007732`, `med = 0.001956`, `top1 = 97.88%`** (and **`mean_KLD = 0.008548`, `top1 = 97.62%`** with Hybrid AVX2 FP32 CPU+GPU MoE enabled), plus `3/3` verbatim 23.9K needle retrieval.
+  - **Hybrid AVX2 FP32 CPU+GPU MoE (`--cpu-moe on` vs `--cpu-moe off` on 3,026 tokens):** **`mean_KLD = 0.004581`, `med = 0.000146`, `top1 = 98.81%`, `dPPL = -0.0011`**.
+- **Stochastic sampling (`--temp 1.0 --top-p 0.95`):** Uses 128-CTA multi-block PDL GPU sampling with exact Leviathan/Chen rejection sampling + residual resampling inside the CUDA Graph, and automatically disables Prompt-Lookup for stochastic sampling (`T > 0, top_k != 1`) to prevent rejection-sampling cliffs.
 
 ---
 
-## Architecture: How `squid5060` v3.0 Hits 85.8 tok/s + Vision + Idle-Sleep in 8 GB VRAM
+## Architecture: How `squid5060` v3.1 Hits 2,025 tok/s Prefill + 98 tok/s @ 24K in 8 GB VRAM
 
 Full `Inkling-2-Mini` weights are ~14.54 GiB in NVFP4 — nearly double an 8 GB GPU's VRAM. On any GPU with `< 15 GiB` VRAM, `squid5060` automatically enables its **8 GB Unified Expert Cache** profile (`--mode nvfp4 --kv q4 --ctx 32768 --mtp 7 --spec-threshold 0.90 --embed-host --cpu-moe auto`) while keeping full-VRAM mode and dynamic SM-aware grids for larger Blackwell GPUs (`>= 15 GiB`):
 
-1. **Hybrid AVX2+FMA+F16C CPU + GPU PCIe MoE Miss Execution (`+46%` Decode Speedup):**
+1. **1-Launch PDL Blackwell Cluster Attention + 128-CTA Multi-Block PDL Sampling (`+42.8%` Long-Context Decode):**
+   - Replaces the legacy multi-kernel decode attention + merge pipeline with a single `attn_cluster_decode_kernel` using Blackwell thread-block clusters, DSMEM barriers, and Programmatic Dependent Launch (PDL) overlap across QKV projection, attention, residual norms, and DSpark drafting.
+   - Hardware-aware cluster sizing (`CS=4` for `window=512` local SWA and `CS=8` for global attention on 26-SM RTX 5060; `CS=16` global on ≥64-SM GPUs) with full BF16/FP8/Q4 KV and shared-loop global KV support — pushing 24K-context decode from **68.5 → 97.9 tok/s** (`+42.8%`).
+   - Multi-block 128-CTA PDL LM-head stochastic sampler (`g_lm_samp`) + 576-thread zero-SMEM `float4` PDL DSpark & residual kernels.
+2. **Native `sm_120a` Block-Scaled Tensor Core Prefill MoE + Fused 2D-Parallel Prefill (`2,025 tok/s`, `+38.6%`):**
+   - `p_wgemm_blkscale_kernel<..., CACHED=true>` executes Blackwell native `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` (and MXFP8 `m16n8k32`) directly with L2-resident FP32 `atomicAdd` on Down projection, `BK=256` full 128-byte coalesced PCIe cachelines, and once-per-CTA contiguous `uint4` weight-scale preloading (`-55%` MoE prefill latency on PCIe misses).
+   - Paired with 2D-parallel fused SConv/KV store (`p_local_sconv_prep_store_kernel` / `p_global_attn_prep_store_kernel`), 7-launch batched DSpark commit, reverse-causal `exp2f` FlashAttention prefill, and `min_batch=64` on 8 GB GPUs (keeping short prompts `<64` tok on the `B=8` hybrid AVX2+GPU decode graphs with zero 90-slot tail eviction).
+3. **Hybrid AVX2+FMA+F16C CPU + GPU PCIe MoE Miss Execution (`+46%` Decode Speedup):**
    - On 8 GB GPUs, ~52% of Inkling-2-Mini's 3,072 NVFP4 experts live in pinned host RAM. Previously every cache miss serialized over the ~24 GB/s PCIe link.
-   - `squid5060` v3.0 adds a persistent POSIX-pthread AVX2+FMA+F16C worker pool (`cuda/cpu_moe.cpp`) coordinated via a CUDA-Graph-safe mapped-memory doorbell (`moe_cpu_dispatch_kernel` / `moe_cpu_merge_kernel`). During decode (`B <= 8`), half of RAM misses (`split=1/2`) execute **simultaneously on CPU cores directly out of DDR5 RAM in exact FP32** (~35 GB/s, `0.129 ms/expert`, 0% CPU when idle via wake/nap CV) while the GPU runs VRAM hits + the other half over PCIe — pushing 6-prompt median decode from **58.6 → 85.8 tok/s** (`+46.4%`, **96.8 tok/s peak**).
-2. **Unified 3,072-Expert VRAM Cache + Built-in Hot-Expert Profile (`~6.1–6.5 GiB`, 1,471–1,529 physical slots at 32K):**
+   - `squid5060` adds a persistent POSIX-pthread AVX2+FMA+F16C worker pool (`cuda/cpu_moe.cpp`) coordinated via a CUDA-Graph-safe mapped-memory doorbell (`moe_cpu_dispatch_kernel` / `moe_cpu_merge_kernel`). During decode (`B <= 8`), half of RAM misses (`split=1/2`) execute **simultaneously on CPU cores directly out of DDR5 RAM in exact FP32** (~35 GB/s, `0.129 ms/expert`, 0% CPU when idle via wake/nap CV) while the GPU runs VRAM hits + the other half over PCIe.
+4. **Unified 3,072-Expert VRAM Cache + Built-in Hot-Expert Profile (`~6.1–6.5 GiB`, 1,471–1,529 physical slots at 32K):**
    - All 24 physical layers' 3,072 experts (L0–19 native NVFP4 + L20–23 converted from MXFP8 → NVFP4 on load in 32-expert GPU chunks) are packed into a uniform `4,478,976 B` (`4.27 MiB`), 256-byte-aligned slot (`w13_data`, `w13_scales`, `w2_data`, `w2_scales`).
    - **Pre-warmed multi-domain profile + fixed LRFU warm-prior (`prior_max = 4.0`):** Even on a fresh install with no `.squid5060-warm-cache.bin` snapshot yet, `squid5060` bulk-DMAs its built-in blended hot-expert profile (`src/hot_experts.zig`) in ~270 ms at startup so Prompt #1 starts warm; subsequent runs refine and persist the snapshot.
    - **Zero-race async overlapped promotion:** Dedicated `copy_stream` overlaps H2D promotions with the next forward pass using 8 staging slots and 1-token victim quarantine while keeping persistent `cudaGraphExec_t` graphs completely intact.
-3. **Power-Law Temperature-Aware 4-Way `{1, 2, 4, 8}` Adaptive Switch + Hybrid O(1) Prompt-Lookup:**
+5. **Power-Law Temperature-Aware 4-Way `{1, 2, 4, 8}` Adaptive Switch + Zero-Overhead LoopCD-Hidden:**
    - Inside CUDA 13's `cudaGraphCondTypeSwitch`, `z_adaptive_select_width_kernel` calibrates DSpark draft probabilities via `p_k = conf_k^gamma` (scaling `gamma` with `temperature` and `--spec-threshold`) and maximizes `E[accepted(w)] / cost(w)` over `{1, 2, 4, 8}` with 8 GB PCIe-calibrated step costs `{1.00, 1.30, 2.45, 4.50}` — dropping cleanly to `B=1` on uncertain steps while scaling to `B=4/8` on code and verbatim spans.
-4. **Auto Idle-Sleep (`--idle-sleep <sec>` + `GET/POST /v1/vram`):**
-   - After `<sec>` seconds without inference traffic (or manually via `POST /v1/vram {"action":"sleep"}`), `squid5060` parks the live conversation to host RAM, destroys CUDA graphs, frees the weight/runtime/expert-cache VRAM arenas (**`7.47 GiB → 0.22 GiB`**, freeing ~7.25 GiB for games/other apps), and naps CPU workers.
-   - `GET /health` and `GET /v1/vram` inspect status without waking. The next chat/completion request (or `POST /v1/vram {"action":"wake"}`) re-allocates VRAM and H2D-restores dense weights + ~1,463 hottest experts from host RAM in **`~326 ms`** and restores the parked chat in **`~22 ms`**.
-5. **Host-RAM Conversation Parking (`--slot-keep N`, default `4`):**
-   - Keeps up to `N` (max 8) full conversations in LRU host-RAM slots (tokens, local SWA KV + sconv rings at both `decode_end` and `prefill_end`, plus global KV & DSpark KV) at **0.0 MiB extra VRAM**. Switching between multiple long coding/chat sessions restores in **~22–27 ms** instead of re-prefilling, and survives VRAM sleep/wake cycles.
-6. **On-Demand Vision / Image Input (`0.0 MiB` Permanent VRAM):**
-   - Runs Inkling-2-Mini's built-in **23-layer BF16 ViT + `2×2` merge projector** (`cuda/vision.cu`, `src/vision.zig`) on demand for OpenAI `content: [{"type":"image_url","image_url":{"url":"data:image/...;base64,..."}}]` requests and CLI `--image <path>`.
-   - Lazily mmaps the 422 BF16 `model.visual.*` tensors from `model-00001-of-00001.safetensors`, borrows the existing prefill tail scratch + shared cuBLAS handle, executes 23 layers with 0-indexed interleaved axial 2D RoPE + FlashAttention (~158 ms for 128 visual tokens), and immediately returns all borrowed VRAM slots (`+0.0 MiB` permanent VRAM delta). Supports PNG (`libpng16`, RGBA checkerboard compositing) and JPEG (`libjpeg`) with automatic bicubic downscale to ≤1,024 visual tokens.
-7. **Hybrid VRAM/PCIe `B=1024` Tensor Core Prefill + FP8 Local / Shared-Loop Q4 Global KV (256K Context in 8 GB):**
-   - `p_wgemm_kernel<..., CACHED=true>` keeps `cp.async` for VRAM hits and uses coalesced `uint4` loads for PCIe misses (**19× speedup**, `981–1,398 tok/s` cold prefill) while borrowing `375.9 MiB` prefill scratch from evictable cache tail slots (`0.0 MiB` permanent decode overhead).
-   - FP8 local SWA KV + training-free Last-Loop Shared Global KV (1,024-token native tail rings on Loops 1 & 2, shared bulk on Loop 3) cuts global KV banks `8 → 4`, fitting **256K context** with 1,192 cached experts inside 8 GB VRAM.
+   - **LoopCD-Hidden (`arXiv:2610.02185`):** Optional per-request or CLI `--loopcd-omega <f>` / `--loopcd-ref 1|2` hidden-state contrastive decoding (`h' = (1 + ω)·h_3 - ω·h_ref`) at `0.0 MiB` decode VRAM via tail-aliased scratch, properly keyed in both `PrefixCache` and `ParkedSlot` with zero CUDA graph rebuilds.
+6. **Auto Idle-Sleep (`--idle-sleep <sec>` + `GET/POST /v1/vram`) & Host-RAM Conversation Parking (`--slot-keep N`):**
+   - After `<sec>` seconds without inference traffic (or manually via `POST /v1/vram {"action":"sleep"}`), `squid5060` parks the live conversation to host RAM, destroys CUDA graphs, frees the weight/runtime/expert-cache VRAM arenas (**`7.47 GiB → 0.22 GiB`**, freeing ~7.25 GiB for games/other apps), and naps CPU workers; wakes in **`~326–329 ms`**.
+   - Keeps up to `N` (default `4`, max `8`) full conversations in LRU host-RAM slots at **0.0 MiB extra VRAM**, swapping in **~11–28 ms** across multi-chat switches and VRAM sleep/wake cycles, with unbounded multi-turn tool-call history (`O(1)` `ToolCallIdMap`).
+7. **On-Demand Vision (`0.0 MiB` Permanent VRAM) & 256K Context (`FP8` Local / Shared-Loop `Q4` Global KV):**
+   - Lazily runs Inkling-2-Mini's **23-layer BF16 ViT + `2×2` merge projector** (`cuda/vision.cu`, `src/vision.zig`) for OpenAI base64 `image_url` PNG/JPEG requests and CLI `--image <path>` by borrowing the prefill tail scratch + shared cuBLAS handle, returning all borrowed slots immediately (`+0.0 MiB` permanent VRAM).
+   - FP8 local SWA KV + training-free Last-Loop Shared Global KV (1,024-token native tail rings on Loops 1 & 2, shared bulk on Loop 3) cuts global KV banks `8 → 4`, fitting **256K context** with 1,192 cached experts inside `7.25 GiB` VRAM.
 
 ---
 
@@ -128,7 +133,8 @@ curl -X POST http://127.0.0.1:8000/v1/vram -H 'Content-Type: application/json' -
 | `--idle-sleep` | `0` (disabled) | Seconds of inactivity before releasing ~7.25 GiB VRAM (`7.47 → 0.22 GiB`); auto-wakes in ~326 ms on next request |
 | `--slot-keep` | `4` (max `8`) | LRU host-RAM parked conversations preserved across session switches and VRAM sleep/wake (`0` disables) |
 | `--image` | none (`generate` only) | Path to a PNG or JPEG image to encode on-demand (`0 MiB` permanent VRAM); in `serve`, use OpenAI `image_url` base64 data URIs |
-| `--temp` / `--top-p` / `--top-k` | `1.0` / `0.95` / `0` | GPU sampling & exact Leviathan/Chen rejection sampling defaults (overridable per-request) |
+| `--temp` / `--top-p` / `--top-k` | `1.0` / `0.95` / `0` | 128-CTA PDL GPU sampling & exact Leviathan/Chen rejection sampling defaults (overridable per-request) |
+| `--loopcd-omega` / `--loopcd-ref` | `0.0` / `1` | Zero-overhead LoopCD-Hidden (`arXiv:2610.02185`) contrastive strength & reference loop pass `1\|2` (also per-request JSON `loopcd_omega` / `loopcd_ref`) |
 | `--api-key` / `--api-key-file` | `$SQUID_API_KEY` | Optional `Authorization: Bearer <key>` constant-time auth (rejects empty/oversized key files) |
 | `--cache-mib` / `--cache-headroom-mib` | auto / `160` | Override VRAM expert cache size or reserved desktop headroom |
 | `--cache-file` / `--no-warm-cache` | `<model_dir>/.squid5060-warm-cache.bin` | Warm-cache LRFU snapshot path (falls back to built-in multi-domain profile) or disable |

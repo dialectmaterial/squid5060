@@ -110,6 +110,13 @@ struct SampleConfig {
     uint64_t seed;
 };
 
+// LoopCD-Hidden (arXiv:2610.02185 Eq. 2): h' = h_R + omega * (h_R - h_ref) before Coda layers.
+// Lives in device memory so CUDA Graphs never rebuild when omega or ref_pass changes per request.
+struct LoopCDConfig {
+    float omega;      // 0.0 = disabled (bit-exact identity); > 0 = contrastive extrapolation
+    int32_t ref_pass; // 1 = h_1 (after pass 0, vi=17), 2 = h_2 (after pass 1, vi=29)
+};
+
 constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
 constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf

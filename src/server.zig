@@ -41,6 +41,8 @@ pub const ServerConfig = struct {
     default_temperature: f32 = 1.0,
     default_top_p: f32 = 0.95,
     default_top_k: i32 = 0,
+    default_loopcd_omega: f32 = 0.0,
+    default_loopcd_ref: i32 = 1,
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
@@ -83,6 +85,84 @@ const ToolCallRecord = struct {
     args_len: usize = 0,
 };
 
+const ToolCallIdEntry = struct {
+    gen: u32 = 0,
+    hash: u64 = 0,
+    id_raw: []const u8 = "",
+    name_raw: []const u8 = "",
+};
+
+const ToolCallIdMap = struct {
+    const cap: usize = 16384;
+    const mask: usize = cap - 1;
+    entries: []ToolCallIdEntry,
+    gen: u32 = 1,
+
+    fn init() ToolCallIdMap {
+        return .{ .entries = tiger.alloc_host_zeroed(ToolCallIdEntry, cap), .gen = 1 };
+    }
+
+    fn deinit(self: *ToolCallIdMap) void {
+        tiger.free_host_slice(ToolCallIdEntry, self.entries);
+    }
+
+    fn clear(self: *ToolCallIdMap) void {
+        self.gen +%= 1;
+        if (self.gen == 0) {
+            for (self.entries) |*e| e.gen = 0;
+            self.gen = 1;
+        }
+    }
+
+    fn insert(self: *ToolCallIdMap, id_unescaped: []const u8, id_raw: []const u8, name_raw: []const u8) void {
+        if (id_unescaped.len == 0 or name_raw.len == 0) return;
+        const h = tiger.hash_bytes_u64(id_unescaped);
+        var slot: usize = @intCast(h & mask);
+        var probe: usize = 0;
+        var tmp_buf: [128]u8 = undefined;
+        while (probe < 64) : (probe += 1) {
+            const e = &self.entries[slot];
+            if (e.gen != self.gen) {
+                e.* = .{ .gen = self.gen, .hash = h, .id_raw = id_raw, .name_raw = name_raw };
+                return;
+            }
+            if (e.hash == h) {
+                var p: usize = 0;
+                if (tokenizer_mod.parse_json_string(e.id_raw, &p, &tmp_buf)) |existing_id| {
+                    if (std.mem.eql(u8, existing_id, id_unescaped)) {
+                        e.name_raw = name_raw;
+                        return;
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    fn lookup(self: *const ToolCallIdMap, target_id: []const u8, out_buf: []u8) ?[]const u8 {
+        if (target_id.len == 0) return null;
+        const h = tiger.hash_bytes_u64(target_id);
+        var slot: usize = @intCast(h & mask);
+        var probe: usize = 0;
+        var tmp_buf: [128]u8 = undefined;
+        while (probe < 64) : (probe += 1) {
+            const e = self.entries[slot];
+            if (e.gen != self.gen) return null;
+            if (e.hash == h) {
+                var p: usize = 0;
+                if (tokenizer_mod.parse_json_string(e.id_raw, &p, &tmp_buf)) |existing_id| {
+                    if (std.mem.eql(u8, existing_id, target_id)) {
+                        var np: usize = 0;
+                        return tokenizer_mod.parse_json_string(e.name_raw, &np, out_buf);
+                    }
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        return null;
+    }
+};
+
 /// Static preallocated host workspace owned by the server for its entire lifetime.
 const ServerBuffers = struct {
     request_buf: []u8,
@@ -95,6 +175,7 @@ const ServerBuffers = struct {
     scratch_str_buf: []u8,
     sse_buf: []u8,
     prompt_tokens: []i32,
+    tool_id_map: ToolCallIdMap,
     tok_scratch: tokenizer_mod.TokenizerScratch,
     image_decode_buf: []u8 = &.{},
     image_embeds_buf: []f32 = &.{},
@@ -111,6 +192,7 @@ const ServerBuffers = struct {
             .scratch_str_buf = tiger.alloc_host_zeroed(u8, scratch_string_bytes),
             .sse_buf = tiger.alloc_host_zeroed(u8, sse_frame_bytes),
             .prompt_tokens = tiger.alloc_host_zeroed(i32, prompt_tokens_max),
+            .tool_id_map = ToolCallIdMap.init(),
             .tok_scratch = tokenizer_mod.TokenizerScratch.init(),
         };
     }
@@ -136,6 +218,7 @@ const ServerBuffers = struct {
         tiger.free_host_slice(u8, self.scratch_str_buf);
         tiger.free_host_slice(u8, self.sse_buf);
         tiger.free_host_slice(i32, self.prompt_tokens);
+        self.tool_id_map.deinit();
         if (self.image_decode_buf.len > 0) tiger.free_host_slice(u8, self.image_decode_buf);
         if (self.image_embeds_buf.len > 0) tiger.free_host_slice(f32, self.image_embeds_buf);
         self.tok_scratch.deinit();
@@ -689,6 +772,8 @@ fn handle_chat_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -699,7 +784,7 @@ fn handle_chat_completions(
     var key_buf: [128]u8 = undefined;
 
     var field_iter: u32 = 0;
-    while (pos < body.len and field_iter < 64) : (field_iter += 1) {
+    while (pos < body.len and field_iter < 256) : (field_iter += 1) {
         tokenizer_mod.skip_ws(body, &pos);
         if (pos < body.len and body[pos] == '}') break;
         const k = tokenizer_mod.parse_json_string(body, &pos, &key_buf) orelse {
@@ -766,6 +851,10 @@ fn handle_chat_completions(
             include_usage = extract_bool_field(body[start..pos], "include_usage");
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -783,6 +872,8 @@ fn handle_chat_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     // Encode Inkling-2-Mini chat template directly into prompt_tokens:
@@ -833,6 +924,8 @@ fn handle_chat_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
     if (engine.sleeping) engine.wake_vram();
     last_activity_ns.* = tiger.clock_monotonic_ns();
@@ -1074,6 +1167,8 @@ fn handle_text_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -1085,7 +1180,7 @@ fn handle_text_completions(
     var key_buf: [128]u8 = undefined;
 
     var field_iter: u32 = 0;
-    while (pos < body.len and field_iter < 64) : (field_iter += 1) {
+    while (pos < body.len and field_iter < 256) : (field_iter += 1) {
         tokenizer_mod.skip_ws(body, &pos);
         if (pos < body.len and body[pos] == '}') break;
         const k = tokenizer_mod.parse_json_string(body, &pos, &key_buf) orelse break;
@@ -1121,6 +1216,10 @@ fn handle_text_completions(
             echo = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -1138,6 +1237,8 @@ fn handle_text_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     const prompt_len = tokenizer.encode_into(prompt, true, &buffers.tok_scratch, buffers.prompt_tokens);
@@ -1163,6 +1264,8 @@ fn handle_text_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
     if (engine.sleeping) engine.wake_vram();
     last_activity_ns.* = tiger.clock_monotonic_ns();
@@ -1443,6 +1546,7 @@ fn encode_chat_template_zero_alloc(
     var images: [vision_mod.max_images_per_req]vision_mod.ImageSpan = @splat(.{});
     var image_count: usize = 0;
     const scratch = buffers.scratch_str_buf;
+    buffers.tool_id_map.clear();
 
     if (json_array_has_items(tools_json)) {
         append_encoded_segment(tokenizer, "<|message_system|>tool_declare<|content_xml|>", true, buffers, &out_len, &overflow);
@@ -1451,7 +1555,7 @@ fn encode_chat_template_zero_alloc(
         var tp: usize = 1;
         var t_iter: u32 = 0;
         var emitted_tools: u32 = 0;
-        while (tp < tools_json.len and t_iter < 256 and ok) : (t_iter += 1) {
+        while (tp < tools_json.len and t_iter < 1024 and ok) : (t_iter += 1) {
             tokenizer_mod.skip_ws(tools_json, &tp);
             if (tp >= tools_json.len or tools_json[tp] == ']') break;
             const t_start = tp;
@@ -1495,7 +1599,7 @@ fn encode_chat_template_zero_alloc(
     var effort_render: [128]u8 = undefined;
     var pos: usize = 1; // skip '['
     var msg_iter: u32 = 0;
-    while (pos < messages_json.len and msg_iter < 1024 and !overflow) : (msg_iter += 1) {
+    while (pos < messages_json.len and msg_iter < 65536 and !overflow) : (msg_iter += 1) {
         tokenizer_mod.skip_ws(messages_json, &pos);
         if (pos >= messages_json.len or messages_json[pos] == ']') break;
         if (messages_json[pos] != '{') {
@@ -1535,7 +1639,7 @@ fn encode_chat_template_zero_alloc(
         if (std.mem.eql(u8, role, "tool") and (resolved_name == null or resolved_name.?.len == 0)) {
             var tcid_buf: [128]u8 = undefined;
             if (extract_string_field(msg_obj, "tool_call_id", &tcid_buf)) |tcid| {
-                resolved_name = resolve_tool_name_by_id(messages_json[0..obj_start], tcid, &name_buf);
+                resolved_name = buffers.tool_id_map.lookup(tcid, &name_buf);
             }
         }
         const is_assistant: bool = std.mem.eql(u8, role, "assistant");
@@ -1576,7 +1680,7 @@ fn encode_chat_template_zero_alloc(
             } else if (c_raw.len > 0 and c_raw[0] == '[') {
                 var ap: usize = 1;
                 var part_iter: u32 = 0;
-                while (ap < c_raw.len and part_iter < 64 and !overflow) : (part_iter += 1) {
+                while (ap < c_raw.len and part_iter < 1024 and !overflow) : (part_iter += 1) {
                     tokenizer_mod.skip_ws(c_raw, &ap);
                     if (ap >= c_raw.len or c_raw[ap] == ']') break;
                     if (c_raw[ap] == '"') {
@@ -1668,7 +1772,7 @@ fn encode_chat_template_zero_alloc(
             const tc_arr = tc_raw_opt.?;
             var tcp: usize = 1;
             var tc_iter: u32 = 0;
-            while (tcp < tc_arr.len and tc_iter < 32 and !overflow) : (tc_iter += 1) {
+            while (tcp < tc_arr.len and tc_iter < 256 and !overflow) : (tc_iter += 1) {
                 tokenizer_mod.skip_ws(tc_arr, &tcp);
                 if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
                 const tc_start = tcp;
@@ -1676,37 +1780,47 @@ fn encode_chat_template_zero_alloc(
                 const tc_obj = tc_arr[tc_start..tcp];
                 if (extract_raw_field(tc_obj, "function")) |fn_obj| {
                     var fname_buf: [256]u8 = undefined;
-                    if (extract_string_field(fn_obj, "name", &fname_buf)) |fname| {
-                        emitted_assistant_block = true;
-                        append_encoded_segment(tokenizer, "<|message_model|>", true, buffers, &out_len, &overflow);
-                        append_encoded_segment(tokenizer, fname, false, buffers, &out_len, &overflow);
-                        append_encoded_segment(tokenizer, "<|content_invoke_tool_json|>", true, buffers, &out_len, &overflow);
-                        var tw = tiger.ByteWriter.init(buffers.render_buf);
-                        var tok_ok: bool = tw.try_append_slice("{\"name\":");
-                        tok_ok = tok_ok and tw.try_append_json_escaped(fname);
-                        tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
-                        if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
-                            if (args_raw.len > 0 and args_raw[0] == '"') {
-                                var ap2: usize = 0;
-                                if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
-                                    const trimmed = trim_ascii_ws(args_str);
-                                    tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                    if (extract_raw_field(fn_obj, "name")) |fname_raw| {
+                        var fnp: usize = 0;
+                        if (tokenizer_mod.parse_json_string(fname_raw, &fnp, &fname_buf)) |fname| {
+                            if (extract_raw_field(tc_obj, "id")) |id_raw| {
+                                var id_buf: [128]u8 = undefined;
+                                var idp: usize = 0;
+                                if (tokenizer_mod.parse_json_string(id_raw, &idp, &id_buf)) |id_val| {
+                                    buffers.tool_id_map.insert(id_val, id_raw, fname_raw);
+                                }
+                            }
+                            emitted_assistant_block = true;
+                            append_encoded_segment(tokenizer, "<|message_model|>", true, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, fname, false, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, "<|content_invoke_tool_json|>", true, buffers, &out_len, &overflow);
+                            var tw = tiger.ByteWriter.init(buffers.render_buf);
+                            var tok_ok: bool = tw.try_append_slice("{\"name\":");
+                            tok_ok = tok_ok and tw.try_append_json_escaped(fname);
+                            tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
+                            if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
+                                if (args_raw.len > 0 and args_raw[0] == '"') {
+                                    var ap2: usize = 0;
+                                    if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
+                                        const trimmed = trim_ascii_ws(args_str);
+                                        tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                                    } else {
+                                        tok_ok = tok_ok and tw.try_append_slice("{}");
+                                    }
                                 } else {
-                                    tok_ok = tok_ok and tw.try_append_slice("{}");
+                                    tok_ok = tok_ok and tw.try_append_slice(args_raw);
                                 }
                             } else {
-                                tok_ok = tok_ok and tw.try_append_slice(args_raw);
+                                tok_ok = tok_ok and tw.try_append_slice("{}");
                             }
-                        } else {
-                            tok_ok = tok_ok and tw.try_append_slice("{}");
+                            tok_ok = tok_ok and tw.try_append_byte('}');
+                            if (!tok_ok) {
+                                overflow = true;
+                            } else {
+                                append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
+                            }
+                            append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
                         }
-                        tok_ok = tok_ok and tw.try_append_byte('}');
-                        if (!tok_ok) {
-                            overflow = true;
-                        } else {
-                            append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
-                        }
-                        append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
                     }
                 }
                 tokenizer_mod.skip_ws(tc_arr, &tcp);
@@ -1723,6 +1837,12 @@ fn encode_chat_template_zero_alloc(
 
         tokenizer_mod.skip_ws(messages_json, &pos);
         if (pos < messages_json.len and messages_json[pos] == ',') pos += 1;
+    }
+
+    // Never silently truncate trailing messages if the loop cap was hit!
+    if (!overflow) {
+        tokenizer_mod.skip_ws(messages_json, &pos);
+        if (pos < messages_json.len and messages_json[pos] != ']') overflow = true;
     }
 
     if (!effort_emitted and !overflow) {
@@ -1742,48 +1862,6 @@ fn encode_chat_template_zero_alloc(
         .images = images,
         .image_count = image_count,
     };
-}
-
-fn resolve_tool_name_by_id(prior_messages_prefix: []const u8, target_id: []const u8, out_buf: []u8) ?[]const u8 {
-    if (prior_messages_prefix.len < 2 or target_id.len == 0) return null;
-    var pos: usize = 1;
-    var msg_iter: u32 = 0;
-    while (pos < prior_messages_prefix.len and msg_iter < 1024) : (msg_iter += 1) {
-        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
-        if (pos >= prior_messages_prefix.len or prior_messages_prefix[pos] != '{') {
-            if (pos < prior_messages_prefix.len) pos += 1;
-            continue;
-        }
-        const obj_start = pos;
-        tokenizer_mod.skip_json_value(prior_messages_prefix, &pos);
-        const msg_obj = prior_messages_prefix[obj_start..pos];
-        if (extract_raw_field(msg_obj, "tool_calls")) |tc_arr| {
-            if (tc_arr.len > 2 and tc_arr[0] == '[') {
-                var tcp: usize = 1;
-                var tc_iter: u32 = 0;
-                while (tcp < tc_arr.len and tc_iter < 32) : (tc_iter += 1) {
-                    tokenizer_mod.skip_ws(tc_arr, &tcp);
-                    if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
-                    const tc_start = tcp;
-                    tokenizer_mod.skip_json_value(tc_arr, &tcp);
-                    const tc_obj = tc_arr[tc_start..tcp];
-                    var id_buf: [128]u8 = undefined;
-                    if (extract_string_field(tc_obj, "id", &id_buf)) |id_val| {
-                        if (std.mem.eql(u8, id_val, target_id)) {
-                            if (extract_raw_field(tc_obj, "function")) |fn_obj| {
-                                return extract_string_field(fn_obj, "name", out_buf);
-                            }
-                        }
-                    }
-                    tokenizer_mod.skip_ws(tc_arr, &tcp);
-                    if (tcp < tc_arr.len and tc_arr[tcp] == ',') tcp += 1;
-                }
-            }
-        }
-        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
-        if (pos < prior_messages_prefix.len and prior_messages_prefix[pos] == ',') pos += 1;
-    }
-    return null;
 }
 
 // --- Low-Level Socket, UTF-8 & Iterative JSON Field Helpers ---

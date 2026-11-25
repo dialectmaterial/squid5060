@@ -37,3 +37,8 @@ following open-source projects:
 
 4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.
+
+5. LoopCD-Hidden (arXiv:2610.02185) & upstream tensorfish/squid5090 (Apache License 2.0)
+   - Training-free looped hidden-state contrastive decoding (`--loopcd-omega`, `--loopcd-ref`),
+     1-launch PDL Blackwell cluster decode attention, 128-CTA PDL multi-block stochastic sampler,
+     and native sm_120a block-scaled Tensor Core prefill MoE adapted for 8 GB RTX 5060 GPUs.
