@@ -25,18 +25,16 @@
 
   <!-- Top Header -->
   <text x="36" y="48" class="sans title">squid5060 v3.1 — Inkling-2-Mini (26.4B MoE) on 8 GB RTX 5060 Laptop</text>
-  <text x="36" y="72" class="sans subtitle">Single-stream (c=1) · 32K ctx · 7.47 GiB peak (0.22 GiB idle-sleep) · PDL Cluster Attn + sm_120a Block-Scaled TC Prefill + Hybrid AVX2 MoE</text>
+  <text x="36" y="72" class="sans subtitle">Single-stream (c=1) · benched at 32K ctx · 7.47 GiB peak (0.22 GiB idle-sleep) · PDL Cluster Attn + sm_120a Block-Scaled TC Prefill + Hybrid AVX2 MoE</text>
 
   <!-- Legend Row -->
   <g transform="translate(36, 94)">
     <rect x="0" y="0" width="12" height="12" rx="3" fill="#4b5563"/>
     <text x="20" y="10.5" class="sans legend-text">llama.cpp (tuned + loop fix)</text>
 
-    <rect x="215" y="0" width="12" height="12" rx="3" fill="#60a5fa"/>
-    <text x="235" y="10.5" class="sans legend-text">squid5060 v3.0 (Hybrid AVX2+GPU)</text>
 
-    <rect x="470" y="0" width="12" height="12" rx="3" fill="#34d399"/>
-    <text x="490" y="10.5" class="sans legend-text">squid5060 v3.1 (+ PDL Cluster Attn, sm_120a Block-Scaled Prefill, LoopCD)</text>
+    <rect x="215" y="0" width="12" height="12" rx="3" fill="#34d399"/>
+    <text x="235" y="10.5" class="sans legend-text">squid5060 v3.1 (PDL Cluster Attn, sm_120a Block-Scaled Prefill, LoopCD)</text>
   </g>
 
   <!-- ====================================================================== -->
@@ -73,15 +71,12 @@
     <rect x="64" y="14" width="89.9" height="20" rx="4" fill="#4b5563"/>
     <text x="162" y="28.5" class="mono val-muted">32.1</text>
 
-    <!-- v3.0: 80.9 -> 226.5px -->
-    <rect x="64" y="40" width="226.5" height="20" rx="4" fill="#60a5fa"/>
-    <text x="299" y="54.5" class="mono val-v30">80.9</text>
 
     <!-- v3.1: 97.9 -> 274.1px -->
-    <rect x="64" y="66" width="274.1" height="22" rx="4" fill="#34d399"/>
-    <text x="347" y="81.5" class="mono val-v31">97.9 tok/s</text>
-    <rect x="448" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="478" y="81" text-anchor="middle" class="mono pill-text">3.05×</text>
+    <rect x="64" y="40" width="274.1" height="22" rx="4" fill="#34d399"/>
+    <text x="347" y="55.5" class="mono val-v31">97.9 tok/s</text>
+    <rect x="448" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="478" y="55" text-anchor="middle" class="mono pill-text">3.05×</text>
   </g>
 
   <!-- Group D2: Peak Single-Prompt Decode (c=1) -->
@@ -93,15 +88,12 @@
     <rect x="64" y="14" width="106.1" height="20" rx="4" fill="#4b5563"/>
     <text x="178" y="28.5" class="mono val-muted">37.9</text>
 
-    <!-- v3.0: 96.8 -> 271.0px -->
-    <rect x="64" y="40" width="271.0" height="20" rx="4" fill="#60a5fa"/>
-    <text x="343" y="54.5" class="mono val-v30">96.8</text>
 
     <!-- v3.1: 105.4 -> 295.1px -->
-    <rect x="64" y="66" width="295.1" height="22" rx="4" fill="#34d399"/>
-    <text x="368" y="81.5" class="mono val-v31">105.4 tok/s</text>
-    <rect x="476" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="506" y="81" text-anchor="middle" class="mono pill-text">2.78×</text>
+    <rect x="64" y="40" width="295.1" height="22" rx="4" fill="#34d399"/>
+    <text x="368" y="55.5" class="mono val-v31">105.4 tok/s</text>
+    <rect x="476" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="506" y="55" text-anchor="middle" class="mono pill-text">2.78×</text>
   </g>
 
   <!-- Group D3: 6-Prompt Median (c=1) -->
@@ -113,15 +105,12 @@
     <rect x="64" y="14" width="104.2" height="20" rx="4" fill="#4b5563"/>
     <text x="176" y="28.5" class="mono val-muted">37.2</text>
 
-    <!-- v3.0: 83.1 -> 232.7px -->
-    <rect x="64" y="40" width="232.7" height="20" rx="4" fill="#60a5fa"/>
-    <text x="305" y="54.5" class="mono val-v30">83.1</text>
 
     <!-- v3.1: 82.4 -> 230.7px -->
-    <rect x="64" y="66" width="230.7" height="22" rx="4" fill="#34d399"/>
-    <text x="304" y="81.5" class="mono val-v31">82.4 tok/s</text>
-    <rect x="405" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="435" y="81" text-anchor="middle" class="mono pill-text">2.22×</text>
+    <rect x="64" y="40" width="230.7" height="22" rx="4" fill="#34d399"/>
+    <text x="304" y="55.5" class="mono val-v31">82.4 tok/s</text>
+    <rect x="405" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="435" y="55" text-anchor="middle" class="mono pill-text">2.22×</text>
   </g>
 
   <!-- ====================================================================== -->
@@ -156,15 +145,12 @@
     <rect x="640" y="14" width="27.0" height="20" rx="4" fill="#4b5563"/>
     <text x="675" y="28.5" class="mono val-muted">174</text>
 
-    <!-- v3.0: 1031 -> 159.8px -->
-    <rect x="640" y="40" width="159.8" height="20" rx="4" fill="#60a5fa"/>
-    <text x="808" y="54.5" class="mono val-v30">1,031</text>
 
     <!-- v3.1: 1182 -> 183.2px -->
-    <rect x="640" y="66" width="183.2" height="22" rx="4" fill="#34d399"/>
-    <text x="832" y="81.5" class="mono val-v31">1,182 tok/s</text>
-    <rect x="940" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="970" y="81" text-anchor="middle" class="mono pill-text">6.79×</text>
+    <rect x="640" y="40" width="183.2" height="22" rx="4" fill="#34d399"/>
+    <text x="832" y="55.5" class="mono val-v31">1,182 tok/s</text>
+    <rect x="940" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="970" y="55" text-anchor="middle" class="mono pill-text">6.79×</text>
   </g>
 
   <!-- Group P2: 12.9K Cold Prefill -->
@@ -176,42 +162,36 @@
     <rect x="640" y="14" width="26.0" height="20" rx="4" fill="#4b5563"/>
     <text x="674" y="28.5" class="mono val-muted">168</text>
 
-    <!-- v3.0: 1319 -> 204.4px -->
-    <rect x="640" y="40" width="204.4" height="20" rx="4" fill="#60a5fa"/>
-    <text x="853" y="54.5" class="mono val-v30">1,319</text>
 
     <!-- v3.1: 1793 -> 277.9px -->
-    <rect x="640" y="66" width="277.9" height="22" rx="4" fill="#34d399"/>
-    <text x="927" y="81.5" class="mono val-v31">1,793 tok/s</text>
-    <rect x="1035" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="1065" y="81" text-anchor="middle" class="mono pill-text">10.7×</text>
+    <rect x="640" y="40" width="277.9" height="22" rx="4" fill="#34d399"/>
+    <text x="927" y="55.5" class="mono val-v31">1,793 tok/s</text>
+    <rect x="1035" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="1065" y="55" text-anchor="middle" class="mono pill-text">10.7×</text>
   </g>
 
   <!-- Group P3: Long-Context Needle Haystack Prefill -->
   <g transform="translate(0, 454)">
     <text x="640" y="0" class="sans group-label">Long-Context Needle (23.9K)</text>
-    <text x="836" y="0" class="sans group-sub">204s → 11.8s wait · 3/3 recall</text>
+    <text x="836" y="0" class="sans group-sub">160s → 11.8s wait · 3/3 recall</text>
 
     <!-- llama.cpp: 149 -> 23.1px -->
     <rect x="640" y="14" width="23.1" height="20" rx="4" fill="#4b5563"/>
-    <text x="671" y="28.5" class="mono val-muted">149 (204s)</text>
+    <text x="671" y="28.5" class="mono val-muted">149 (160s)</text>
 
-    <!-- v3.0: 1398 -> 216.7px -->
-    <rect x="640" y="40" width="216.7" height="20" rx="4" fill="#60a5fa"/>
-    <text x="865" y="54.5" class="mono val-v30">1,398 (17.1s)</text>
 
     <!-- v3.1: 2025 -> 313.9px -->
-    <rect x="640" y="66" width="313.9" height="22" rx="4" fill="#34d399"/>
-    <text x="963" y="81.5" class="mono val-v31">2,025 tok/s</text>
-    <rect x="1072" y="67" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="1102" y="81" text-anchor="middle" class="mono pill-text">13.6×</text>
+    <rect x="640" y="40" width="313.9" height="22" rx="4" fill="#34d399"/>
+    <text x="963" y="55.5" class="mono val-v31">2,025 tok/s</text>
+    <rect x="1072" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="1102" y="55" text-anchor="middle" class="mono pill-text">13.6×</text>
   </g>
 
   <!-- Footer Strip -->
   <rect x="36" y="622" width="1128" height="36" rx="8" fill="#11161d" stroke="#1f2937" stroke-width="1"/>
   <text x="600" y="644" text-anchor="middle" class="sans footer-text">
     <tspan class="footer-strong">KLD (Q4/FP8 vs BF16):</tspan> 0.0077 (top1 97.9%)  ·
-    <tspan class="footer-strong">Idle-Sleep:</tspan> 7.47 → 0.22 GiB (329 ms wake)  ·
+    <tspan class="footer-strong">Idle-Sleep:</tspan> 7.47 → 0.22 GiB (326–329 ms wake)  ·
     <tspan class="footer-strong">4 Parked Chats:</tspan> 11–28 ms  ·
     <tspan class="footer-strong">Vision:</tspan> 0 MiB  ·
     <tspan class="footer-strong">Max Ctx:</tspan> 256K

@@ -4,7 +4,7 @@
 
 Forked from [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), `squid5060` v3.1 combines upstream Blackwell **`sm_120a` native block-scaled Tensor Core prefill MoE** (`m16n8k64` NVFP4 with 128B PCIe cachelines & preloaded scales), **1-launch PDL Cluster Attention** (`CS=4` local / `CS=8` global on 26-SM RTX 5060), **128-CTA multi-block PDL stochastic sampling**, and **zero-overhead LoopCD-Hidden (`arXiv:2610.02185`)** with `squid5060`'s 8 GB architecture — **Hybrid AVX2 FP32 CPU + GPU PCIe MoE miss execution**, **temperature-aware 4-way `{1, 2, 4, 8}` adaptive DSpark speculative decoding**, **pre-warmed multi-domain expert cache**, **FP8 local SWA + shared-loop Q4 global KV caches**, **auto idle-sleep (`7.47 GiB → 0.22 GiB` VRAM, 326 ms wake)**, **host-RAM conversation parking (~22 ms swap)**, **on-demand PNG/JPEG vision (`0.0 MiB` permanent VRAM)**, and **up to 256K context** in **< 7.5 GiB VRAM** — hitting **`2,025 tok/s` prefill (`13.6×` `llama.cpp`)**, **`97.9 tok/s` decode at 24K context (`3.05×` `llama.cpp`)**, and **`105.4 tok/s` peak single-stream decode**.
 
-![squid5060 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp and v3.0](assets/benchmark-5060.png)
+![squid5060 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp](assets/benchmark-5060.png)
 
 > **Upfront Attribution:** `squid5060` tracks [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090) (which builds on [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine), and [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill)). Training-free last-loop KV sharing was inspired by [2DSD (SqueezeAILab)](https://github.com/SqueezeAILab/2DSD). Full attributions live in [`NOTICE`](NOTICE).
 >
@@ -24,7 +24,7 @@ Measured strictly single-stream (`c=1`, sequential — zero multi-user batching)
 | **Short-prompt TTFT** | — | `245.3 ms` | **`229.5 ms`** | **`271.5 ms`** | **1.07× faster vs v3.0** |
 | **Cold prefill (3.3K random filler)** | `174 tok/s` | `1,031 tok/s` | **`1,143 / 1,182 tok/s`** | **`1,167 tok/s`** | **6.57× – 6.79× faster** |
 | **Cold prefill (12.9K random filler)** | `168 tok/s` | `1,319 tok/s` | **`1,792 / 1,777 tok/s`** | **`1,793 tok/s`** | **10.7× faster** |
-| **Long-ctx Needle prefill (23.9K)** | `149 tok/s` *(204s)* | `1,398 tok/s` *(17.1s)* | **`2,025 tok/s`** *(**11.8s**)* | **`2,025 tok/s`** *(**11.8s**)* | **13.6× faster** |
+| **Long-ctx Needle prefill (23.9K)** | `149 tok/s` *(160s)* | `1,398 tok/s` *(17.1s)* | **`2,025 tok/s`** *(**11.8s**)* | **`2,025 tok/s`** *(**11.8s**)* | **13.6× faster** |
 | **Needle-in-a-Haystack accuracy** | `3/3` | `3/3` PASS | **`3/3` PASS** | **`3/3` PASS** | **100% exact** |
 | **Peak VRAM / Idle-Sleep VRAM** | `7.35 GiB` / — | `7.47 GiB` / `0.22 GiB` | **`7.47 GiB` / `0.22 GiB`** *(329 ms wake)* | **`7.47 GiB` / `0.22 GiB`** | **7.25 GiB freed idle** |
 | **Multi-chat swap (4 parked slots)** | — | `22–27 ms` | **`11–28 ms`** *(host-RAM LRU)* | **`11–28 ms`** | **Zero re-prefill** |
