@@ -34,6 +34,9 @@ pub const GenerateStats = struct {
     generated_tokens: u32 = 0,
     prefill_ms: f64 = 0.0,
     decode_ms: f64 = 0.0,
+    vision_ms: f64 = 0.0,
+    images_encoded: u32 = 0,
+    image_tokens: u32 = 0,
     spec_steps: u32 = 0,
     lookup_steps: u32 = 0,
     total_drafts: u32 = 0,
@@ -119,7 +122,9 @@ const PromptLookupIndex = struct {
         }
         var j: u32 = 0;
         while (j < constants.mtp_draft_count_max) : (j += 1) {
-            out_drafts[j] = self.at(cand + j);
+            const t = self.at(cand + j);
+            if (t < 0) return false;
+            out_drafts[j] = t;
         }
         return true;
     }
@@ -223,8 +228,10 @@ pub const Engine = struct {
     prefill_tail_slots: u32 = 0,
     prefill_aliased: bool = false,
     share_loop_kv: bool = false,
-    active_images: []const vision_mod.ImageSpan = &.{},
+    active_images: []vision_mod.ImageSpan = &.{},
     prefill_cur_prompt_pos: u32 = std.math.maxInt(u32),
+    pending_post_decode_ckpt: bool = false,
+    pending_post_decode_has_images: bool = false,
 
     // Per-visit KV caches and sconv rings
     kv_cap: [constants.visit_count]i32 = @splat(0),
@@ -886,6 +893,7 @@ pub const Engine = struct {
         if (self.active_images.len == 0 or chunk_start == std.math.maxInt(u32)) return;
         const chunk_end: u32 = chunk_start + batch_len;
         for (self.active_images) |img| {
+            if (!img.encoded or img.embeds.len == 0) continue;
             const img_start: u32 = img.prompt_pos;
             const img_end: u32 = img.prompt_pos + img.num_tokens;
             const ov_lo: u32 = @max(chunk_start, img_start);
@@ -902,6 +910,16 @@ pub const Engine = struct {
                 @as(usize, cnt) * constants.hidden_dim * @sizeOf(f32),
                 self.stream,
             ));
+        }
+    }
+
+    pub fn save_post_decode_checkpoint(self: *Engine) void {
+        if (!self.pending_post_decode_ckpt) return;
+        const had_imgs = self.pending_post_decode_has_images;
+        self.pending_post_decode_ckpt = false;
+        self.pending_post_decode_has_images = false;
+        if (self.prefix_cache.enabled and (self.prefix_cache.session_len >= 128 or had_imgs)) {
+            self.save_local_state_checkpoint(3, self.prefix_cache.session_len);
         }
     }
 
@@ -1401,6 +1419,8 @@ pub const Engine = struct {
         callback_context: ?*anyopaque,
     ) GenerateStats {
         tiger.assert(self.weights != null);
+        self.pending_post_decode_ckpt = false;
+        self.pending_post_decode_has_images = false;
         var stats: GenerateStats = .{ .prompt_tokens = @intCast(prompt.len) };
         if (prompt.len == 0 or max_new_tokens_in == 0) return stats;
         if (prompt.len >= self.context_tokens_max) return stats;
@@ -1446,7 +1466,7 @@ pub const Engine = struct {
             else
                 0;
             var common: u32 = 0;
-            while (common < live_max_match and self.prefix_cache.session_tokens[common] == prompt[common] and prompt[common] != vision_mod.image_token_id) : (common += 1) {}
+            while (common < live_max_match and self.prefix_cache.session_tokens[common] == prompt[common]) : (common += 1) {}
             const live_loopcd_match: bool = (loopcd_omega == self.prefix_cache.session_loopcd_omega) and
                 (loopcd_omega == 0.0 or loopcd_ref == self.prefix_cache.session_loopcd_ref);
 
@@ -1481,7 +1501,7 @@ pub const Engine = struct {
                 const p_cap: u32 = @min(sl.len, prompt_match_cap);
                 if (p_cap < 128) continue;
                 var p_common: u32 = 0;
-                while (p_common < p_cap and sl.tokens[p_common] == prompt[p_common] and prompt[p_common] != vision_mod.image_token_id) : (p_common += 1) {}
+                while (p_common < p_cap and sl.tokens[p_common] == prompt[p_common]) : (p_common += 1) {}
                 if (sl.len <= p_common and sl.len > parked_pos) {
                     parked_pos = sl.len;
                     parked_best_idx = pi;
@@ -1494,10 +1514,10 @@ pub const Engine = struct {
             }
 
             const side_need: u32 = prompt_len + max_new_tokens + 16;
-            const is_tiny_side: bool = if (max_parked > 0)
+            const is_tiny_side: bool = (self.active_images.len == 0) and (if (max_parked > 0)
                 (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 2048 and common < 128 and prompt_len < 512 and side_need <= 1024)
             else
-                (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 1024 and common < 512 and side_need <= side_shield_max_tokens);
+                (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 1024 and common < 512 and side_need <= side_shield_max_tokens));
 
             if (parked_pos > live_pos and parked_pos >= 128) {
                 if (self.prefix_cache.gpu_global_kv_valid and self.prefix_cache.session_len >= 128) {
@@ -1535,6 +1555,33 @@ pub const Engine = struct {
             self.copy_global_kv_shield(shield_tokens, false);
             self.prefix_cache.gpu_live_at_pos = -1;
         };
+
+        // --- LAZY 0-VRAM VISION ENCODE (skip any image fully inside cached prefix `start_pos`!) ---
+        const had_prompt_images: bool = self.active_images.len > 0;
+        const saved_active_images = self.active_images;
+        defer self.active_images = saved_active_images;
+        if (self.active_images.len > 0) {
+            const vis_start_ns: u64 = tiger.clock_monotonic_ns();
+            var any_unseen: bool = false;
+            for (self.active_images) |*img| {
+                stats.image_tokens += img.num_tokens;
+                if (img.prompt_pos + img.num_tokens <= start_pos) continue; // Already in prefix KV cache (0 ms)!
+                any_unseen = true;
+                if (!img.encoded and img.raw_bytes.len > 0 and img.embed_slot.len >= @as(usize, img.num_tokens) * constants.hidden_dim) {
+                    const enc_res = self.encode_image(img.raw_bytes, img.embed_slot) orelse return stats;
+                    const actual_n: u32 = @min(enc_res.num_tokens, img.num_tokens);
+                    img.embeds = img.embed_slot[0 .. @as(usize, actual_n) * constants.hidden_dim];
+                    img.encoded = true;
+                    stats.images_encoded += 1;
+                }
+            }
+            if (stats.images_encoded > 0) {
+                stats.vision_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - vis_start_ns)) / 1_000_000.0;
+            }
+            if (!any_unseen) {
+                self.active_images = &.{};
+            }
+        }
 
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
         // Invalidate any stale checkpoints past the branch point `start_pos` BEFORE prefill writes new KV!
@@ -1599,7 +1646,7 @@ pub const Engine = struct {
             for (&self.prefix_cache.checkpoints) |*ckpt| {
                 if (ckpt.valid and ckpt.pos > prompt_len) ckpt.valid = false;
             }
-            if (prompt_len >= 128) {
+            if (prompt_len >= 128 or had_prompt_images) {
                 self.save_local_state_checkpoint(2, prompt_len);
             }
         }
@@ -1883,8 +1930,10 @@ pub const Engine = struct {
 
         if (self.prefix_cache.enabled and shield_tokens == 0) {
             self.prefix_cache.gpu_live_at_pos = self.current_position;
-            if (self.prefix_cache.session_len >= 128) {
-                self.save_local_state_checkpoint(3, self.prefix_cache.session_len);
+            if (self.prefix_cache.session_len >= 128 or had_prompt_images) {
+                // Defer D2H checkpoint copy until AFTER the HTTP server flushes [DONE] / JSON to the client!
+                self.pending_post_decode_ckpt = true;
+                self.pending_post_decode_has_images = had_prompt_images;
             }
         }
         return stats;

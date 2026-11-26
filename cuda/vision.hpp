@@ -39,6 +39,19 @@ struct CVisionWeightsHost {
     const void* proj_out_w;              // [2304, 4096]
 };
 
+// Fast header-only probe of PNG or JPEG bytes (no pixel decode, zero GPU work):
+// computes exact visual token count matching `squid_vision_encode_image` and a content hash
+// for multi-turn prefix-cache reuse via negative synthetic token IDs.
+// Returns 0 on success, non-zero error code on invalid header.
+int32_t squid_vision_probe_image(
+    const uint8_t* img_bytes,
+    size_t img_len,
+    int32_t max_tokens,
+    int32_t* out_num_tokens,
+    int32_t* out_cols,
+    int32_t* out_rows,
+    uint64_t* out_hash);
+
 // Decode PNG or JPEG bytes and run Inkling-2-Mini's 23-layer ViT + projector on GPU using
 // `scratch_dev` (`scratch_bytes` borrowed from prefill tail, or temporary cudaMalloc if null).
 // Writes `out_num_tokens` (<= max_tokens) and `[out_num_tokens * 2304]` FP32 embeddings into `out_embeds_host`.

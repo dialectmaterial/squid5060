@@ -879,7 +879,7 @@ fn handle_chat_completions(
     // Encode Inkling-2-Mini chat template directly into prompt_tokens:
     // server-emitted control tags use parse_special=true, while all untrusted user/tool/assistant text
     // uses parse_special=false (blocking control-token spoofing AND avoiding 32 MiB intermediate overflow!).
-    const enc_res = encode_chat_template_zero_alloc(
+    var enc_res = encode_chat_template_zero_alloc(
         engine,
         tokenizer,
         messages_json,
@@ -1025,14 +1025,23 @@ fn handle_chat_completions(
         });
         if (!ok) {
             send_error_json(fd, 500, "Response exceeded 16 MiB static response buffer", "server_error", buffers.response_buf);
+            engine.save_post_decode_checkpoint();
             return;
         }
 
-        tiger.print_stdout(
-            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-        );
+        if (stats.image_tokens > 0) {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        } else {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -1117,16 +1126,25 @@ fn handle_chat_completions(
         StreamCtx.on_token,
         @ptrCast(&sctx),
     );
-    if (!sctx.conn_ok) return;
+    if (!sctx.conn_ok) {
+        engine.save_post_decode_checkpoint();
+        return;
+    }
 
     if (stops.count > 0 and !sctx.hit_stop and sctx.emitted_len < parser.content_writer.length) {
         const rem = parser.content_writer.slice()[sctx.emitted_len..];
-        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) return;
+        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     // Emit streaming OpenAI tool_calls delta chunk(s) before final finish_reason="tool_calls"!
     if (parser.tool_call_count > 0) {
-        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) return;
+        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     const hit_eos: bool = (stats.last_token_id == constants.eos_token_id);
@@ -1134,14 +1152,22 @@ fn handle_chat_completions(
     const usage_opt: ?engine_mod.GenerateStats = if (include_usage) stats else null;
     _ = send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .empty, "", finish_reason, usage_opt);
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 
     const dec_toks: f64 = @floatFromInt(if (stats.generated_tokens > 0) stats.generated_tokens - 1 else 0);
     const tps: f64 = if (stats.decode_ms > 0.0) (dec_toks * 1000.0 / stats.decode_ms) else 0.0;
     const dl: f64 = if (stats.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(stats.spec_steps))) else 1.0;
-    tiger.print_stdout(
-        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-    );
+    if (stats.image_tokens > 0) {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    } else {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    }
 }
 
 fn handle_text_completions(
@@ -1328,9 +1354,11 @@ fn handle_text_completions(
         });
         if (!ok) {
             send_error_json(fd, 500, "Response exceeded 16 MiB static response buffer", "server_error", buffers.response_buf);
+            engine.save_post_decode_checkpoint();
             return;
         }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -1366,7 +1394,10 @@ fn handle_text_completions(
     };
     var scctx: StreamCmplCtx = .{ .fd = fd, .sse_buf = buffers.sse_buf, .req_id = req_id, .created = created, .req_model = req_model, .parser = &parser };
     const stats = engine.generate(buffers.prompt_tokens[0..prompt_len], gen_limit, @intCast(req_mtp), &.{}, StreamCmplCtx.on_token, @ptrCast(&scctx));
-    if (!scctx.conn_ok) return;
+    if (!scctx.conn_ok) {
+        engine.save_post_decode_checkpoint();
+        return;
+    }
     var bw = tiger.ByteWriter.init(buffers.sse_buf);
     bw.append_slice("data: {\"id\":");
     bw.append_json_escaped(req_id);
@@ -1377,6 +1408,7 @@ fn handle_text_completions(
     bw.append_slice("}]}\n\n");
     _ = send_all(fd, bw.slice());
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 }
 
 const DeltaKind = enum { role, content, reasoning, empty };
@@ -1540,11 +1572,13 @@ fn encode_chat_template_zero_alloc(
     enable_thinking: bool,
     buffers: *ServerBuffers,
 ) ChatEncodeResult {
+    _ = engine;
     var out_len: usize = 0;
     var overflow: bool = false;
     var vision_error: bool = false;
     var images: [vision_mod.max_images_per_req]vision_mod.ImageSpan = @splat(.{});
     var image_count: usize = 0;
+    var img_bytes_used: usize = 0;
     const scratch = buffers.scratch_str_buf;
     buffers.tool_id_map.clear();
 
@@ -1707,8 +1741,21 @@ fn encode_chat_template_zero_alloc(
                                     var iup: usize = 0;
                                     img_url_opt = tokenizer_mod.parse_json_string(iu_raw, &iup, scratch);
                                 }
-                            } else {
-                                img_url_opt = extract_string_field(part_obj, "url", scratch);
+                            }
+                            if (img_url_opt == null) img_url_opt = extract_string_field(part_obj, "image", scratch);
+                            if (img_url_opt == null) img_url_opt = extract_string_field(part_obj, "url", scratch);
+                            if (img_url_opt == null) {
+                                if (extract_raw_field(part_obj, "source")) |src_obj| {
+                                    if (src_obj.len > 0 and src_obj[0] == '{') {
+                                        var sk_buf: [32]u8 = undefined;
+                                        const sk = extract_string_field(src_obj, "type", &sk_buf) orelse "";
+                                        if (std.mem.eql(u8, sk, "base64")) {
+                                            img_url_opt = extract_string_field(src_obj, "data", scratch);
+                                        } else if (std.mem.eql(u8, sk, "url")) {
+                                            img_url_opt = extract_string_field(src_obj, "url", scratch);
+                                        }
+                                    }
+                                }
                             }
                             const img_url = img_url_opt orelse {
                                 vision_error = true;
@@ -1719,31 +1766,38 @@ fn encode_chat_template_zero_alloc(
                                 break;
                             }
                             buffers.ensure_vision_buffers();
-                            const img_bytes = vision_mod.decode_base64_url(img_url, buffers.image_decode_buf) orelse {
+                            if (img_bytes_used >= buffers.image_decode_buf.len) {
+                                vision_error = true;
+                                break;
+                            }
+                            const img_bytes = vision_mod.decode_base64_url(img_url, buffers.image_decode_buf[img_bytes_used..]) orelse {
+                                vision_error = true;
+                                break;
+                            };
+                            img_bytes_used += img_bytes.len;
+                            const probe = vision_mod.probe_image_bytes(img_bytes, vision_mod.max_image_tokens) orelse {
                                 vision_error = true;
                                 break;
                             };
                             const slot_stride: usize = @as(usize, vision_mod.max_image_tokens) * constants.hidden_dim;
                             const embed_slot = buffers.image_embeds_buf[image_count * slot_stride .. (image_count + 1) * slot_stride];
-                            const enc_img = engine.encode_image(img_bytes, embed_slot) orelse {
-                                vision_error = true;
-                                break;
-                            };
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
                             if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
                             append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, &out_len, &overflow);
-                            if (!overflow and out_len + enc_img.num_tokens < buffers.prompt_tokens.len) {
+                            if (!overflow and out_len + probe.num_tokens < buffers.prompt_tokens.len) {
                                 const img_pos: u32 = @intCast(out_len);
                                 var k_tok: u32 = 0;
-                                while (k_tok < enc_img.num_tokens) : (k_tok += 1) {
-                                    buffers.prompt_tokens[out_len] = vision_mod.image_token_id;
+                                while (k_tok < probe.num_tokens) : (k_tok += 1) {
+                                    buffers.prompt_tokens[out_len] = vision_mod.image_token_id_for(probe.hash, k_tok);
                                     out_len += 1;
                                 }
                                 images[image_count] = .{
                                     .prompt_pos = img_pos,
-                                    .num_tokens = enc_img.num_tokens,
-                                    .embeds = embed_slot[0 .. @as(usize, enc_img.num_tokens) * constants.hidden_dim],
+                                    .num_tokens = probe.num_tokens,
+                                    .raw_bytes = img_bytes,
+                                    .embed_slot = embed_slot,
+                                    .encoded = false,
                                 };
                                 image_count += 1;
                             } else {

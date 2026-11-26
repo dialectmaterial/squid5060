@@ -13,8 +13,24 @@ namespace squid {
 // ============================================================================
 // Blackwell Programmatic Dependent Launch (PDL) & Streaming Weight Load Primitives
 // Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
-// Note: L2::cache_hint is intentionally omitted on CUDA 13.1 due to ptxas 13.1 bug.
+// Uses L2::evict_first cache hints automatically on CUDA 13.4+ (ptxas 13.1 bug avoided).
 // ============================================================================
+
+#if defined(__CUDACC_VER_MAJOR__) && ((__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+#define SQUID_HAS_L2_HINT 1
+#else
+#define SQUID_HAS_L2_HINT 0
+#endif
+
+__device__ __forceinline__ uint64_t l2_policy_evict_first() {
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    unsigned long long pol;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    return static_cast<uint64_t>(pol);
+#else
+    return 0ull;
+#endif
+}
 
 __device__ __forceinline__ void pdl_wait() {
 #if __CUDA_ARCH__ >= 900
@@ -53,7 +69,7 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStrea
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
-__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+__device__ __forceinline__ uint4 ld_stream_u4_nohint(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -61,23 +77,55 @@ __device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
     return v;
 }
 
+__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+    uint4 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p), "l"(pol));
+#else
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+#endif
+    return v;
+}
+
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p) {
     uint2 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
+                 : "=r"(v.x), "=r"(v.y)
+                 : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
                  : "=r"(v.x), "=r"(v.y)
                  : "l"(p));
+#endif
     return v;
 }
 
 __device__ __forceinline__ uint16_t ld_scale_u16(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return v;
 }
 
 __device__ __forceinline__ uint8_t ld_scale_u8(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return static_cast<uint8_t>(v);
 }
 

@@ -296,8 +296,9 @@ dspark_global_attn_bulk_splitk_kernel(
     int first = (p > max_win) ? (p - max_win) : 0;
     int total_len = p - first;
     int split = blockIdx.y;
-    int chunk = (total_len + KV_SPLIT_K - 1) / KV_SPLIT_K;
+    int chunk = ((total_len + KV_SPLIT_K - 1) / KV_SPLIT_K + 31) & ~31;
     int t_start = first + split * chunk;
+    if (t_start >= p) return;
     int t_end = min(p, t_start + chunk);
 
     constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
@@ -305,16 +306,45 @@ dspark_global_attn_bulk_splitk_kernel(
         qkv, ck, cv, cks, cvs, cap, blockIdx.x, split, t_start, t_end, split_buf);
 }
 
+constexpr int DSPARK_LOCAL_SPLITS = 8;
+
+// 64-CTA Blackwell Tensor Core (m16n8k16) Split-K FlashDecoding for DSpark Local Layers 0 & 2!
+// Reads each of the <=1024 BF16 local KV tokens ONCE across all 24 DSpark queries (24x less BW!).
+__global__ void __launch_bounds__(128)
+dspark_local_attn_bulk_splitk_kernel(
+    const float* __restrict__ qkv, // [8, 5120]
+    const void* __restrict__ ck,
+    const void* __restrict__ cv,
+    int cap,
+    const int32_t* __restrict__ d_pos,
+    float* __restrict__ split_buf) {
+    pdl_wait();
+    pdl_trigger();
+    int p = *d_pos;
+    if (p <= 0) return;
+
+    int first = (p > SWA_WINDOW) ? (p - SWA_WINDOW) : 0;
+    int total_len = p - first;
+    int split = blockIdx.y;
+    int chunk = ((total_len + DSPARK_LOCAL_SPLITS - 1) / DSPARK_LOCAL_SPLITS + 31) & ~31;
+    int t_start = first + split * chunk;
+    if (t_start >= p) return;
+    int t_end = min(p, t_start + chunk);
+
+    constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
+    run_tc_bulk_splitk<0, 24, QKV_STRIDE, 128>(
+        qkv, ck, cv, nullptr, nullptr, cap, blockIdx.x, split, t_start, t_end, split_buf);
+}
+
 // DSpark Block Attention writing __half directly for w_o linear_h!
-// Local layers (window > 0): BF16 SWA context + 8 bidirectional block rows.
-// Global layer (window == 0): 8 bidirectional block rows + exact merge of 24 bulk Split-K partials!
+// Both local (8 TC splits) and global (KV_SPLIT_K TC splits) layers attend to the 8 bidirectional block rows
+// and merge ONLY the active 32-aligned TC bulk Split-K partials in one fast PDL launch!
 __global__ void __launch_bounds__(256)
 dspark_block_attn_kernel(
     const float* __restrict__ qkv,
-    const __nv_bfloat16* __restrict__ ck,
-    const __nv_bfloat16* __restrict__ cv,
     const float* __restrict__ split_buf,
-    int cap, int window,
+    int num_splits,
+    int max_win,
     const int32_t* __restrict__ d_pos,
     float* __restrict__ out,
     __half* __restrict__ out_h) {
@@ -330,8 +360,12 @@ dspark_block_attn_kernel(
     pdl_trigger();
 
     int p = *d_pos;
-    bool has_bulk = (window == 0 && split_buf != nullptr && p > 0);
-    int first = (window > 0 && p > window) ? (p - window) : 0;
+    int total_len = (p > max_win) ? max_win : p;
+    int chunk = (total_len > 0 && num_splits > 0) ? (((total_len + num_splits - 1) / num_splits + 31) & ~31) : 32;
+    int active_splits = (split_buf != nullptr && total_len > 0 && num_splits > 0)
+        ? min(num_splits, (total_len + chunk - 1) / chunk)
+        : 0;
+    bool has_bulk = (active_splits > 0);
 
     int d_off = lane * 4;
     const float* qp = qkv + (size_t)r * QKV_STRIDE + h * HEAD_DIM;
@@ -339,45 +373,18 @@ dspark_block_attn_kernel(
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     float m_val = -1e30f, d_val = 0.0f;
 
-    // 1. Context KV [first .. p-1] (only for local BF16 layers; global layer uses 192-CTA Split-K!)
-    if (!has_bulk && window > 0) {
-        for (int t = first + warp; t < p; t += 8) {
-            int slot = t % cap;
-            uint2 k4 = __ldg(reinterpret_cast<const uint2*>(ck + (size_t)slot * KV_DIM + kvh * HEAD_DIM + d_off));
-            uint2 v4 = __ldg(reinterpret_cast<const uint2*>(cv + (size_t)slot * KV_DIM + kvh * HEAD_DIM + d_off));
-            const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(&k4);
-            const __nv_bfloat162* vb = reinterpret_cast<const __nv_bfloat162*>(&v4);
-            float2 kf0 = __bfloat1622float2(kb[0]), kf1 = __bfloat1622float2(kb[1]);
-            float2 vf0 = __bfloat1622float2(vb[0]), vf1 = __bfloat1622float2(vb[1]);
-            float dot = fmaf(qv.x, kf0.x, fmaf(qv.y, kf0.y, fmaf(qv.z, kf1.x, qv.w * kf1.y)));
-            float score = warp_sum(dot) * INV_SQRT_HEAD_DIM;
-            float m_new = fmaxf(m_val, score);
-            float alpha = __expf(m_val - m_new);
-            float pw = __expf(score - m_new);
-            d_val = d_val * alpha + pw;
-            acc0 = fmaf(pw, vf0.x, acc0 * alpha);
-            acc1 = fmaf(pw, vf0.y, acc1 * alpha);
-            acc2 = fmaf(pw, vf1.x, acc2 * alpha);
-            acc3 = fmaf(pw, vf1.y, acc3 * alpha);
-            m_val = m_new;
-        }
-    }
-
-    // 2. Bidirectional block KV (all 8 rows: warp `w` handles block row `w`!)
+    // Bidirectional block KV (all 8 rows: warp `w` handles block row `w`!)
     {
         float4 bkv = *reinterpret_cast<const float4*>(qkv + (size_t)warp * QKV_STRIDE + Q_DIM + kvh * HEAD_DIM + d_off);
         float4 bvv = *reinterpret_cast<const float4*>(qkv + (size_t)warp * QKV_STRIDE + Q_DIM + KV_DIM + kvh * HEAD_DIM + d_off);
         float dot = fmaf(qv.x, bkv.x, fmaf(qv.y, bkv.y, fmaf(qv.z, bkv.z, qv.w * bkv.w)));
         float score = warp_sum(dot) * INV_SQRT_HEAD_DIM;
-        float m_new = fmaxf(m_val, score);
-        float alpha = __expf(m_val - m_new);
-        float pw = __expf(score - m_new);
-        d_val = d_val * alpha + pw;
-        acc0 = fmaf(pw, bvv.x, acc0 * alpha);
-        acc1 = fmaf(pw, bvv.y, acc1 * alpha);
-        acc2 = fmaf(pw, bvv.z, acc2 * alpha);
-        acc3 = fmaf(pw, bvv.w, acc3 * alpha);
-        m_val = m_new;
+        m_val = score;
+        d_val = 1.0f;
+        acc0 = bvv.x;
+        acc1 = bvv.y;
+        acc2 = bvv.z;
+        acc3 = bvv.w;
     }
 
     __shared__ float sm_m[8], sm_d[8], sm_acc[8][HEAD_DIM];
@@ -398,8 +405,7 @@ dspark_block_attn_kernel(
         const float* s_d_in = split_buf + SPLIT_D_OFF;
         const float* s_o_in = split_buf + SPLIT_O_OFF;
         if (has_bulk) {
-            #pragma unroll
-            for (int s = 0; s < KV_SPLIT_K; ++s) {
+            for (int s = 0; s < active_splits; ++s) {
                 g_m = fmaxf(g_m, s_m_in[base_hr + s]);
             }
         }
@@ -414,8 +420,7 @@ dspark_block_attn_kernel(
             }
         }
         if (has_bulk) {
-            #pragma unroll
-            for (int s = 0; s < KV_SPLIT_K; ++s) {
+            for (int s = 0; s < active_splits; ++s) {
                 float sd = s_d_in[base_hr + s];
                 if (sd > 0.0f) {
                     float sc = __expf(s_m_in[base_hr + s] - g_m);
@@ -585,7 +590,6 @@ dspark_base_logits_nvfp4_mma_kernel(
     constexpr int U = 3;
     constexpr int CB = HIDDEN >> 1;
     constexpr int SB = HIDDEN >> 4;
-    __shared__ __half s_xh[K_CONST][HIDDEN];
     __shared__ float cs[SPLITK][16][8];
 
     const int tid = threadIdx.x;
@@ -594,33 +598,8 @@ dspark_base_logits_nvfp4_mma_kernel(
     const int g = lane >> 2;
     const int t = lane & 3;
     const int c_base = warp * (4 * U) + t;
-
-    pdl_wait_fenced(zero);
-
-    int total_x = K_CONST * HIDDEN;
-    for (int i = tid; i < total_x; i += 192) {
-        s_xh[i / HIDDEN][i % HIDDEN] = normed_h[i];
-    }
-    __syncthreads();
-
-    uint32_t xw[U][16];
     const bool lx = (g < K_CONST);
-    #pragma unroll
-    for (int u = 0; u < U; ++u) {
-        int col = (c_base + 4 * u) * 32;
-        if (lx) {
-            const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = xp[v];
-                xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
-                xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
-            }
-        } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[u][v] = 0;
-        }
-    }
+    const __half* xg = lx ? (normed_h + (size_t)g * HIDDEN) : nullptr;
 
     auto decode32 = [](uint4 q, uint16_t s, uint32_t (&o)[16]) {
         const __half2 sc = cvt_e4m3x2_to_half2(s);
@@ -639,11 +618,12 @@ dspark_base_logits_nvfp4_mma_kernel(
         }
     };
 
-    int n_tiles = (V + 15) / 16;
+    bool waited = false;
+    const int n_tiles = (V + 15) / 16;
     for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
-        int r0 = tile * 16;
-        int ra = r0 + g, rb = r0 + g + 8;
-        bool la = (ra < V), lb = (rb < V);
+        const int r0 = tile * 16;
+        const int ra = r0 + g, rb = r0 + g + 8;
+        const bool la = (ra < V), lb = (rb < V);
 
         uint4 aq[U], bq[U];
         uint16_t as[U], bs[U];
@@ -659,9 +639,29 @@ dspark_base_logits_nvfp4_mma_kernel(
                 bs[u] = ld_scale_u16(w_scales + (size_t)rb * SB + (size_t)c * 2);
             } else { bq[u] = make_uint4(0, 0, 0, 0); bs[u] = 0; }
         }
+        if (!waited) {
+            pdl_wait_fenced(zero);
+            waited = true;
+        }
+        uint32_t xw[U][16];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int col = (c_base + 4 * u) * 32;
+            if (lx) {
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    uint4 q = ld_dep_u4(xg + col + 8 * v);
+                    xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
+                    xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
+                }
+            } else {
+                #pragma unroll
+                for (int v = 0; v < 16; ++v) xw[u][v] = 0;
+            }
+        }
         uint32_t dep = 0;
         #pragma unroll
-        for (int u = 0; u < U; ++u) dep ^= aq[u].x ^ aq[u].w ^ bq[u].x ^ bq[u].w;
+        for (int u = 0; u < U; ++u) dep ^= aq[u].x ^ aq[u].w ^ bq[u].x ^ bq[u].w ^ xw[u][0];
         dep &= zero;
 
         float d[4] = {0.f, 0.f, 0.f, 0.f};
@@ -697,6 +697,7 @@ dspark_base_logits_nvfp4_mma_kernel(
         }
         __syncthreads();
     }
+    if (!waited) pdl_wait_fenced(zero);
     pdl_trigger();
 }
 
@@ -1146,7 +1147,10 @@ void launch_dspark_draft(
         }
         launch_pdl(dspark_block_qk_rope_kernel, dim3(MTP_BLOCK_SIZE, NUM_HEADS + NUM_KV_HEADS), HEAD_DIM, stream,
             qkv, dl.q_norm, dl.k_norm, d_pos);
-        if (!dl.is_local) {
+        if (dl.is_local) {
+            launch_pdl(dspark_local_attn_bulk_splitk_kernel, dim3(NUM_KV_HEADS, DSPARK_LOCAL_SPLITS), 128, stream,
+                qkv, ctx_k[l], ctx_v[l], ctx_cap[l], d_pos, split_buf);
+        } else {
             dim3 sgrid(NUM_KV_HEADS, KV_SPLIT_K);
             if (global_kv_fmt == KVFormat::FP8) {
                 launch_pdl(dspark_global_attn_bulk_splitk_kernel<1>, sgrid, 128, stream,
@@ -1159,9 +1163,9 @@ void launch_dspark_draft(
                     qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos, split_buf);
             }
         }
+        const int max_win = dl.is_local ? SWA_WINDOW : max(0, ctx_cap[l] - MTP_MAX_DRAFTS);
         launch_pdl(dspark_block_attn_kernel, dim3(NUM_HEADS, MTP_BLOCK_SIZE), 256, stream,
-            qkv, static_cast<const __nv_bfloat16*>(ctx_k[l]), static_cast<const __nv_bfloat16*>(ctx_v[l]),
-            dl.is_local ? nullptr : split_buf, ctx_cap[l], dl.is_local ? SWA_WINDOW : 0, d_pos,
+            qkv, split_buf, dl.is_local ? DSPARK_LOCAL_SPLITS : KV_SPLIT_K, max_win, d_pos,
             use_half ? nullptr : attn_out, use_half ? attn_out_h : nullptr);
         if (use_half) launch_linear_h(dl.w_o, attn_out_h, block_x, MTP_BLOCK_SIZE, true, stream);
         else          launch_linear(dl.w_o, attn_out, block_x, MTP_BLOCK_SIZE, true, stream);

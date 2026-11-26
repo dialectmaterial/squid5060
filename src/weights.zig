@@ -1279,55 +1279,53 @@ fn stage_layer_raw(sf: *const safetensors.SafetensorsFile, layer_idx: u32, suffi
     return @intCast(expected_bytes);
 }
 
+const embedded_draft_shortlist_bytes = @embedFile("draft_shortlist.bin");
+
 fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.QuantMode) ?[]i32 {
+    _ = model_directory;
     if (quant_mode == .exact) return null;
     const env_dv = tiger.getenv("SQUID_DRAFT_VOCAB");
-    var prefer_49k: bool = false;
+    var shortlist_rows: usize = 32768;
     if (env_dv) |ptr| {
         const s = std.mem.span(ptr);
         if (std.mem.eql(u8, s, "full")) return null;
-        if (std.mem.eql(u8, s, "49k")) prefer_49k = true;
+        if (std.mem.eql(u8, s, "49k")) shortlist_rows = 49152;
     }
-    const candidates: [2][]const u8 = if (prefer_49k)
-        .{ "/draft_vocab_49k.bin", "/draft_vocab_32k.bin" }
-    else
-        .{ "/draft_vocab_32k.bin", "/draft_vocab_49k.bin" };
 
-    var path_buf: [1024]u8 = undefined;
-    for (candidates) |suffix| {
-        const path_z = tiger.format_path_z(&path_buf, model_directory, suffix);
-        const fd: i32 = tiger.open(path_z, tiger.O_RDONLY);
-        if (fd < 0) continue;
-        defer _ = tiger.close(fd);
-        const sz_i64: i64 = tiger.lseek(fd, 0, tiger.SEEK_END);
-        if (sz_i64 <= 0 or @mod(sz_i64, 4) != 0) continue;
-        _ = tiger.lseek(fd, 0, tiger.SEEK_SET);
-        const count: usize = @intCast(@divExact(sz_i64, 4));
-        if (count == 0 or count > constants.vocab_unpadded_count) continue;
-        const ids = tiger.alloc_host_zeroed(i32, count);
-        const raw_dst: [*]u8 = @ptrCast(ids.ptr);
-        const want_bytes: usize = count * 4;
-        var got: usize = 0;
-        var iter: u32 = 0;
-        while (got < want_bytes and iter < 4096) : (iter += 1) {
-            const n: isize = tiger.read(fd, raw_dst + got, want_bytes - got);
-            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
-            if (n <= 0) break;
-            got += @intCast(n);
+    const vocab_n: usize = constants.vocab_unpadded_count;
+    const present = tiger.alloc_host_zeroed(u8, vocab_n);
+    defer tiger.free_host_slice(u8, present);
+
+    // Corpus-frequency-ranked top-K shortlist + all special tokens (199990..V), sorted ascending by token ID
+    // (tie-breaking matches full unembed; adapted from satellitedown/inkling-2-mini-abliterated-ingine, Apache-2.0).
+    const n_ranks: usize = embedded_draft_shortlist_bytes.len / 4;
+    var taken: usize = 0;
+    var ri: usize = 0;
+    while (ri < n_ranks and taken < shortlist_rows) : (ri += 1) {
+        const tid = std.mem.readInt(u32, embedded_draft_shortlist_bytes[ri * 4 ..][0..4], .little);
+        if (tid < vocab_n and present[tid] == 0) {
+            present[tid] = 1;
+            taken += 1;
         }
-        if (got == want_bytes) {
-            var all_valid: bool = true;
-            for (ids) |id| {
-                if (id < 0 or id >= @as(i32, @intCast(constants.vocab_unpadded_count))) {
-                    all_valid = false;
-                    break;
-                }
-            }
-            if (all_valid) return ids;
-        }
-        tiger.free_host_slice(i32, ids);
     }
-    return null;
+    var sp: usize = 199990;
+    while (sp < vocab_n) : (sp += 1) {
+        present[sp] = 1;
+    }
+
+    var total: usize = 0;
+    for (present) |p| total += p;
+    if (total == 0) return null;
+
+    const ids = tiger.alloc_host_zeroed(i32, total);
+    var out_i: usize = 0;
+    for (present, 0..) |p, tid| {
+        if (p != 0) {
+            ids[out_i] = @intCast(tid);
+            out_i += 1;
+        }
+    }
+    return ids;
 }
 
 /// Pass 1: exact 256-byte-aligned VRAM byte accounting matching Pass 2 allocation-for-allocation.

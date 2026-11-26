@@ -1443,14 +1443,32 @@ lm_head_stage1_kernel(
     }
 }
 
-// B=2..8 Tensor Core NVFP4 LM Head Stage 1 (680 persistent CTAs, 6 warps = 192 threads, mma.m16n8k16)!
+__device__ __align__(16) __half g_lm_xh[8 * HIDDEN];
+
+__global__ void __launch_bounds__(256)
+lm_f32_to_f16_pdl_kernel(const float* __restrict__ src, int total_f4) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total_f4) {
+        const float4 v = ld_dep_f4(src + (i << 2));
+        const __half2 h0 = __floats2half2_rn(v.x, v.y);
+        const __half2 h1 = __floats2half2_rn(v.z, v.w);
+        uint2 u;
+        u.x = *reinterpret_cast<const uint32_t*>(&h0);
+        u.y = *reinterpret_cast<const uint32_t*>(&h1);
+        reinterpret_cast<uint2*>(g_lm_xh)[i] = u;
+    }
+}
+
+// B=2..8 High-Occupancy Tensor Core NVFP4 LM Head Stage 1 (3 KB SMEM -> 4-5 CTAs/SM, L1-cached x_h, L2::evict_first)!
 template <int B_CONST>
 __global__ void __launch_bounds__(192)
 lm_head_nvfp4_mma_stage1_kernel(
     const uint8_t* __restrict__ w_data,
     const uint8_t* __restrict__ w_scales,
     float global_scale,
-    const float* __restrict__ x,
+    const __half* __restrict__ x_h,
     float* __restrict__ out_logits,
     float* __restrict__ blk_max_val,
     int32_t* __restrict__ blk_max_idx,
@@ -1461,7 +1479,6 @@ lm_head_nvfp4_mma_stage1_kernel(
     constexpr int U = 3; // 6 * 3 * 128 = 2304
     constexpr int CB = HIDDEN >> 1;
     constexpr int SB = HIDDEN >> 4;
-    __shared__ __half s_xh[B_CONST][HIDDEN];
     __shared__ float cs[SPLITK][16][8];
 
     const int tid = threadIdx.x;
@@ -1470,44 +1487,22 @@ lm_head_nvfp4_mma_stage1_kernel(
     const int g = lane >> 2;
     const int t = lane & 3;
     const int c_base = warp * (4 * U) + t;
-
-    pdl_wait_fenced(zero);
-
-    int total_x = B_CONST * HIDDEN;
-    for (int i = tid; i < total_x; i += 192) {
-        s_xh[i / HIDDEN][i % HIDDEN] = __float2half(ld_dep_f32(x + i));
-    }
-    __syncthreads();
-
-    uint32_t xw[U][16];
     const bool lx = (g < B_CONST);
-    #pragma unroll
-    for (int u = 0; u < U; ++u) {
-        int col = (c_base + 4 * u) * 32;
-        if (lx) {
-            const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = xp[v];
-                xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
-                xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
-            }
-        } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[u][v] = 0;
-        }
-    }
+    const __half* xg = lx ? (x_h + (size_t)g * HIDDEN) : nullptr;
 
-    float best_val[B_CONST];
-    int32_t best_idx[B_CONST];
-    #pragma unroll
-    for (int b = 0; b < B_CONST; ++b) { best_val[b] = -1e30f; best_idx[b] = 0; }
+    // Parallel epilogue: each thread tid < 16*B_CONST owns ONE (row_in_tile, token) slot across ALL tiles!
+    const bool owns_epi = (tid < 16 * B_CONST);
+    const int epi_r = tid / B_CONST;
+    const int epi_b = tid % B_CONST;
+    float my_best_val = -1e30f;
+    int32_t my_best_idx = 0;
 
-    int n_tiles = (V + 15) / 16;
+    bool waited = false;
+    const int n_tiles = (V + 15) / 16;
     for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
-        int r0 = tile * 16;
-        int ra = r0 + g, rb = r0 + g + 8;
-        bool la = (ra < V), lb = (rb < V);
+        const int r0 = tile * 16;
+        const int ra = r0 + g, rb = r0 + g + 8;
+        const bool la = (ra < V), lb = (rb < V);
 
         Nvfp4Chunk32 A[U], B[U];
         #pragma unroll
@@ -1518,9 +1513,30 @@ lm_head_nvfp4_mma_stage1_kernel(
             if (lb) B[u] = load_nvfp4_chunk32(w_data + (size_t)rb * CB, w_scales + (size_t)rb * SB, c);
             else { B[u].q = make_uint4(0, 0, 0, 0); B[u].s = 0; }
         }
+        if (!waited) {
+            pdl_wait_fenced(zero);
+            waited = true;
+        }
+
+        uint32_t xw[U][16];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int col = (c_base + 4 * u) * 32;
+            if (lx) {
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    uint4 q = ld_dep_u4(xg + col + 8 * v);
+                    xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
+                    xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
+                }
+            } else {
+                #pragma unroll
+                for (int v = 0; v < 16; ++v) xw[u][v] = 0;
+            }
+        }
         uint32_t dep = 0;
         #pragma unroll
-        for (int u = 0; u < U; ++u) dep ^= A[u].q.x ^ A[u].q.w ^ B[u].q.x ^ B[u].q.w;
+        for (int u = 0; u < U; ++u) dep ^= A[u].q.x ^ A[u].q.w ^ B[u].q.x ^ B[u].q.w ^ xw[u][0];
         dep &= zero;
 
         float d[4] = {0.f, 0.f, 0.f, 0.f};
@@ -1543,24 +1559,21 @@ lm_head_nvfp4_mma_stage1_kernel(
         cs[warp][g + 8][2 * t + 1] = d[3];
         __syncthreads();
 
-        if (tid < 16) {
-            int row = r0 + tid;
+        if (owns_epi) {
+            const int row = r0 + epi_r;
             if (row < V) {
-                #pragma unroll
-                for (int b = 0; b < B_CONST; ++b) {
-                    float s = cs[0][tid][b] + cs[1][tid][b] + cs[2][tid][b]
-                            + cs[3][tid][b] + cs[4][tid][b] + cs[5][tid][b];
-                    float val = s * global_scale;
-                    if (write_logits) {
-                        float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
-                        out_logits[(size_t)b * V + row] = cap_val;
-                        if (cap_val > best_val[b] || (cap_val == best_val[b] && row < best_idx[b])) {
-                            best_val[b] = cap_val; best_idx[b] = row;
-                        }
-                    } else {
-                        if (val > best_val[b] || (val == best_val[b] && row < best_idx[b])) {
-                            best_val[b] = val; best_idx[b] = row;
-                        }
+                const float s = cs[0][epi_r][epi_b] + cs[1][epi_r][epi_b] + cs[2][epi_r][epi_b]
+                              + cs[3][epi_r][epi_b] + cs[4][epi_r][epi_b] + cs[5][epi_r][epi_b];
+                const float val = s * global_scale;
+                if (write_logits) {
+                    const float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+                    out_logits[(size_t)epi_b * V + row] = cap_val;
+                    if (cap_val > my_best_val || (cap_val == my_best_val && row < my_best_idx)) {
+                        my_best_val = cap_val; my_best_idx = row;
+                    }
+                } else {
+                    if (val > my_best_val || (val == my_best_val && row < my_best_idx)) {
+                        my_best_val = val; my_best_idx = row;
                     }
                 }
             }
@@ -1568,42 +1581,51 @@ lm_head_nvfp4_mma_stage1_kernel(
         __syncthreads();
     }
 
+    if (!waited) pdl_wait_fenced(zero);
     pdl_trigger();
-    if (tid < 16) {
+
+    __shared__ float sm_bv[B_CONST][16];
+    __shared__ int32_t sm_bi[B_CONST][16];
+    if (owns_epi) {
+        sm_bv[epi_b][epi_r] = my_best_val;
+        sm_bi[epi_b][epi_r] = my_best_idx;
+    }
+    __syncthreads();
+    if (tid < B_CONST) {
+        const int b = tid;
+        float bv = sm_bv[b][0];
+        int32_t bi = sm_bi[b][0];
         #pragma unroll
-        for (int b = 0; b < B_CONST; ++b) {
-            float bv = best_val[b];
-            int32_t bi = best_idx[b];
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) {
-                float ov = __shfl_xor_sync(0xFFFFu, bv, off);
-                int32_t oi = __shfl_xor_sync(0xFFFFu, bi, off);
-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-            }
-            if (tid == 0) {
-                blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
-                blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
+        for (int r = 1; r < 16; ++r) {
+            if (sm_bv[b][r] > bv || (sm_bv[b][r] == bv && sm_bi[b][r] < bi)) {
+                bv = sm_bv[b][r]; bi = sm_bi[b][r];
             }
         }
+        blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
+        blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
     }
 }
 
-// Persistent Blackwell Tensor Core (mma.m16n8k16.f32.f16) + PDL FP8 LM Head for B = 2..8!
+// High-Occupancy Blackwell Tensor Core (mma.m16n8k16.f32.f16) + PDL FP8 LM Head for B = 2..8!
+// 3 KB SMEM (4-5 CTAs/SM!), L1-cached x_h, tile-0 weight prefetch before pdl_wait, L2::evict_first!
 template <int B_CONST>
 __global__ void __launch_bounds__(192)
 lm_head_fp8_mma_stage1_kernel(
     const uint8_t* __restrict__ w_data,
     const float* __restrict__ row_scales,
-    const float* __restrict__ x,
+    const __half* __restrict__ x_h,
     float* __restrict__ out_logits,
     float* __restrict__ blk_max_val,
     int32_t* __restrict__ blk_max_idx,
     const SampleConfig* __restrict__ sample_cfg,
     int V, uint32_t zero) {
     const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
+    constexpr int CPL = 16;
     constexpr int SPLITK = 6;
-    constexpr int U = 3; // 6 * 3 * 128 = 2304
-    __shared__ __half s_xh[B_CONST][HIDDEN];
+    constexpr int SPAN = 4 * CPL;       // 64 cols/step
+    constexpr int KS = HIDDEN / SPLITK; // 384
+    constexpr int NJ = KS / SPAN;       // 6 (2 batches of U=3)
+    constexpr int U = 3;
     __shared__ float cs[SPLITK][16][8];
 
     const int tid = threadIdx.x;
@@ -1611,65 +1633,67 @@ lm_head_fp8_mma_stage1_kernel(
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int t = lane & 3;
-    const int c_base = warp * (4 * U) + t;
-
-    pdl_wait_fenced(zero);
-
-    int total_x = B_CONST * HIDDEN;
-    for (int i = tid; i < total_x; i += 192) {
-        s_xh[i / HIDDEN][i % HIDDEN] = __float2half(ld_dep_f32(x + i));
-    }
-    __syncthreads();
-
-    uint32_t xw[U][16];
+    const int c0 = warp * KS + t * CPL;
     const bool lx = (g < B_CONST);
-    #pragma unroll
-    for (int u = 0; u < U; ++u) {
-        int col = (c_base + 4 * u) * 32;
-        if (lx) {
-            const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = xp[v];
-                xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
-                xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
-            }
-        } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[u][v] = 0;
-        }
-    }
+    const __half* xg = lx ? (x_h + (size_t)g * HIDDEN) : nullptr;
 
-    float best_val[B_CONST];
-    int32_t best_idx[B_CONST];
-    #pragma unroll
-    for (int b = 0; b < B_CONST; ++b) { best_val[b] = -1e30f; best_idx[b] = 0; }
+    const bool owns_epi = (tid < 16 * B_CONST);
+    const int epi_r = tid / B_CONST;
+    const int epi_b = tid % B_CONST;
+    float my_best_val = -1e30f;
+    int32_t my_best_idx = 0;
 
-    int n_tiles = (V + 15) / 16;
+    bool waited = false;
+    const int n_tiles = (V + 15) / 16;
     for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
-        int r0 = tile * 16;
-        int ra = r0 + g, rb = r0 + g + 8;
-        bool la = (ra < V), lb = (rb < V);
+        const int r0 = tile * 16;
+        const int ra = r0 + g, rb = r0 + g + 8;
+        const bool la = (ra < V), lb = (rb < V);
+        const uint8_t* wa = w_data + (size_t)(la ? ra : 0) * HIDDEN;
+        const uint8_t* wb = w_data + (size_t)(lb ? rb : 0) * HIDDEN;
 
         float d[4] = {0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            int c = c_base + 4 * u;
-            Fp8Chunk32 Ac, Bc;
-            if (la) Ac = load_fp8_chunk32(w_data + (size_t)ra * HIDDEN, c);
-            else { Ac.q0 = make_uint4(0, 0, 0, 0); Ac.q1 = make_uint4(0, 0, 0, 0); }
-            if (lb) Bc = load_fp8_chunk32(w_data + (size_t)rb * HIDDEN, c);
-            else { Bc.q0 = make_uint4(0, 0, 0, 0); Bc.q1 = make_uint4(0, 0, 0, 0); }
-            uint32_t dep = (Ac.q0.x ^ Ac.q1.w ^ Bc.q0.x ^ Bc.q1.w) & zero;
-            uint32_t a[16], b[16];
-            decode_fp8_chunk32_f16(Ac, a);
-            decode_fp8_chunk32_f16(Bc, b);
+        #pragma unroll 1
+        for (int jb = 0; jb < NJ; jb += U) {
+            uint4 A[U], B[U], X[U][2];
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
-                                     a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
-                                     xw[u][2 * i] ^ dep, xw[u][2 * i + 1],
-                                     d[0], d[1], d[2], d[3]);
+            for (int u = 0; u < U; ++u) {
+                int col = c0 + (jb + u) * SPAN;
+                A[u] = la ? ld_stream_u4(wa + col) : make_uint4(0, 0, 0, 0);
+                B[u] = lb ? ld_stream_u4(wb + col) : make_uint4(0, 0, 0, 0);
+            }
+            if (!waited) {
+                pdl_wait_fenced(zero);
+                waited = true;
+            }
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                int col = c0 + (jb + u) * SPAN;
+                X[u][0] = lx ? ld_dep_u4(xg + col)     : make_uint4(0, 0, 0, 0);
+                X[u][1] = lx ? ld_dep_u4(xg + col + 8) : make_uint4(0, 0, 0, 0);
+            }
+            uint32_t dep = 0u;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w ^ X[u][0].x;
+            dep &= zero;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w};
+                const uint32_t bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+                const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
+                                        X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(aw[s] & 0xFFFFu));
+                    __half2 a1 = cvt_e4m3x2_to_half2(uint16_t(aw[s] >> 16));
+                    __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(bw[s] & 0xFFFFu));
+                    __half2 b1 = cvt_e4m3x2_to_half2(uint16_t(bw[s] >> 16));
+                    mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                         *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                         *reinterpret_cast<uint32_t*>(&a1), *reinterpret_cast<uint32_t*>(&b1),
+                                         xw[2 * s] ^ dep, xw[2 * s + 1],
+                                         d[0], d[1], d[2], d[3]);
+                }
             }
         }
         cs[warp][g][2 * t]     = d[0];
@@ -1678,25 +1702,22 @@ lm_head_fp8_mma_stage1_kernel(
         cs[warp][g + 8][2 * t + 1] = d[3];
         __syncthreads();
 
-        if (tid < 16) {
-            int row = r0 + tid;
+        if (owns_epi) {
+            const int row = r0 + epi_r;
             if (row < V) {
-                float rscale = row_scales[row];
-                #pragma unroll
-                for (int b = 0; b < B_CONST; ++b) {
-                    float s = cs[0][tid][b] + cs[1][tid][b] + cs[2][tid][b]
-                            + cs[3][tid][b] + cs[4][tid][b] + cs[5][tid][b];
-                    float val = s * rscale;
-                    if (write_logits) {
-                        float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
-                        out_logits[(size_t)b * V + row] = cap_val;
-                        if (cap_val > best_val[b] || (cap_val == best_val[b] && row < best_idx[b])) {
-                            best_val[b] = cap_val; best_idx[b] = row;
-                        }
-                    } else {
-                        if (val > best_val[b] || (val == best_val[b] && row < best_idx[b])) {
-                            best_val[b] = val; best_idx[b] = row;
-                        }
+                const float rscale = __ldg(row_scales + row);
+                const float s = cs[0][epi_r][epi_b] + cs[1][epi_r][epi_b] + cs[2][epi_r][epi_b]
+                              + cs[3][epi_r][epi_b] + cs[4][epi_r][epi_b] + cs[5][epi_r][epi_b];
+                const float val = s * rscale;
+                if (write_logits) {
+                    const float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+                    out_logits[(size_t)epi_b * V + row] = cap_val;
+                    if (cap_val > my_best_val || (cap_val == my_best_val && row < my_best_idx)) {
+                        my_best_val = cap_val; my_best_idx = row;
+                    }
+                } else {
+                    if (val > my_best_val || (val == my_best_val && row < my_best_idx)) {
+                        my_best_val = val; my_best_idx = row;
                     }
                 }
             }
@@ -1704,23 +1725,28 @@ lm_head_fp8_mma_stage1_kernel(
         __syncthreads();
     }
 
+    if (!waited) pdl_wait_fenced(zero);
     pdl_trigger();
-    if (tid < 16) {
+
+    __shared__ float sm_bv[B_CONST][16];
+    __shared__ int32_t sm_bi[B_CONST][16];
+    if (owns_epi) {
+        sm_bv[epi_b][epi_r] = my_best_val;
+        sm_bi[epi_b][epi_r] = my_best_idx;
+    }
+    __syncthreads();
+    if (tid < B_CONST) {
+        const int b = tid;
+        float bv = sm_bv[b][0];
+        int32_t bi = sm_bi[b][0];
         #pragma unroll
-        for (int b = 0; b < B_CONST; ++b) {
-            float bv = best_val[b];
-            int32_t bi = best_idx[b];
-            #pragma unroll
-            for (int off = 8; off > 0; off >>= 1) {
-                float ov = __shfl_xor_sync(0xFFFFu, bv, off);
-                int32_t oi = __shfl_xor_sync(0xFFFFu, bi, off);
-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-            }
-            if (tid == 0) {
-                blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
-                blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
+        for (int r = 1; r < 16; ++r) {
+            if (sm_bv[b][r] > bv || (sm_bv[b][r] == bv && sm_bi[b][r] < bi)) {
+                bv = sm_bv[b][r]; bi = sm_bi[b][r];
             }
         }
+        blk_max_val[b * (int)gridDim.x + (int)blockIdx.x] = bv;
+        blk_max_idx[b * (int)gridDim.x + (int)blockIdx.x] = bi;
     }
 }
 
@@ -3327,9 +3353,13 @@ static void dispatch_lm_head(
     const int lm_blocks = get_lm_head_blocks();
     if (u.kind == WeightKind::NVFP4) {
         if constexpr (B_CONST >= 2) {
+            const int total_f4 = (B_CONST * HIDDEN) >> 2;
+            const __half* lm_xh = nullptr;
+            CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(const_cast<__half**>(&lm_xh)), g_lm_xh));
+            launch_pdl(lm_f32_to_f16_pdl_kernel, dim3((total_f4 + 255) / 256), 256, stream, x, total_f4);
             launch_pdl(lm_head_nvfp4_mma_stage1_kernel<B_CONST>, dim3(lm_blocks), 192, stream,
                 static_cast<const uint8_t*>(u.data), u.scales, u.global_scale,
-                x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
+                lm_xh, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
             launch_pdl(lm_head_stage1_kernel<B_CONST, 2>, dim3(lm_blocks), 256, stream,
                 u.data, u.scales, static_cast<const float*>(nullptr), u.global_scale,
@@ -3337,9 +3367,13 @@ static void dispatch_lm_head(
         }
     } else if (u.kind == WeightKind::FP8) {
         if constexpr (B_CONST >= 2) {
+            const int total_f4 = (B_CONST * HIDDEN) >> 2;
+            const __half* lm_xh = nullptr;
+            CUDA_CHECK(cudaGetSymbolAddress(reinterpret_cast<void**>(const_cast<__half**>(&lm_xh)), g_lm_xh));
+            launch_pdl(lm_f32_to_f16_pdl_kernel, dim3((total_f4 + 255) / 256), 256, stream, x, total_f4);
             launch_pdl(lm_head_fp8_mma_stage1_kernel<B_CONST>, dim3(lm_blocks), 192, stream,
                 static_cast<const uint8_t*>(u.data), u.row_scales,
-                x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
+                lm_xh, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
             launch_pdl(lm_head_stage1_kernel<B_CONST, 1>, dim3(lm_blocks), 256, stream,
                 u.data, static_cast<const uint8_t*>(nullptr), u.row_scales, 1.0f,

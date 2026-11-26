@@ -32,6 +32,7 @@ __global__ void embed_norm_kernel(
     int b = blockIdx.x;
     int tid = threadIdx.x; // 256 threads
     int tok = tokens[b];
+    if (tok < 0) tok = 0; // Synthetic negative image token IDs are overwritten immediately by inject_active_images
     const __nv_bfloat16* row = embed + (size_t)tok * HIDDEN;
     float sum_sq = 0.0f;
     for (int d = tid; d < HIDDEN; d += 256) {

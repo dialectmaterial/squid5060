@@ -660,6 +660,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 return 1;
             };
             cli_img_embeds = tiger.alloc_host_zeroed(f32, @as(usize, vision_mod.max_image_tokens) * constants.hidden_dim);
+            const probe_img = vision_mod.probe_image_bytes(img_bytes, vision_mod.max_image_tokens) orelse {
+                tiger.print_stderr("Failed to decode --image '{s}' (supported: PNG, JPEG)\n", .{image_path});
+                return 1;
+            };
             const enc_img = engine.encode_image(img_bytes, cli_img_embeds) orelse {
                 tiger.print_stderr("Failed to encode --image '{s}' (supported: PNG, JPEG)\n", .{image_path});
                 return 1;
@@ -676,7 +680,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const img_pos: u32 = @intCast(plen);
             var ki: u32 = 0;
             while (ki < enc_img.num_tokens and plen < prompt_ids_buf.len) : (ki += 1) {
-                prompt_ids_buf[plen] = vision_mod.image_token_id;
+                prompt_ids_buf[plen] = vision_mod.image_token_id_for(probe_img.hash, ki);
                 plen += 1;
             }
             plen += tokenizer.encode_into("<|end_message|><|message_user|><|content_text|>", true, &scratch, prompt_ids_buf[plen..]);
@@ -689,6 +693,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 .prompt_pos = img_pos,
                 .num_tokens = enc_img.num_tokens,
                 .embeds = cli_img_embeds[0 .. @as(usize, enc_img.num_tokens) * constants.hidden_dim],
+                .encoded = true,
             };
             engine.active_images = cli_img_spans[0..1];
         }

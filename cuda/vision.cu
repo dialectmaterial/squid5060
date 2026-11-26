@@ -536,8 +536,124 @@ static void vit_gemm_bf16(
 
 static size_t align256(size_t x) { return (x + 255u) & ~size_t(255u); }
 
+static uint64_t splitmix64_mix(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static uint64_t hash_image_bytes(const uint8_t* data, size_t len, int cap_cells) {
+    uint64_t h = splitmix64_mix((static_cast<uint64_t>(uint32_t(cap_cells)) << 32) ^ static_cast<uint64_t>(len) ^ 1ULL);
+    const uint8_t* p = data;
+    size_t n = len;
+    for (; n >= 8; p += 8, n -= 8) {
+        uint64_t word = 0;
+        std::memcpy(&word, p, 8);
+        h = splitmix64_mix(h + 0x9E3779B97F4A7C15ULL + word);
+    }
+    if (n > 0) {
+        uint64_t word = 0;
+        std::memcpy(&word, p, n);
+        h = splitmix64_mix(h + 0x9E3779B97F4A7C15ULL + word);
+    }
+    return splitmix64_mix(h ^ static_cast<uint64_t>(len));
+}
+
+static bool probe_png_dims(const uint8_t* data, size_t len, int& w, int& h) {
+    if (len < 24 || png_sig_cmp(data, 0, 8) != 0) return false;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) return false;
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, nullptr, nullptr);
+        return false;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        return false;
+    }
+    PngMemReader reader{data, len, 0};
+    png_set_read_fn(png, &reader, png_read_mem);
+    png_read_info(png, info);
+    png_uint_32 pw = 0, ph = 0;
+    int bit_depth = 0, color_type = 0;
+    png_get_IHDR(png, info, &pw, &ph, &bit_depth, &color_type, nullptr, nullptr, nullptr);
+    png_destroy_read_struct(&png, &info, nullptr);
+    if (pw == 0 || ph == 0 || pw > 16384 || ph > 16384) return false;
+    w = static_cast<int>(pw);
+    h = static_cast<int>(ph);
+    return true;
+}
+
+static bool probe_jpeg_dims(const uint8_t* data, size_t len, int& w, int& h) {
+    if (len < 3 || data[0] != 0xFF || data[1] != 0xD8) return false;
+    jpeg_decompress_struct cinfo{};
+    JpegErrMgr jerr{};
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_err_exit;
+    if (setjmp(jerr.jbuf)) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, data, static_cast<unsigned long>(len));
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    int pw = static_cast<int>(cinfo.image_width);
+    int ph = static_cast<int>(cinfo.image_height);
+    jpeg_destroy_decompress(&cinfo);
+    if (pw <= 0 || ph <= 0 || pw > 16384 || ph > 16384) return false;
+    w = pw;
+    h = ph;
+    return true;
+}
+
+static void compute_grid_dims(int w, int h, int cap_cells, int& nw, int& nh, int& cols, int& rows) {
+    nw = w;
+    nh = h;
+    cols = (w + VIT_CELL - 1) / VIT_CELL;
+    rows = (h + VIT_CELL - 1) / VIT_CELL;
+    if (cols * rows > cap_cells) {
+        double scale = std::sqrt(static_cast<double>(cap_cells) / static_cast<double>(cols * rows));
+        nw = std::max(1, static_cast<int>(std::floor(w * scale)));
+        nh = std::max(1, static_cast<int>(std::floor(h * scale)));
+        while (((nw + VIT_CELL - 1) / VIT_CELL) * ((nh + VIT_CELL - 1) / VIT_CELL) > cap_cells && (nw > VIT_CELL || nh > VIT_CELL)) {
+            nw = std::max(1, nw - 8);
+            nh = std::max(1, nh - 8);
+        }
+        cols = (nw + VIT_CELL - 1) / VIT_CELL;
+        rows = (nh + VIT_CELL - 1) / VIT_CELL;
+    }
+}
+
 } // namespace vision
 } // namespace squid
+
+extern "C" int32_t squid_vision_probe_image(
+    const uint8_t* img_bytes,
+    size_t img_len,
+    int32_t max_tokens,
+    int32_t* out_num_tokens,
+    int32_t* out_cols,
+    int32_t* out_rows,
+    uint64_t* out_hash) {
+    using namespace squid::vision;
+    if (!img_bytes || img_len < 8 || !out_num_tokens || !out_hash) return -1;
+    int w = 0, h = 0;
+    bool ok = probe_png_dims(img_bytes, img_len, w, h);
+    if (!ok) ok = probe_jpeg_dims(img_bytes, img_len, w, h);
+    if (!ok || w <= 0 || h <= 0) return -2;
+    const int cap_cells = (max_tokens > 0) ? std::min(max_tokens, 1024) : 1024;
+    int nw = 0, nh = 0, cols = 0, rows = 0;
+    compute_grid_dims(w, h, cap_cells, nw, nh, cols, rows);
+    *out_num_tokens = cols * rows;
+    if (out_cols) *out_cols = cols;
+    if (out_rows) *out_rows = rows;
+    *out_hash = hash_image_bytes(img_bytes, img_len, cap_cells);
+    return 0;
+}
 
 extern "C" int32_t squid_vision_encode_image(
     const uint8_t* img_bytes,
@@ -564,24 +680,15 @@ extern "C" int32_t squid_vision_encode_image(
     composite_rgba_to_rgb(rgba, w, h, rgb);
     rgba.clear();
 
-    int cap_cells = (max_tokens > 0) ? std::min(max_tokens, 1024) : 1024;
-    int cols = (w + VIT_CELL - 1) / VIT_CELL;
-    int rows = (h + VIT_CELL - 1) / VIT_CELL;
-    if (cols * rows > cap_cells) {
-        double scale = std::sqrt(static_cast<double>(cap_cells) / static_cast<double>(cols * rows));
-        int nw = std::max(1, static_cast<int>(std::floor(w * scale)));
-        int nh = std::max(1, static_cast<int>(std::floor(h * scale)));
-        while (((nw + VIT_CELL - 1) / VIT_CELL) * ((nh + VIT_CELL - 1) / VIT_CELL) > cap_cells && (nw > VIT_CELL || nh > VIT_CELL)) {
-            nw = std::max(1, nw - 8);
-            nh = std::max(1, nh - 8);
-        }
+    const int cap_cells = (max_tokens > 0) ? std::min(max_tokens, 1024) : 1024;
+    int nw = 0, nh = 0, cols = 0, rows = 0;
+    compute_grid_dims(w, h, cap_cells, nw, nh, cols, rows);
+    if (nw != w || nh != h) {
         RawBuf<uint8_t> resized;
         resize_rgb_bicubic(rgb, w, h, resized, nw, nh);
         rgb.swap(resized);
         w = nw;
         h = nh;
-        cols = (w + VIT_CELL - 1) / VIT_CELL;
-        rows = (h + VIT_CELL - 1) / VIT_CELL;
     }
 
     const int m = cols * rows;

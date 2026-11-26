@@ -16,6 +16,16 @@ pub const ImageSpan = struct {
     prompt_pos: u32 = 0,
     num_tokens: u32 = 0,
     embeds: []f32 = &.{}, // [num_tokens * constants.hidden_dim] FP32 host slice
+    raw_bytes: []const u8 = &.{}, // optional compressed PNG/JPEG bytes for lazy encoding after prefix-cache match
+    embed_slot: []f32 = &.{}, // backing buffer for lazy encoding
+    encoded: bool = false,
+};
+
+pub const ProbeResult = struct {
+    num_tokens: u32,
+    cols: u32,
+    rows: u32,
+    hash: u64,
 };
 
 pub const EncodeResult = struct {
@@ -23,6 +33,44 @@ pub const EncodeResult = struct {
     cols: u32,
     rows: u32,
 };
+
+fn splitmix64_mix(z_in: u64) u64 {
+    var z: u64 = (z_in ^ (z_in >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+/// Content-addressed negative synthetic token ID for visual tile `k` of an image with `hash`.
+/// Enables automatic 0 ms prefix-cache & parked-slot reuse across multi-turn vision chats.
+pub fn image_token_id_for(hash: u64, k: u32) i32 {
+    const v: u64 = splitmix64_mix(hash ^ ((@as(u64, k) +% 1) *% 0x9E3779B97F4A7C15)) >> 33;
+    return @intCast(-1 - @as(i64, @intCast(v)));
+}
+
+pub fn probe_image_bytes(img_bytes: []const u8, max_tokens: u32) ?ProbeResult {
+    if (img_bytes.len < 8) return null;
+    const cap_toks: u32 = @min(max_tokens, max_image_tokens);
+    var out_n: i32 = 0;
+    var out_c: i32 = 0;
+    var out_r: i32 = 0;
+    var out_h: u64 = 0;
+    const rc = cuda.squid_vision_probe_image(
+        img_bytes.ptr,
+        img_bytes.len,
+        @intCast(cap_toks),
+        &out_n,
+        &out_c,
+        &out_r,
+        &out_h,
+    );
+    if (rc != 0 or out_n <= 0) return null;
+    return .{
+        .num_tokens = @intCast(out_n),
+        .cols = @intCast(out_c),
+        .rows = @intCast(out_r),
+        .hash = out_h,
+    };
+}
 
 pub fn encode_image_bytes(
     model_dir: []const u8,

@@ -473,6 +473,16 @@ pub const CVisionWeightsHost = extern struct {
     proj_out_w: ?*const anyopaque = null,
 };
 
+pub extern "c" fn squid_vision_probe_image(
+    img_bytes: [*]const u8,
+    img_len: usize,
+    max_tokens: i32,
+    out_num_tokens: *i32,
+    out_cols: ?*i32,
+    out_rows: ?*i32,
+    out_hash: *u64,
+) i32;
+
 pub extern "c" fn squid_vision_encode_image(
     img_bytes: [*]const u8,
     img_len: usize,

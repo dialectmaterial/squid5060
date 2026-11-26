@@ -41,4 +41,8 @@ following open-source projects:
 5. LoopCD-Hidden (arXiv:2610.02185) & upstream tensorfish/squid5090 (Apache License 2.0)
    - Training-free looped hidden-state contrastive decoding (`--loopcd-omega`, `--loopcd-ref`),
      1-launch PDL Blackwell cluster decode attention, 128-CTA PDL multi-block stochastic sampler,
-     and native sm_120a block-scaled Tensor Core prefill MoE adapted for 8 GB RTX 5060 GPUs.
+     native sm_120a block-scaled Tensor Core prefill MoE, CUDA 13.4+ `L2::evict_first` streaming
+     weight hints, 3 KB SMEM L1-cached LM-head/DSpark MMA kernels, DSpark local TC Split-K
+     attention, embedded corpus-frequency 32K draft shortlist (`src/draft_shortlist.bin`),
+     post-`[DONE]` deferred checkpointing, and content-addressed negative synthetic image token
+     IDs adapted for 8 GB RTX 5060 GPUs.
