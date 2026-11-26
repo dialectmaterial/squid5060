@@ -63,6 +63,8 @@ pub fn build(b: *std.Build) void {
             "-mavx2",
             "-mfma",
             "-mf16c",
+            "-mavxvnni",
+            "-mwaitpkg",
             "-fno-exceptions",
             "-fno-rtti",
             "-std=c++20",

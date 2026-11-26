@@ -122,6 +122,7 @@ void launch_moe_gate_up_h(
     const CpuMoeDevState* cpu_state, // optional hybrid CPU skip mask
     __half* out_act_h,         // [B, TOP_K, INTERMEDIATE]
     int B,
+    bool is_loop_layer,
     cudaStream_t stream);
 
 // MoE Down + Weighted Top-K Reduction (reads half act!)
@@ -134,6 +135,7 @@ void launch_moe_down_h(
     const CpuMoeDevState* cpu_state, // optional hybrid CPU skip mask
     float* out_down,           // [B, HIDDEN]
     int B,
+    bool is_loop_layer,
     cudaStream_t stream,
     bool already_zeroed = false);
 
@@ -294,7 +296,7 @@ void launch_relative_attention_gated(
     int B, const int32_t* d_pos,
     cudaStream_t stream);
 
-// 64-block parallel half-warp NVFP4 MoE Router + Fused Top-8 & ExpertGroups + Free moe_down zeroing!
+// 64-block parallel half-warp NVFP4 MoE Router + Fused Top-8 & ExpertGroups + Optional Fused CPU MoE Dispatch!
 void launch_route_topk_nvfp4(
     const __half* m_h,            // [B, HIDDEN]
     const LinearWeight& router_nvfp4,
@@ -304,10 +306,14 @@ void launch_route_topk_nvfp4(
     float* out_weights,           // [B, TOP_K]
     ExpertGroups* groups,         // optional (filled when B > 1)
     float* moe_down_zero,         // optional (zeroed in parallel when B > 1!)
+    const int32_t* slot_map,      // optional (enables fused CPU MoE miss dispatch)
+    int layer_idx,
+    CpuMoeBell* cpu_bell,
+    CpuMoeDevState* cpu_state,
     int B,
     cudaStream_t stream);
 
-// Fused MoE Router (BF16): parallel 64-block GEMV [128, 2304] + Fused Top-8 & ExpertGroups!
+// Fused MoE Router (BF16): parallel 64-block GEMV [128, 2304] + Fused Top-8 & ExpertGroups + Optional CPU Dispatch!
 void launch_route_topk(
     const float* m,               // [B, HIDDEN]
     const __nv_bfloat16* router_w,// [128, HIDDEN]
@@ -317,6 +323,11 @@ void launch_route_topk(
     float* out_weights,           // [B, TOP_K]
     ExpertGroups* groups,         // optional (filled when B > 1)
     float* moe_down_zero,         // optional (zeroed in parallel when B > 1!)
+    const int32_t* slot_map,
+    int layer_idx,
+    const __half* x_h,
+    CpuMoeBell* cpu_bell,
+    CpuMoeDevState* cpu_state,
     int B,
     cudaStream_t stream);
 

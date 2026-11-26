@@ -1,5 +1,6 @@
 #include "kernels.hpp"
 #include "kernels_common.cuh"
+#include <cstdlib>
 
 namespace squid {
 
@@ -452,7 +453,18 @@ __global__ void dspark_swiglu_kernel(const float* __restrict__ gu, float* __rest
     if (out_h) out_h[idx] = __float2half(v);
 }
 
-// Coalesced 24-block Markov RNN projection:
+__device__ __forceinline__ bool markov_should_skip(
+    const float* __restrict__ conf_buf, int step_idx, float early_exit_thresh) {
+    if (conf_buf == nullptr || step_idx < 2 || early_exit_thresh <= 0.0f) return false;
+    float prod = 1.0f;
+    #pragma unroll
+    for (int k = 0; k < MTP_MAX_DRAFTS; ++k) {
+        if (k < step_idx) prod *= ld_dep_f32(conf_buf + k);
+    }
+    return prod < early_exit_thresh;
+}
+
+// Coalesced 24-block Markov RNN projection (PDL + exact early-exit):
 // raw[768] = rnn_bias + c_h[i] + c_f + rnn_w_sp @ [state; w1[prev_tok]]
 // Grid: 24 blocks, Block: 128 threads (4 warps/block -> 8 rows/warp = 768 rows, 100% coalesced uint4!)
 __global__ void __launch_bounds__(128)
@@ -464,10 +476,16 @@ markov_rnn_proj_kernel(
     const float* __restrict__ c_f,               // [768]
     const int32_t* __restrict__ prev_tok_ptr,    // [1]
     const float* __restrict__ state,             // [256]
+    const float* __restrict__ conf_buf,          // [7] optional (for early-exit)
+    int step_idx,
+    float early_exit_thresh,
     float* __restrict__ out_raw) {               // [768]
+    pdl_wait();
+    pdl_trigger();
+    if (markov_should_skip(conf_buf, step_idx, early_exit_thresh)) return;
     __shared__ float sp[512];
     int tid = threadIdx.x;
-    int prev_tok = *prev_tok_ptr;
+    int prev_tok = ld_dep_i32(prev_tok_ptr);
     const __nv_bfloat16* w1_row = markov_w1 + (size_t)prev_tok * MTP_MARKOV_RANK;
     sp[tid]       = state[tid];
     sp[128 + tid] = state[128 + tid];
@@ -713,6 +731,9 @@ markov_fold_argmax_stage1_kernel(
     const float* __restrict__ fold_b,      // optional [V]
     const float* __restrict__ raw_rnn,     // [768]: gate[0..255], cand[256..511], lat[512..767]
     float* __restrict__ state,             // [256] updated by block 0!
+    const float* __restrict__ conf_buf,
+    int step_idx,
+    float early_exit_thresh,
     float* __restrict__ blk_val,
     int32_t* __restrict__ blk_idx,
     float* __restrict__ blk_cm,
@@ -720,16 +741,19 @@ markov_fold_argmax_stage1_kernel(
     float* __restrict__ out_step_probs,
     const SampleConfig* __restrict__ sample_cfg,
     int V) {
+    pdl_wait();
+    pdl_trigger();
+    if (markov_should_skip(conf_buf, step_idx, early_exit_thresh)) return;
     const bool write_logits = (out_step_probs != nullptr) && (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f);
     __shared__ __half s_lh[256];
     __shared__ float s_lf[256];
     int tid = threadIdx.x;
-    float lat_v = fast_tanh(raw_rnn[512 + tid]);
+    float lat_v = fast_tanh(ld_dep_f32(raw_rnn + 512 + tid));
     s_lf[tid] = lat_v;
     s_lh[tid] = __float2half(lat_v);
     if (blockIdx.x == 0) {
-        float gate = fast_sigmoid(raw_rnn[tid]);
-        float cand = fast_tanh(raw_rnn[256 + tid]);
+        float gate = fast_sigmoid(ld_dep_f32(raw_rnn + tid));
+        float cand = fast_tanh(ld_dep_f32(raw_rnn + 256 + tid));
         state[tid] = gate * state[tid] + (1.0f - gate) * cand;
     }
     __syncthreads();
@@ -749,12 +773,12 @@ markov_fold_argmax_stage1_kernel(
     for (int row = gr; row < V; row += tr) {
         float acc = 0.0f;
         if constexpr (KIND == 2) {
-            // HALF-WARP: K = 256 -> 16 blocks of 16 -> 1 EXACT block per lane, 100% active!!
+            // HALF-WARP: K = 256 -> 16 blocks of 16 -> 1 EXACT block per lane, streaming L2::evict_first!
             const uint2* wr = reinterpret_cast<const uint2*>(
                 static_cast<const uint8_t*>(fold_data) + (size_t)row * 128);
             const uint8_t* sr = fold_scales + (size_t)row * 16;
-            uint2 w8 = __ldg(wr + lane);
-            float sc = cvt_e4m3_to_float(__ldg(sr + lane));
+            uint2 w8 = ld_stream_u2(wr + lane);
+            float sc = cvt_e4m3_to_float(ld_scale_u8(sr + lane));
             const __half2* xh = reinterpret_cast<const __half2*>(s_lh + (lane << 4));
             acc = half_warp_sum(nvfp4_block16_dot(w8, xh) * sc) * fold_gscale;
         } else {
@@ -817,7 +841,8 @@ __global__ void markov_fold_argmax_stage2_kernel(
     const float* __restrict__ blk_csum,
     const int32_t* __restrict__ draft_vocab_ids, // optional remap to real vocab ID
     int32_t* __restrict__ out_tok,
-    float* __restrict__ out_conf,
+    float* __restrict__ conf_buf,                // base pointer to out_draft_conf[0..6] (or nullptr)
+    float early_exit_thresh,
     float* __restrict__ out_step_probs,
     float* __restrict__ out_q_sel,
     int32_t* __restrict__ d_draft_is_delta,
@@ -826,6 +851,17 @@ __global__ void markov_fold_argmax_stage2_kernel(
     int step_idx,
     int V,
     int n_blocks) {
+    pdl_wait();
+    pdl_trigger();
+    if (markov_should_skip(conf_buf, step_idx, early_exit_thresh)) {
+        if (threadIdx.x == 0) {
+            *out_tok = 0;
+            if (conf_buf) conf_buf[step_idx] = 0.0f;
+            if (out_q_sel) *out_q_sel = 0.0f;
+        }
+        return;
+    }
+    float* out_conf = conf_buf ? (conf_buf + step_idx) : nullptr;
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
@@ -1216,32 +1252,69 @@ void launch_dspark_draft(
         launch_linear(dw.unembed_draft, normed, base_logits, num_drafts, false, stream);
     }
 
-    // 6. Run num_drafts sequential Markov steps (24-block coalesced RNN + half-warp fused argmax + exact confidence!)
+    // 6. Run num_drafts sequential Markov steps (PDL + L2::evict_first + exact adaptive early-exit!)
+    float early_exit_thresh = 0.05f;
+    if (const char* ev = std::getenv("SQUID_MARKOV_EARLY_EXIT")) {
+        if (ev[0] == '0') early_exit_thresh = 0.0f;
+        else {
+            float v = std::strtof(ev, nullptr);
+            if (v > 0.0f && v < 0.5f) early_exit_thresh = v;
+        }
+    }
+    if (out_draft_conf == nullptr) early_exit_thresh = 0.0f; // never early-exit in fixed-width mode!
+    bool use_markov_pdl = true;
+    if (const char* ev = std::getenv("SQUID_MARKOV_PDL")) {
+        if (ev[0] == '0') use_markov_pdl = false;
+    }
+
     const float* fb_arg = fold_b_in_base ? nullptr : dw.fold_b;
     for (int i = 0; i < num_drafts; ++i) {
         const int32_t* prev_ptr = (i == 0) ? d_anchor_token : (out_draft_tokens + i - 1);
-        markov_rnn_proj_kernel<<<24, 128, 0, stream>>>(
-            dw.rnn_w_sp, dw.rnn_bias, dw.markov_w1,
-            c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state, raw_rnn);
-
         const float* bl_i = base_logits + (size_t)i * Vd;
         float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * Vd) : nullptr;
-        if (dw.fold_w.kind == WeightKind::NVFP4) {
-            markov_fold_argmax_stage1_kernel<2><<<markov_blocks, 256, 0, stream>>>(
-                dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
-                dp_i, sample_cfg, Vd);
+        if (use_markov_pdl) {
+            launch_pdl(markov_rnn_proj_kernel, dim3(24), 128, stream,
+                dw.rnn_w_sp, dw.rnn_bias, dw.markov_w1,
+                c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state,
+                out_draft_conf, i, early_exit_thresh, raw_rnn);
+            if (dw.fold_w.kind == WeightKind::NVFP4) {
+                launch_pdl(markov_fold_argmax_stage1_kernel<2>, dim3(markov_blocks), 256, stream,
+                    dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
+                    bl_i, fb_arg, raw_rnn, state, out_draft_conf, i, early_exit_thresh,
+                    blk_val, blk_idx, blk_cm, blk_csum, dp_i, sample_cfg, Vd);
+            } else {
+                launch_pdl(markov_fold_argmax_stage1_kernel<0>, dim3(markov_blocks), 256, stream,
+                    dw.fold_w.data, static_cast<const uint8_t*>(nullptr), 1.0f,
+                    bl_i, fb_arg, raw_rnn, state, out_draft_conf, i, early_exit_thresh,
+                    blk_val, blk_idx, blk_cm, blk_csum, dp_i, sample_cfg, Vd);
+            }
+            launch_pdl(markov_fold_argmax_stage2_kernel, dim3(1), 256, stream,
+                blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
+                out_draft_tokens + i, out_draft_conf, early_exit_thresh,
+                dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
+                sample_cfg, d_pos, i, Vd, markov_blocks);
         } else {
-            markov_fold_argmax_stage1_kernel<0><<<markov_blocks, 256, 0, stream>>>(
-                dw.fold_w.data, nullptr, 1.0f,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
-                dp_i, sample_cfg, Vd);
+            markov_rnn_proj_kernel<<<24, 128, 0, stream>>>(
+                dw.rnn_w_sp, dw.rnn_bias, dw.markov_w1,
+                c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state,
+                out_draft_conf, i, early_exit_thresh, raw_rnn);
+            if (dw.fold_w.kind == WeightKind::NVFP4) {
+                markov_fold_argmax_stage1_kernel<2><<<markov_blocks, 256, 0, stream>>>(
+                    dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
+                    bl_i, fb_arg, raw_rnn, state, out_draft_conf, i, early_exit_thresh,
+                    blk_val, blk_idx, blk_cm, blk_csum, dp_i, sample_cfg, Vd);
+            } else {
+                markov_fold_argmax_stage1_kernel<0><<<markov_blocks, 256, 0, stream>>>(
+                    dw.fold_w.data, nullptr, 1.0f,
+                    bl_i, fb_arg, raw_rnn, state, out_draft_conf, i, early_exit_thresh,
+                    blk_val, blk_idx, blk_cm, blk_csum, dp_i, sample_cfg, Vd);
+            }
+            markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
+                blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
+                out_draft_tokens + i, out_draft_conf, early_exit_thresh,
+                dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
+                sample_cfg, d_pos, i, Vd, markov_blocks);
         }
-        markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
-            blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
-            out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr,
-            dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
-            sample_cfg, d_pos, i, Vd, markov_blocks);
     }
 }
 

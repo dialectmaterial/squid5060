@@ -226,6 +226,8 @@ pub const Engine = struct {
     cpu_moe_pool: ?*anyopaque = null,
     prefill_batch_cap: u32 = prefill_batch_max,
     prefill_tail_slots: u32 = 0,
+    prefill_bound_cap: u32 = 0,
+    prefill_dyn_tail: bool = true,
     prefill_aliased: bool = false,
     share_loop_kv: bool = false,
     active_images: []vision_mod.ImageSpan = &.{},
@@ -609,6 +611,10 @@ pub const Engine = struct {
             }
             self.prefill_batch_cap = chosen_pb;
             self.prefill_tail_slots = chosen_slots;
+            self.prefill_bound_cap = 0;
+            if (tiger.getenv("SQUID_PREFILL_DYN_TAIL")) |ev| {
+                self.prefill_dyn_tail = !(ev[0] == '0');
+            }
             tiger.print_stdout(
                 "[engine] Prefill-scratch tail aliasing: pb={d} borrows {d} tail slots ({d:.1} MiB) during prefill -> 0.0 MiB permanent overhead in decode!\n",
                 .{ chosen_pb, chosen_slots, @as(f64, @floatFromInt(@as(u64, chosen_slots) * slot_bytes)) / (1024.0 * 1024.0) },
@@ -628,32 +634,60 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_host_get_device_pointer(&self.d_cpu_bell, self.h_cpu_bell.?));
         tiger.assert(self.d_cpu_bell != null);
 
-        var num_threads: i32 = 0; // auto (8-10 on hybrid CPUs)
+        var num_threads: i32 = 0; // auto (up to 12 ring-resident P/E cores)
         if (tiger.getenv("SQUID_CPU_MOE_THREADS")) |env_t| {
             num_threads = std.fmt.parseInt(i32, std.mem.span(env_t), 10) catch 0;
         }
-        var split_num: u32 = 1;
+        var split_num: u32 = 2;
         var split_round: u32 = 1;
-        var split_den: u32 = 2;
+        var split_den: u32 = 3;
+        var hit_w1_q8: u32 = 24; // ~0.094 VRAM-hit weight for B=1 cost-balanced split
+        var hit_wn_q8: u32 = 32; // ~0.125 VRAM-hit weight for B>=2 cost-balanced split (re-tuned for Phase 2 TC MoE)
         if (tiger.getenv("SQUID_CPU_MOE_SPLIT")) |env_s| {
             const s = std.mem.span(env_s);
             if (std.mem.eql(u8, s, "all") or std.mem.eql(u8, s, "1/1")) {
                 split_num = 1;
                 split_round = 0;
                 split_den = 1;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
+            } else if (std.mem.eql(u8, s, "4/5")) {
+                split_num = 4;
+                split_round = 2;
+                split_den = 5;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
             } else if (std.mem.eql(u8, s, "3/4")) {
                 split_num = 3;
                 split_round = 2;
                 split_den = 4;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
+            } else if (std.mem.eql(u8, s, "2/3")) {
+                split_num = 2;
+                split_round = 1;
+                split_den = 3;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
             } else if (std.mem.eql(u8, s, "1/2")) {
                 split_num = 1;
                 split_round = 1;
                 split_den = 2;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
             } else if (std.mem.eql(u8, s, "1/3")) {
                 split_num = 1;
                 split_round = 1;
                 split_den = 3;
+                hit_w1_q8 = 0;
+                hit_wn_q8 = 0;
             }
+        }
+        if (tiger.getenv("SQUID_CPU_MOE_HIT_W1")) |env_w1| {
+            hit_w1_q8 = std.fmt.parseInt(u32, std.mem.span(env_w1), 10) catch hit_w1_q8;
+        }
+        if (tiger.getenv("SQUID_CPU_MOE_HIT_WN")) |env_wn| {
+            hit_wn_q8 = std.fmt.parseInt(u32, std.mem.span(env_wn), 10) catch hit_wn_q8;
         }
         var max_batch: u32 = 8;
         if (tiger.getenv("SQUID_CPU_MOE_MAX_B")) |env_b| {
@@ -671,6 +705,8 @@ pub const Engine = struct {
             .split_den = split_den,
             .max_batch = max_batch,
             .skip_mask = 0,
+            .hit_weight_b1_q8 = hit_w1_q8,
+            .hit_weight_bn_q8 = hit_wn_q8,
         };
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(self.d_cpu_state.?, @ptrCast(&self.cpu_moe_cfg), @sizeOf(cuda.CCpuMoeDevState)));
 
@@ -687,8 +723,8 @@ pub const Engine = struct {
         );
         tiger.assert(self.cpu_moe_pool != null);
         tiger.print_stdout(
-            "[cpu-moe] Hybrid AVX2 FP32-NVFP4 miss executor enabled (threads={d}, split={d}/{d}, max_B={d}, bell={d:.1} KiB)\n",
-            .{ num_threads, split_num, split_den, max_batch, @as(f64, @floatFromInt(bell_bytes)) / 1024.0 },
+            "[cpu-moe] Hybrid AVX-VNNI/FP32-NVFP4 miss executor enabled (threads={d}, split={d}/{d}, hit_w={d}/{d}, max_B={d}, bell={d:.1} KiB)\n",
+            .{ num_threads, split_num, split_den, hit_w1_q8, hit_wn_q8, max_batch, @as(f64, @floatFromInt(bell_bytes)) / 1024.0 },
         );
     }
 
@@ -876,7 +912,8 @@ pub const Engine = struct {
             borrowed = true;
         }
         defer if (borrowed) {
-            self.expert_cache.release_prefill_scratch(self.stream, true);
+            self.expert_cache.release_prefill_scratch_and_refill(w, self.stream, true);
+            self.prefill_bound_cap = 0;
         };
         return vision_mod.encode_image_bytes(
             w.model_dir(),
@@ -1629,9 +1666,10 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
 
-        // Phase 2A: immediately return borrowed prefill-scratch tail slots to decode's free list!
+        // Phase 3: immediately return borrowed prefill-scratch tail slots AND bulk-DMA-refill hottest LRFU experts!
         if (self.prefill_aliased and self.expert_cache.prefill_reserved_tail > 0) {
-            self.expert_cache.release_prefill_scratch(self.stream, true);
+            self.expert_cache.release_prefill_scratch_and_refill(self.weights.?, self.stream, true);
+            self.prefill_bound_cap = 0;
         }
 
         // Update session tokens & save prefill_end checkpoint (Slot 2) BEFORE decode overwrites rings/local KV!
@@ -1768,7 +1806,7 @@ pub const Engine = struct {
 
                 const n_acc_i32: i32 = self.h_num_accepted.?.*;
                 const chosen_w_i32: i32 = if (lookup_hit) constants.mtp_block_size_max else self.h_chosen_width.?.*;
-                tiger.assert(chosen_w_i32 == 1 or chosen_w_i32 == 2 or chosen_w_i32 == 4 or chosen_w_i32 == 8);
+                tiger.assert(chosen_w_i32 == 1 or chosen_w_i32 == 2 or chosen_w_i32 == 3 or chosen_w_i32 == 4 or chosen_w_i32 == 8);
                 tiger.assert(n_acc_i32 >= 1 and n_acc_i32 <= chosen_w_i32);
                 const n_acc: u32 = @intCast(n_acc_i32);
                 self.expert_cache.process_decode_step(w, n_acc, self.stream);
@@ -1820,6 +1858,11 @@ pub const Engine = struct {
                 } else {
                     const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
                     const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
+                    const prof_draft: bool = (tiger.getenv("SQUID_PROF_DECODE") != null);
+                    const t_d0: u64 = if (prof_draft) blk: {
+                        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                        break :blk tiger.clock_monotonic_ns();
+                    } else 0;
                     cuda.squid_launch_dspark_draft(
                         w.embed.?,
                         w.embed_norm.?,
@@ -1844,6 +1887,11 @@ pub const Engine = struct {
                         self.d_draft_is_delta,
                         self.stream,
                     );
+                    if (prof_draft) {
+                        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                        const t_d1 = tiger.clock_monotonic_ns();
+                        tiger.print_stdout("[prof-draft] K={d} pos={d} | draft={d:.2}ms\n", .{ num_drafts, self.current_position, @as(f64, @floatFromInt(t_d1 - t_d0)) / 1e6 });
+                    }
                     cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
                     self.expert_cache.record_zero_touches(self.stream);
                     self.record_target_forward(batch, true, true, true, true);
@@ -2032,9 +2080,31 @@ pub const Engine = struct {
     fn prefill_chunk_batched(self: *Engine, prompt: []const i32, start_i: u32, chunk_len: u32, commit_dspark: bool, compute_last_lm: bool) void {
         tiger.assert(chunk_len >= 1 and chunk_len <= self.prefill_batch_cap);
         const w = self.weights.?;
-        if (self.prefill_aliased and self.expert_cache.prefill_reserved_tail == 0) {
-            const tail_base = self.expert_cache.acquire_prefill_scratch(self.prefill_tail_slots, self.stream);
-            self.bind_prefill_scratch_from_base(tail_base, self.prefill_batch_cap);
+        if (self.prefill_aliased) {
+            var eff_pb: u32 = self.prefill_batch_cap;
+            if (self.prefill_dyn_tail) {
+                if (chunk_len <= 128 and 128 <= self.prefill_batch_cap) {
+                    eff_pb = 128;
+                } else if (chunk_len <= 256 and 256 <= self.prefill_batch_cap) {
+                    eff_pb = 256;
+                } else if (chunk_len <= 512 and 512 <= self.prefill_batch_cap) {
+                    eff_pb = 512;
+                }
+            }
+            if (self.expert_cache.prefill_reserved_tail > 0 and chunk_len > self.prefill_bound_cap) {
+                self.expert_cache.release_prefill_scratch(self.stream, false);
+                self.prefill_bound_cap = 0;
+            }
+            if (self.expert_cache.prefill_reserved_tail == 0) {
+                const slot_bytes: u64 = constants.expert_slot_bytes;
+                const need_bytes: u64 = compute_prefill_scratch_bytes(eff_pb);
+                const need_slots: u32 = @min(self.prefill_tail_slots, @as(u32, @intCast((need_bytes + slot_bytes - 1) / slot_bytes)));
+                const tail_base = self.expert_cache.acquire_prefill_scratch(need_slots, self.stream);
+                self.bind_prefill_scratch_from_base(tail_base, eff_pb);
+                self.prefill_bound_cap = eff_pb;
+            } else {
+                self.expert_cache.flush_async(self.stream);
+            }
         } else {
             self.expert_cache.flush_async(self.stream);
         }
@@ -2872,10 +2942,59 @@ pub const Engine = struct {
         const moe_slotted: u8 = if (self.expert_cache.enabled) 1 else 0;
         const moe_out_ptr: [*]f32 = if (moe_slotted != 0) self.moe_slot_out else self.moe_down;
 
+        const prof_dec: bool = (!self.use_graphs and compute_lm_head and tiger.getenv("SQUID_PROF_DECODE") != null);
+        // Zero-host-sync GPU hardware event profiler (preserves full PDL & CPU-GPU overlap!)
+        const ProfEvents = struct {
+            ev: [512]?*anyopaque = @splat(null),
+            tag: [512]u8 = @splat(0),
+            n: usize = 0,
+            fn start(p: *@This(), stream: ?*anyopaque) void {
+                var e: ?*anyopaque = null;
+                tiger.assert_cuda(cuda.squid_cuda_event_create(&e, 0));
+                tiger.assert_cuda(cuda.squid_cuda_event_record(e, stream));
+                p.ev[0] = e;
+                p.n = 1;
+            }
+            fn mark(p: *@This(), stream: ?*anyopaque, stage: u8) void {
+                if (p.n >= p.ev.len) return;
+                var e: ?*anyopaque = null;
+                tiger.assert_cuda(cuda.squid_cuda_event_create(&e, 0));
+                tiger.assert_cuda(cuda.squid_cuda_event_record(e, stream));
+                p.ev[p.n] = e;
+                p.tag[p.n] = stage;
+                p.n += 1;
+            }
+            fn finish(p: *@This(), stream: ?*anyopaque, b_sz: i32, pos: i32) void {
+                tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
+                var ms: [12]f64 = @splat(0.0);
+                var i: usize = 1;
+                while (i < p.n) : (i += 1) {
+                    var dt: f32 = 0.0;
+                    tiger.assert_cuda(cuda.squid_cuda_event_elapsed_ms(&dt, p.ev[i - 1], p.ev[i]));
+                    if (dt > 0.0) ms[p.tag[i]] += @floatCast(dt);
+                }
+                var tot: f32 = 0.0;
+                if (p.n >= 2) {
+                    tiger.assert_cuda(cuda.squid_cuda_event_elapsed_ms(&tot, p.ev[0], p.ev[p.n - 1]));
+                }
+                i = 0;
+                while (i < p.n) : (i += 1) {
+                    if (p.ev[i]) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
+                }
+                tiger.print_stdout(
+                    "[prof-dec] B={d} pos={d} | tot={d:.2}ms | emb={d:.2} ctrl={d:.2} dense={d:.2} aloc={d:.2} aglob={d:.2} rtr={d:.2} cdisp={d:.2} mgu={d:.2} mdn={d:.2} cmerge={d:.2} dscmt={d:.2} lm={d:.2}\n",
+                    .{ b_sz, pos, tot, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8], ms[9], ms[10], ms[11] },
+                );
+            }
+        };
+        var pe: ProfEvents = .{};
+        if (prof_dec) pe.start(self.stream);
+
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
         if (self.active_images.len > 0 and self.prefill_cur_prompt_pos != std.math.maxInt(u32)) {
             self.inject_active_images(self.hidden, self.prefill_cur_prompt_pos, @intCast(batch_size));
         }
+        if (prof_dec) pe.mark(self.stream, 0);
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -3072,6 +3191,7 @@ pub const Engine = struct {
             const in_kh = if (distinct_inputs) self.attn_in_h[1] else self.attn_in_h[0];
             const in_vh = if (distinct_inputs) self.attn_in_h[2] else self.attn_in_h[0];
 
+            if (prof_dec) pe.mark(self.stream, 1);
             if (lw.w_qrgs.kind != @intFromEnum(constants.WeightKind.bf16)) {
                 cuda.squid_launch_qkvrg_fused(&lw.w_qrgs, &lw.w_k, &lw.w_v, in_qh, in_kh, in_vh, self.qrgs, self.k_proj, self.v_proj, batch_size, self.stream);
             } else {
@@ -3079,6 +3199,7 @@ pub const Engine = struct {
                 cuda.squid_launch_linear(&lw.w_k, in_k, self.k_proj, batch_size, 0, self.stream);
                 cuda.squid_launch_linear(&lw.w_v, in_v, self.v_proj, batch_size, 0, self.stream);
             }
+            if (prof_dec) pe.mark(self.stream, 2);
 
             const share_bulk: bool = v.is_global and self.share_loop_kv and is_shared_loop_global_visit(vi);
             const bulk_vi: u32 = shared_bulk_visit_idx(vi);
@@ -3116,12 +3237,14 @@ pub const Engine = struct {
                 self.d_pos,
                 self.stream,
             );
+            if (prof_dec) pe.mark(self.stream, if (v.is_global) 4 else 3);
 
             if (use_half_dense) {
                 cuda.squid_launch_linear_h(&lw.w_o, self.attn_gated_h, self.o_proj, batch_size, 0, self.stream);
             } else {
                 cuda.squid_launch_linear(&lw.w_o, self.attn_gated, self.o_proj, batch_size, 0, self.stream);
             }
+            if (prof_dec) pe.mark(self.stream, 2);
 
             const is_boundary: bool = (l % constants.block_layer_count == 0);
             const attn_abl = ablation_slice(w, false, vi);
@@ -3163,7 +3286,11 @@ pub const Engine = struct {
                 }
             }
 
+            if (prof_dec) pe.mark(self.stream, 1);
             const route_groups: ?*anyopaque = if (self.expert_cache.enabled and batch_size > 1) self.exp_groups else null;
+            const active_cpu_state: ?*anyopaque = if (use_cpu_moe and self.cpu_moe_pool != null and self.expert_cache.enabled) self.d_cpu_state else null;
+            const fused_slot_map: ?[*]const i32 = if (active_cpu_state != null) lw.w13.slot_map else null;
+            const fused_bell: ?*anyopaque = if (active_cpu_state != null) self.d_cpu_bell else null;
             if (w.mode == .nvfp4) {
                 cuda.squid_launch_route_topk_nvfp4(
                     self.mlp_normed_h,
@@ -3173,6 +3300,10 @@ pub const Engine = struct {
                     self.route_ids,
                     self.route_w,
                     route_groups,
+                    fused_slot_map,
+                    @intCast(l),
+                    fused_bell,
+                    active_cpu_state,
                     batch_size,
                     self.stream,
                 );
@@ -3185,29 +3316,24 @@ pub const Engine = struct {
                     self.route_ids,
                     self.route_w,
                     route_groups,
-                    batch_size,
-                    self.stream,
-                );
-            }
-            const active_cpu_state: ?*anyopaque = if (use_cpu_moe and self.cpu_moe_pool != null and self.expert_cache.enabled) self.d_cpu_state else null;
-            if (active_cpu_state != null) {
-                cuda.squid_launch_moe_cpu_dispatch(
-                    &lw.w13,
+                    fused_slot_map,
                     @intCast(l),
                     self.mlp_normed_h,
-                    self.route_ids,
-                    self.route_w,
-                    if (batch_size > 1) self.exp_groups else null,
-                    self.d_cpu_bell,
+                    fused_bell,
                     active_cpu_state,
                     batch_size,
                     self.stream,
                 );
             }
-            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, active_cpu_state, self.moe_act_h, batch_size, self.stream);
-            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, active_cpu_state, moe_out_ptr, batch_size, self.stream);
+            if (prof_dec) pe.mark(self.stream, 5);
+            const is_loop_u8: u8 = if (v.is_loop) 1 else 0;
+            cuda.squid_launch_moe_gate_up_h(&lw.w13, self.mlp_normed_h, self.route_ids, self.exp_groups, active_cpu_state, self.moe_act_h, batch_size, is_loop_u8, self.stream);
+            if (prof_dec) pe.mark(self.stream, 7);
+            cuda.squid_launch_moe_down_h(&lw.w2, self.moe_act_h, self.route_ids, self.route_w, self.exp_groups, active_cpu_state, moe_out_ptr, batch_size, is_loop_u8, self.stream);
+            if (prof_dec) pe.mark(self.stream, 8);
             if (active_cpu_state != null) {
                 cuda.squid_launch_moe_cpu_merge(self.d_cpu_bell, active_cpu_state, moe_out_ptr, self.stream);
+                if (prof_dec) pe.mark(self.stream, 9);
             }
 
             if (vi == 17 or vi == 29) {
@@ -3270,27 +3396,48 @@ pub const Engine = struct {
         );
 
         // Overlap dspark_commit on aux_stream concurrently with lm_head_argmax on stream!
+        if (prof_dec) pe.mark(self.stream, 1);
         if (compute_lm_head) {
             if (commit_dspark) {
-                tiger.assert_cuda(cuda.squid_cuda_event_record(self.fork_event, self.stream));
-                tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.aux_stream, self.fork_event));
-                cuda.squid_launch_dspark_commit(
-                    &w.dspark,
-                    self.taps,
-                    &self.ds_k_cache,
-                    &self.ds_v_cache,
-                    &self.ds_k_scale,
-                    &self.ds_v_scale,
-                    &self.ds_kv_cap,
-                    @intFromEnum(self.kv_format),
-                    self.ds_f_ring.?,
-                    self.ds_mix,
-                    self.ds_kv,
-                    batch_size,
-                    self.d_pos,
-                    self.aux_stream,
-                );
-                tiger.assert_cuda(cuda.squid_cuda_event_record(self.join_event, self.aux_stream));
+                if (prof_dec) {
+                    cuda.squid_launch_dspark_commit(
+                        &w.dspark,
+                        self.taps,
+                        &self.ds_k_cache,
+                        &self.ds_v_cache,
+                        &self.ds_k_scale,
+                        &self.ds_v_scale,
+                        &self.ds_kv_cap,
+                        @intFromEnum(self.kv_format),
+                        self.ds_f_ring.?,
+                        self.ds_mix,
+                        self.ds_kv,
+                        batch_size,
+                        self.d_pos,
+                        self.stream,
+                    );
+                    pe.mark(self.stream, 10);
+                } else {
+                    tiger.assert_cuda(cuda.squid_cuda_event_record(self.fork_event, self.stream));
+                    tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.aux_stream, self.fork_event));
+                    cuda.squid_launch_dspark_commit(
+                        &w.dspark,
+                        self.taps,
+                        &self.ds_k_cache,
+                        &self.ds_v_cache,
+                        &self.ds_k_scale,
+                        &self.ds_v_scale,
+                        &self.ds_kv_cap,
+                        @intFromEnum(self.kv_format),
+                        self.ds_f_ring.?,
+                        self.ds_mix,
+                        self.ds_kv,
+                        batch_size,
+                        self.d_pos,
+                        self.aux_stream,
+                    );
+                    tiger.assert_cuda(cuda.squid_cuda_event_record(self.join_event, self.aux_stream));
+                }
             }
             cuda.squid_launch_lm_head_argmax(
                 &w.unembed,
@@ -3310,8 +3457,12 @@ pub const Engine = struct {
                 batch_size,
                 self.stream,
             );
-            if (commit_dspark) {
+            if (commit_dspark and !prof_dec) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.stream, self.join_event));
+            }
+            if (prof_dec) {
+                pe.mark(self.stream, 11);
+                pe.finish(self.stream, batch_size, self.current_position);
             }
         } else if (commit_dspark) {
             cuda.squid_launch_dspark_commit(
@@ -3465,7 +3616,7 @@ pub const Engine = struct {
             self.stream,
             &self.adaptive_graph,
         ));
-        const widths = [_]i32{ 1, 2, 4, 8 };
+        const widths = [_]i32{ 1, 2, 3, 4, 8 };
         for (widths, 0..) |width, bidx| {
             tiger.assert_cuda(cuda.squid_adaptive_graph_branch_begin(self.adaptive_graph, @intCast(bidx), self.stream));
             self.expert_cache.record_zero_touches(self.stream);

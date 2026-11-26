@@ -767,6 +767,7 @@ fn handle_chat_completions(
     var req_model: []const u8 = config.model_name;
     var effort_buf: [32]u8 = undefined;
     var effort: []const u8 = config.default_effort;
+    var has_top_effort: bool = false;
     var max_tokens: i32 = 16384;
     var has_max_completion_tokens: bool = false;
     var req_temp: f32 = config.default_temperature;
@@ -779,6 +780,7 @@ fn handle_chat_completions(
     var stream: bool = false;
     var include_usage: bool = false;
     var enable_thinking: bool = true;
+    var has_top_enable_thinking: bool = false;
     var req_mtp: i32 = @intCast(config.default_mtp);
     var stops: StopList = .{};
     var key_buf: [128]u8 = undefined;
@@ -811,7 +813,10 @@ fn handle_chat_completions(
             if (tokenizer_mod.parse_json_string(body, &pos, &req_model_buf)) |ms| req_model = ms else tokenizer_mod.skip_json_value(body, &pos);
         } else if (std.mem.eql(u8, k, "reasoning_effort")) {
             if (pos < body.len and body[pos] == '"') {
-                if (tokenizer_mod.parse_json_string(body, &pos, &effort_buf)) |es| effort = es;
+                if (tokenizer_mod.parse_json_string(body, &pos, &effort_buf)) |es| {
+                    effort = es;
+                    has_top_effort = true;
+                }
             } else {
                 const start = pos;
                 tokenizer_mod.skip_json_value(body, &pos);
@@ -819,6 +824,31 @@ fn handle_chat_completions(
                 if (raw_num.len > 0 and raw_num.len <= effort_buf.len and !std.mem.eql(u8, raw_num, "null")) {
                     @memcpy(effort_buf[0..raw_num.len], raw_num);
                     effort = effort_buf[0..raw_num.len];
+                    has_top_effort = true;
+                }
+            }
+        } else if (std.mem.eql(u8, k, "chat_template_kwargs")) {
+            const start = pos;
+            tokenizer_mod.skip_json_value(body, &pos);
+            const ctk = body[start..pos];
+            if (!has_top_effort) {
+                if (extract_raw_field(ctk, "reasoning_effort")) |raw_e| {
+                    if (raw_e.len > 0 and raw_e[0] == '"') {
+                        var ep: usize = 0;
+                        if (tokenizer_mod.parse_json_string(raw_e, &ep, &effort_buf)) |es| effort = es;
+                    } else {
+                        const raw_num = trim_ascii_ws(raw_e);
+                        if (raw_num.len > 0 and raw_num.len <= effort_buf.len and !std.mem.eql(u8, raw_num, "null")) {
+                            @memcpy(effort_buf[0..raw_num.len], raw_num);
+                            effort = effort_buf[0..raw_num.len];
+                        }
+                    }
+                }
+            }
+            if (!has_top_enable_thinking) {
+                if (extract_raw_field(ctk, "enable_thinking")) |raw_et| {
+                    var tp: usize = 0;
+                    if (parse_json_bool_opt(raw_et, &tp)) |b| enable_thinking = b;
                 }
             }
         } else if (std.mem.eql(u8, k, "max_completion_tokens")) {
@@ -844,7 +874,10 @@ fn handle_chat_completions(
         } else if (std.mem.eql(u8, k, "stream")) {
             stream = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "enable_thinking")) {
-            if (parse_json_bool_opt(body, &pos)) |b| enable_thinking = b;
+            if (parse_json_bool_opt(body, &pos)) |b| {
+                enable_thinking = b;
+                has_top_enable_thinking = true;
+            }
         } else if (std.mem.eql(u8, k, "stream_options")) {
             const start = pos;
             tokenizer_mod.skip_json_value(body, &pos);

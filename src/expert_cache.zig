@@ -74,9 +74,13 @@ pub const ExpertCache = struct {
     nonloop_clock_max: u8 = 3,
     lrfu_decay: f32 = 0.998,
     lrfu_hysteresis: f32 = 1.50,
+    lrfu_pf_decay: f32 = 0.985,
+    lrfu_pf_scale: f32 = 6.0,
+    loop_score_mult: f32 = 1.00,
+    tail_refill: bool = true,
     warm_prior_max: f32 = 4.0,
     max_promotes_per_decode: u32 = 8,
-    max_promotes_per_prefill_warm: u32 = 64,
+    max_promotes_per_prefill_warm: u32 = 32,
     sleeping: bool = false,
 
     // Telemetry counters
@@ -121,6 +125,21 @@ pub const ExpertCache = struct {
         }
         if (parse_env_u32("SQUID_CACHE_HYST")) |v| {
             if (v >= 100 and v <= 500) self.lrfu_hysteresis = @as(f32, @floatFromInt(v)) / 100.0;
+        }
+        if (parse_env_u32("SQUID_CACHE_PF_DECAY")) |v| {
+            if (v >= 800 and v <= 1000) self.lrfu_pf_decay = @as(f32, @floatFromInt(v)) / 1000.0;
+        }
+        if (parse_env_u32("SQUID_CACHE_PF_SCALE")) |v| {
+            if (v <= 500) self.lrfu_pf_scale = @as(f32, @floatFromInt(v)) / 10.0;
+        }
+        if (parse_env_u32("SQUID_CACHE_PF_PROMOTE")) |v| {
+            self.max_promotes_per_prefill_warm = @min(v, 256);
+        }
+        if (parse_env_u32("SQUID_CACHE_LOOP_MULT")) |v| {
+            if (v >= 100 and v <= 400) self.loop_score_mult = @as(f32, @floatFromInt(v)) / 100.0;
+        }
+        if (parse_env_u32("SQUID_CACHE_TAIL_REFILL")) |v| {
+            self.tail_refill = (v != 0);
         }
         if (parse_env_u32("SQUID_WARM_PRIOR")) |v| {
             if (v >= 1 and v <= 1000) self.warm_prior_max = @as(f32, @floatFromInt(v)) / 10.0;
@@ -456,6 +475,74 @@ pub const ExpertCache = struct {
         self.prefill_reserved_tail = 0;
     }
 
+    inline fn eff_lrfu_score(self: *const ExpertCache, eid: usize) f32 {
+        const sc: f32 = self.ewma_score[eid];
+        if (self.loop_score_mult == 1.0) return sc;
+        const layer: usize = eid / constants.expert_count;
+        const is_loop: bool = (layer >= constants.loop_start_layer and layer < constants.loop_end_layer);
+        return if (is_loop) (sc * self.loop_score_mult) else sc;
+    }
+
+    /// Release borrowed prefill tail slots AND immediately bulk-DMA-refill them with the hottest
+    /// unmapped LRFU experts so decode starts Token #1 with 100% of VRAM slots resident!
+    pub fn release_prefill_scratch_and_refill(
+        self: *ExpertCache,
+        weights: *const weights_mod.ModelWeights,
+        stream: ?*anyopaque,
+        already_synced: bool,
+    ) void {
+        self.release_prefill_scratch(stream, already_synced);
+        if (!self.enabled or !self.tail_refill or self.free_list_len == 0) return;
+
+        const smap = self.h_slot_map.?;
+        var n_cands: usize = 0;
+        var eid: usize = 0;
+        while (eid < total_experts) : (eid += 1) {
+            if (smap[eid] >= 0 or self.is_inflight[eid]) continue;
+            const sc: f32 = self.eff_lrfu_score(eid);
+            if (std.math.isFinite(sc) and sc > 0.0) {
+                const scaled: u32 = @intFromFloat(@min(sc * 10000.0, 4_000_000_000.0));
+                self.cand_buf[n_cands] = .{ .eid = @intCast(eid), .score = if (scaled == 0) 1 else scaled };
+                n_cands += 1;
+            }
+        }
+        if (n_cands == 0) return;
+
+        const to_fill: usize = @min(n_cands, self.free_list_len);
+        self.sort_top_candidates(n_cands, to_fill);
+
+        const pool_base = self.d_cache_pool.?;
+        const slot_bytes: usize = @intCast(constants.expert_slot_bytes);
+        var loaded: u32 = 0;
+        var idx: usize = 0;
+        while (idx < to_fill) : (idx += 1) {
+            const e_id: usize = self.cand_buf[idx].eid;
+            if (smap[e_id] >= 0) continue;
+            const dst_slot: u32 = self.pop_unassigned_slot() orelse break;
+            const layer: usize = e_id / constants.expert_count;
+            const expert: usize = e_id % constants.expert_count;
+            const is_loop: bool = (layer >= constants.loop_start_layer and layer < constants.loop_end_layer);
+            const h_bank = weights.host_experts_h[layer].?;
+            const src_ptr: *const anyopaque = @ptrCast(h_bank + expert * slot_bytes);
+            const dst_ptr: *anyopaque = @ptrCast(pool_base + @as(usize, dst_slot) * slot_bytes);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(dst_ptr, src_ptr, slot_bytes, stream));
+            smap[e_id] = @intCast(dst_slot);
+            self.slot_owner[dst_slot] = @intCast(e_id);
+            self.clock_bits[dst_slot] = if (is_loop) self.loop_clock_max else self.nonloop_clock_max;
+            loaded += 1;
+        }
+        if (loaded > 0) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                @ptrCast(self.d_slot_map.?),
+                @ptrCast(smap),
+                total_experts * @sizeOf(i32),
+                stream,
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(stream));
+            self.prefill_promotions += loaded;
+        }
+    }
+
     /// Wait for any in-flight async promotions on copy_stream and publish them cleanly before prefill/reset.
     pub fn flush_async(self: *ExpertCache, main_stream: ?*anyopaque) void {
         if (!self.enabled or !self.async_promote) return;
@@ -715,12 +802,12 @@ pub const ExpertCache = struct {
         const smap = self.h_slot_map.?;
         var n_cands: usize = 0;
 
-        // Normalize prefill chunk touches so a 512/1024-token prefill chunk doesn't dwarf decode's +1..+3 EWMA scale!
-        const pf_scale: f32 = 12.0 / @as(f32, @floatFromInt(@max(chunk_len, 1)));
-        if (self.use_lrfu) {
+        // Normalize prefill chunk touches and preserve warm decode LRFU priors across long prompts!
+        const pf_scale: f32 = self.lrfu_pf_scale / @as(f32, @floatFromInt(@max(chunk_len, 1)));
+        if (self.use_lrfu and self.lrfu_pf_decay < 1.0) {
             var i: usize = 0;
             while (i < total_experts) : (i += 1) {
-                self.ewma_score[i] *= 0.90;
+                self.ewma_score[i] *= self.lrfu_pf_decay;
             }
         }
 
@@ -923,7 +1010,7 @@ pub const ExpertCache = struct {
 
     fn find_lrfu_victim(self: *ExpertCache, cand_eid: usize, is_decode: bool) ?u32 {
         const usable: u32 = self.num_slots - self.prefill_reserved_tail;
-        const cand_score: f32 = self.ewma_score[cand_eid];
+        const cand_score: f32 = self.eff_lrfu_score(cand_eid);
         var min_score: f32 = 1e30;
         var min_slot: ?u32 = null;
         var s: u32 = 0;
@@ -931,7 +1018,7 @@ pub const ExpertCache = struct {
             if (self.slot_reserved[s]) continue;
             const owner = self.slot_owner[s];
             if (owner < 0) continue;
-            const sc: f32 = self.ewma_score[@intCast(owner)];
+            const sc: f32 = self.eff_lrfu_score(@intCast(owner));
             if (sc < min_score) {
                 min_score = sc;
                 min_slot = s;

@@ -43,6 +43,8 @@ struct alignas(64) CpuMoeDevState {
     uint32_t split_den;
     uint32_t max_batch;     // max B for which CPU participates (e.g. 1, 2, 4, or 8)
     uint64_t skip_mask;     // bit u (B>1) or bit slot (B=1) = 1 if CPU computes it
+    uint32_t hit_weight_b1_q8; // Q8 weight on n_hits for B=1 cost-balanced split (0 = static split)
+    uint32_t hit_weight_bn_q8; // Q8 weight on n_hits for B>=2 cost-balanced split (0 = static split)
 };
 
 struct CpuMoePool;

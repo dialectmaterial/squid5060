@@ -1320,6 +1320,10 @@ route_logits_nvfp4_parallel_kernel(
 
 // FUSED Top-8 Selection + SMEM-staged ExpertGroups Deduplication in ONE single launch!
 // Grid: 1 block, Block: B_CONST * 32 threads (1 warp per token b!).
+__device__ __forceinline__ void st_release_sys_u32_ink(volatile uint32_t* ptr, uint32_t val) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+
 template <int B_CONST>
 __global__ void __launch_bounds__(B_CONST * 32)
 route_select_and_group_kernel(
@@ -1328,6 +1332,11 @@ route_select_and_group_kernel(
     int32_t* __restrict__ out_ids,         // [B, TOP_K]
     float* __restrict__ out_weights,       // [B, TOP_K]
     ExpertGroups* __restrict__ g,
+    const int32_t* __restrict__ slot_map,
+    int layer_idx,
+    const __half* __restrict__ x_h,
+    CpuMoeBell* __restrict__ bell,
+    CpuMoeDevState* __restrict__ cpu_st,
     uint32_t zero) {
     int b = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
@@ -1384,50 +1393,186 @@ route_select_and_group_kernel(
             float w = chosen[k] * inv;
             out_ids[b * TOP_K + k] = winners[k];
             out_weights[b * TOP_K + k] = w;
-            if constexpr (B_CONST > 1) {
-                s_ids[b][k] = winners[k];
-                s_w[b][k] = w;
+            s_ids[b][k] = winners[k];
+            s_w[b][k] = w;
+        }
+    }
+
+    __shared__ ExpertGroups sg;
+    if constexpr (B_CONST > 1) {
+        if (g) {
+            __shared__ int8_t exp_to_u[NUM_EXPERTS];
+            if (threadIdx.x < 32) {
+                reinterpret_cast<uint32_t*>(exp_to_u)[threadIdx.x] = 0xFFFFFFFFu;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                int n_uniq = 0;
+                #pragma unroll
+                for (int tb = 0; tb < B_CONST; ++tb) {
+                    #pragma unroll
+                    for (int s = 0; s < TOP_K; ++s) {
+                        int e = s_ids[tb][s];
+                        float rw = s_w[tb][s];
+                        int u = (int)exp_to_u[e];
+                        if (u < 0) {
+                            u = n_uniq++;
+                            exp_to_u[e] = (int8_t)u;
+                            sg.expert_id[u] = e;
+                            sg.token_mask[u] = 0;
+                        }
+                        sg.token_mask[u] |= uint8_t(1u << tb);
+                        sg.slot_idx[u][tb] = uint8_t(s);
+                        sg.route_w[u][tb] = rw;
+                    }
+                }
+                sg.num_unique = n_uniq;
+            }
+            __syncthreads();
+            constexpr int NWORDS = sizeof(ExpertGroups) / sizeof(uint32_t);
+            const uint32_t* src_u = reinterpret_cast<const uint32_t*>(&sg);
+            uint32_t* dst_u = reinterpret_cast<uint32_t*>(g);
+            for (int i = threadIdx.x; i < NWORDS; i += B_CONST * 32) {
+                dst_u[i] = src_u[i];
             }
         }
     }
 
-    if constexpr (B_CONST > 1) {
-        if (!g) return;
-        __shared__ int8_t exp_to_u[NUM_EXPERTS];
-        __shared__ ExpertGroups sg;
-        if (threadIdx.x < 32) {
-            reinterpret_cast<uint32_t*>(exp_to_u)[threadIdx.x] = 0xFFFFFFFFu;
-        }
+    // Optional fused Hybrid CPU+GPU MoE miss dispatcher (eliminates 48 separate kernel launches/step!)
+    if (cpu_st != nullptr && bell != nullptr && slot_map != nullptr && x_h != nullptr) {
+        __shared__ int s_n_tasks;
+        __shared__ uint32_t s_next_seq;
         __syncthreads();
         if (threadIdx.x == 0) {
-            int n_uniq = 0;
-            #pragma unroll
-            for (int tb = 0; tb < B_CONST; ++tb) {
-                #pragma unroll
-                for (int s = 0; s < TOP_K; ++s) {
-                    int e = s_ids[tb][s];
-                    float rw = s_w[tb][s];
-                    int u = (int)exp_to_u[e];
-                    if (u < 0) {
-                        u = n_uniq++;
-                        exp_to_u[e] = (int8_t)u;
-                        sg.expert_id[u] = e;
-                        sg.token_mask[u] = 0;
+            s_n_tasks = 0;
+            if (cpu_st->enabled == 0 || B_CONST > (int)cpu_st->max_batch || cpu_st->split_num == 0 || bell->abort_flag != 0) {
+                cpu_st->n_tasks = 0;
+                cpu_st->n_outs = 0;
+                cpu_st->skip_mask = 0ULL;
+            } else {
+                int miss_idx[CPU_MOE_MAX_TASKS];
+                int miss_pop[CPU_MOE_MAX_TASKS];
+                int n_miss = 0;
+                int n_total_u = 0;
+
+                if constexpr (B_CONST == 1) {
+                    n_total_u = TOP_K;
+                    #pragma unroll
+                    for (int s = 0; s < TOP_K; ++s) {
+                        int exp_id = s_ids[0][s];
+                        if (slot_map[exp_id] < 0) {
+                            miss_idx[n_miss] = s;
+                            miss_pop[n_miss] = 1;
+                            n_miss++;
+                        }
                     }
-                    sg.token_mask[u] |= uint8_t(1u << tb);
-                    sg.slot_idx[u][tb] = uint8_t(s);
-                    sg.route_w[u][tb] = rw;
+                } else {
+                    int nu = g ? sg.num_unique : 0;
+                    if (nu > CPU_MOE_MAX_TASKS) nu = CPU_MOE_MAX_TASKS;
+                    n_total_u = nu;
+                    for (int u = 0; u < nu; ++u) {
+                        int exp_id = sg.expert_id[u];
+                        if (slot_map[exp_id] < 0) {
+                            miss_idx[n_miss] = u;
+                            miss_pop[n_miss] = __popc((uint32_t)sg.token_mask[u]);
+                            n_miss++;
+                        }
+                    }
+                }
+
+                int cpu_take = 0;
+                if (n_miss > 0) {
+                    int n_hits = n_total_u - n_miss;
+                    uint32_t hw_q8 = (B_CONST == 1) ? cpu_st->hit_weight_b1_q8 : cpu_st->hit_weight_bn_q8;
+                    if (hw_q8 > 0u) {
+                        uint32_t num = ((uint32_t)n_miss * 256u + (uint32_t)n_hits * hw_q8) * cpu_st->split_num + cpu_st->split_round * 256u;
+                        uint32_t den = cpu_st->split_den * 256u;
+                        cpu_take = (int)(num / den);
+                        if (cpu_take < 1) cpu_take = 1;
+                    } else {
+                        cpu_take = (int)(((uint32_t)n_miss * cpu_st->split_num + cpu_st->split_round) / cpu_st->split_den);
+                    }
+                    if (cpu_take > n_miss) cpu_take = n_miss;
+                    if (cpu_take > CPU_MOE_MAX_TASKS) cpu_take = CPU_MOE_MAX_TASKS;
+                }
+
+                if (cpu_take <= 0) {
+                    cpu_st->n_tasks = 0;
+                    cpu_st->n_outs = 0;
+                    cpu_st->skip_mask = 0ULL;
+                } else {
+                    if constexpr (B_CONST > 1) {
+                        if (cpu_take < n_miss) {
+                            for (int i = 1; i < n_miss; ++i) {
+                                int kidx = miss_idx[i];
+                                int kpop = miss_pop[i];
+                                int j = i - 1;
+                                while (j >= 0 && miss_pop[j] > kpop) {
+                                    miss_idx[j + 1] = miss_idx[j];
+                                    miss_pop[j + 1] = miss_pop[j];
+                                    --j;
+                                }
+                                miss_idx[j + 1] = kidx;
+                                miss_pop[j + 1] = kpop;
+                            }
+                        }
+                    }
+
+                    uint64_t skip = 0ULL;
+                    int out_cursor = 0;
+                    for (int t = 0; t < cpu_take; ++t) {
+                        int idx = miss_idx[t];
+                        skip |= (1ULL << idx);
+                        bell->task_out_base[t] = (uint8_t)out_cursor;
+                        if constexpr (B_CONST == 1) {
+                            bell->task_expert[t] = s_ids[0][idx];
+                            bell->task_token_mask[t] = 1u;
+                            bell->out_tok[out_cursor] = 0;
+                            bell->out_slot[out_cursor] = (uint8_t)idx;
+                            bell->out_rw[out_cursor] = s_w[0][idx];
+                            out_cursor++;
+                        } else {
+                            bell->task_expert[t] = sg.expert_id[idx];
+                            uint8_t mask = sg.token_mask[idx];
+                            bell->task_token_mask[t] = mask;
+                            for (int tb = 0; tb < B_CONST; ++tb) {
+                                if (mask & (1u << tb)) {
+                                    bell->out_tok[out_cursor] = (uint8_t)tb;
+                                    bell->out_slot[out_cursor] = sg.slot_idx[idx][tb];
+                                    bell->out_rw[out_cursor] = sg.route_w[idx][tb];
+                                    out_cursor++;
+                                }
+                            }
+                        }
+                    }
+                    bell->layer_idx = layer_idx;
+                    bell->batch_size = B_CONST;
+                    bell->n_tasks = cpu_take;
+                    bell->n_outs = out_cursor;
+
+                    uint32_t next_seq = cpu_st->seq + 1u;
+                    cpu_st->seq = next_seq;
+                    cpu_st->n_tasks = (uint32_t)cpu_take;
+                    cpu_st->n_outs = (uint32_t)out_cursor;
+                    cpu_st->skip_mask = skip;
+                    s_n_tasks = cpu_take;
+                    s_next_seq = next_seq;
                 }
             }
-            sg.num_unique = n_uniq;
         }
         __syncthreads();
-        // Coalesced parallel copy of ExpertGroups from SMEM -> global!
-        constexpr int NWORDS = sizeof(ExpertGroups) / sizeof(uint32_t);
-        const uint32_t* src_u = reinterpret_cast<const uint32_t*>(&sg);
-        uint32_t* dst_u = reinterpret_cast<uint32_t*>(g);
-        for (int i = threadIdx.x; i < NWORDS; i += B_CONST * 32) {
-            dst_u[i] = src_u[i];
+        if (s_n_tasks > 0) {
+            constexpr int N_U4 = (B_CONST * HIDDEN) >> 3; // 288 * B_CONST (exact 9 uint4/thread!)
+            const uint4* src4 = reinterpret_cast<const uint4*>(x_h);
+            uint4* dst4 = reinterpret_cast<uint4*>(bell->x_h);
+            for (int i = threadIdx.x; i < N_U4; i += B_CONST * 32) {
+                dst4[i] = src4[i];
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence_system();
+                st_release_sys_u32_ink(&bell->req_seq, s_next_seq);
+            }
         }
     }
 }
@@ -2688,25 +2833,30 @@ template <int B_CONST>
 static void dispatch_route_bf16(
     const float* m, const __nv_bfloat16* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
-    ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
+    ExpertGroups* groups, float* moe_down_zero,
+    const int32_t* slot_map, int layer_idx, const __half* x_h,
+    CpuMoeBell* cpu_bell, CpuMoeDevState* cpu_state, cudaStream_t stream) {
     route_logits_parallel_kernel<B_CONST><<<64, 64, 0, stream>>>(m, router_w, scratch_logits, moe_down_zero);
     launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
-        scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
+        scratch_logits, router_bias, out_ids, out_weights, groups,
+        slot_map, layer_idx, x_h, cpu_bell, cpu_state, 0u);
 }
 
 void launch_route_topk(
     const float* m, const __nv_bfloat16* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
-    ExpertGroups* groups, float* moe_down_zero, int B, cudaStream_t stream) {
+    ExpertGroups* groups, float* moe_down_zero,
+    const int32_t* slot_map, int layer_idx, const __half* x_h,
+    CpuMoeBell* cpu_bell, CpuMoeDevState* cpu_state, int B, cudaStream_t stream) {
     switch (B) {
-        case 1: dispatch_route_bf16<1>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 2: dispatch_route_bf16<2>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 3: dispatch_route_bf16<3>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 4: dispatch_route_bf16<4>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 5: dispatch_route_bf16<5>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 6: dispatch_route_bf16<6>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 7: dispatch_route_bf16<7>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 8: dispatch_route_bf16<8>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 1: dispatch_route_bf16<1>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 2: dispatch_route_bf16<2>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 3: dispatch_route_bf16<3>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 4: dispatch_route_bf16<4>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 5: dispatch_route_bf16<5>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 6: dispatch_route_bf16<6>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 7: dispatch_route_bf16<7>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
+        case 8: dispatch_route_bf16<8>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, x_h, cpu_bell, cpu_state, stream); break;
     }
 }
 
@@ -2714,26 +2864,31 @@ template <int B_CONST>
 static void dispatch_route_nvfp4(
     const __half* m_h, const LinearWeight& r, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
-    ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
+    ExpertGroups* groups, float* moe_down_zero,
+    const int32_t* slot_map, int layer_idx,
+    CpuMoeBell* cpu_bell, CpuMoeDevState* cpu_state, cudaStream_t stream) {
     launch_pdl(route_logits_nvfp4_parallel_kernel<B_CONST>, dim3(64), 32, stream,
         m_h, static_cast<const uint8_t*>(r.data), r.scales, r.global_scale, scratch_logits, moe_down_zero, 0u);
     launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
-        scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
+        scratch_logits, router_bias, out_ids, out_weights, groups,
+        slot_map, layer_idx, m_h, cpu_bell, cpu_state, 0u);
 }
 
 void launch_route_topk_nvfp4(
     const __half* m_h, const LinearWeight& router_nvfp4, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
-    ExpertGroups* groups, float* moe_down_zero, int B, cudaStream_t stream) {
+    ExpertGroups* groups, float* moe_down_zero,
+    const int32_t* slot_map, int layer_idx,
+    CpuMoeBell* cpu_bell, CpuMoeDevState* cpu_state, int B, cudaStream_t stream) {
     switch (B) {
-        case 1: dispatch_route_nvfp4<1>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 2: dispatch_route_nvfp4<2>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 3: dispatch_route_nvfp4<3>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 4: dispatch_route_nvfp4<4>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 5: dispatch_route_nvfp4<5>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 6: dispatch_route_nvfp4<6>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 7: dispatch_route_nvfp4<7>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 8: dispatch_route_nvfp4<8>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 1: dispatch_route_nvfp4<1>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 2: dispatch_route_nvfp4<2>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 3: dispatch_route_nvfp4<3>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 4: dispatch_route_nvfp4<4>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 5: dispatch_route_nvfp4<5>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 6: dispatch_route_nvfp4<6>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 7: dispatch_route_nvfp4<7>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
+        case 8: dispatch_route_nvfp4<8>(m_h, router_nvfp4, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, slot_map, layer_idx, cpu_bell, cpu_state, stream); break;
     }
 }
 

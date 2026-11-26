@@ -2634,13 +2634,15 @@ __device__ __forceinline__ float4 ld_sys_cv_f4(const float4* ptr) {
     return v;
 }
 
-// Hybrid CPU+GPU MoE wait & scatter kernel (1 CTA of 256 threads).
+// Hybrid CPU+GPU MoE wait & scatter kernel (1 CTA of 256 threads, PDL-chained!).
 // Zero PCIe traffic when d_state->n_tasks == 0!
 __global__ void __launch_bounds__(256)
 moe_cpu_merge_kernel(
     const CpuMoeBell* __restrict__ bell,
     const CpuMoeDevState* __restrict__ st,
     float* __restrict__ out_slots) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
     uint32_t n_tasks = st->n_tasks;
     if (n_tasks == 0) return;
 
@@ -2668,6 +2670,32 @@ moe_cpu_merge_kernel(
     }
 }
 
+template <bool STREAM_W>
+__device__ __forceinline__ uint4 ld_moe_u4(const void* p) {
+    if constexpr (STREAM_W) return ld_stream_u4(p);
+    else                    return __ldg(reinterpret_cast<const uint4*>(p));
+}
+
+template <bool STREAM_W>
+__device__ __forceinline__ uint2 ld_moe_u2(const void* p) {
+    if constexpr (STREAM_W) {
+        uint2 v;
+#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4)
+        uint64_t pol;
+        asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.L2::cache_hint.v2.u32 {%0,%1}, [%2], %3;"
+                     : "=r"(v.x), "=r"(v.y) : "l"(p), "l"(pol));
+#else
+        asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(v.x), "=r"(v.y) : "l"(p));
+#endif
+        return v;
+    } else {
+        return __ldg(reinterpret_cast<const uint2*>(p));
+    }
+}
+
+template <bool STREAM_W>
 __global__ void __launch_bounds__(128)
 moe_gate_up_nvfp4_b1_cached_kernel(
     const uint8_t* __restrict__ cache_pool,
@@ -2679,6 +2707,8 @@ moe_gate_up_nvfp4_b1_cached_kernel(
     const int32_t* __restrict__ r_ids,
     const CpuMoeDevState* __restrict__ cpu_state,
     __half* __restrict__ out_act_h) {
+    pdl_wait();
+    pdl_trigger();
     int slot = blockIdx.y;
     int expert = r_ids[slot];
     int tid = threadIdx.x;
@@ -2720,8 +2750,8 @@ moe_gate_up_nvfp4_b1_cached_kernel(
             xh[0] = p0[0]; xh[1] = p0[1]; xh[2] = p0[2]; xh[3] = p0[3];
             xh[4] = p1[0]; xh[5] = p1[1]; xh[6] = p1[2]; xh[7] = p1[3];
 
-            uint2 w8g = __ldg(wg + blk);
-            uint2 w8u = __ldg(wu + blk);
+            uint2 w8g = ld_moe_u2<STREAM_W>(wg + blk);
+            uint2 w8u = ld_moe_u2<STREAM_W>(wu + blk);
             float scg = cvt_e4m3_to_float(__ldg(sg + blk));
             float scu = cvt_e4m3_to_float(__ldg(su + blk));
             acc_g = fmaf(nvfp4_block16_dot(w8g, xh), scg, acc_g);
@@ -2743,8 +2773,8 @@ moe_gate_up_nvfp4_b1_cached_kernel(
         constexpr int V_STRIDE = HIDDEN >> 5; // 72 uint4s per row
         #pragma unroll
         for (int v = lane; v < V_STRIDE; v += 16) {
-            acc_g += nvfp4_block32_dot_u4_h(__ldg(wg + v), sg[v], x_h + (v << 5));
-            acc_u += nvfp4_block32_dot_u4_h(__ldg(wu + v), su[v], x_h + (v << 5));
+            acc_g += nvfp4_block32_dot_u4_h(ld_stream_u4(wg + v), sg[v], x_h + (v << 5));
+            acc_u += nvfp4_block32_dot_u4_h(ld_stream_u4(wu + v), su[v], x_h + (v << 5));
         }
     }
 
@@ -2759,8 +2789,9 @@ moe_gate_up_nvfp4_b1_cached_kernel(
     }
 }
 
-// SLOTTED 1-EXPERT-PER-CTA B=1 Dual-Path Cached MoE Down
+// SLOTTED 1-EXPERT-PER-CTA B=1 Dual-Path Cached MoE Down (PDL + selective L2::evict_first!)
 // Grid: (HIDDEN/16 = 144, TOP_K = 8), Block: 128 (16 rows/CTA x 8 threads/row)
+template <bool STREAM_W>
 __global__ void __launch_bounds__(128)
 moe_down_nvfp4_b1_cached_kernel(
     const uint8_t* __restrict__ cache_pool,
@@ -2772,6 +2803,8 @@ moe_down_nvfp4_b1_cached_kernel(
     const float* __restrict__ r_w,
     const CpuMoeDevState* __restrict__ cpu_state,
     float* __restrict__ out_slots) {
+    pdl_wait();
+    pdl_trigger();
     int slot = blockIdx.y;
     if (cpu_state != nullptr && ((cpu_state->skip_mask >> slot) & 1ULL)) return;
     int tid = threadIdx.x;
@@ -2803,7 +2836,7 @@ moe_down_nvfp4_b1_cached_kernel(
             xh[0] = p0[0]; xh[1] = p0[1]; xh[2] = p0[2]; xh[3] = p0[3];
             xh[4] = p1[0]; xh[5] = p1[1]; xh[6] = p1[2]; xh[7] = p1[3];
 
-            uint2 w8 = __ldg(wr + blk);
+            uint2 w8 = ld_moe_u2<STREAM_W>(wr + blk);
             float sc = cvt_e4m3_to_float(__ldg(sr + blk));
             acc = fmaf(nvfp4_block16_dot(w8, xh), sc, acc);
         }
@@ -2821,7 +2854,7 @@ moe_down_nvfp4_b1_cached_kernel(
         constexpr int V_STRIDE = INTERMEDIATE >> 5; // 36 uint4s per row
         #pragma unroll
         for (int v = lane; v < V_STRIDE; v += 8) {
-            acc += nvfp4_block32_dot_u4_h(__ldg(wr + v), sr[v], ah + (v << 5));
+            acc += nvfp4_block32_dot_u4_h(ld_stream_u4(wr + v), sr[v], ah + (v << 5));
         }
     }
 
@@ -2831,9 +2864,289 @@ moe_down_nvfp4_b1_cached_kernel(
     }
 }
 
-// HALF-WARP Dual-Path Grouped Cached MoE Gate+Up (B=2..8 MTP verify)
+// ============================================================================
+// Phase 2: Blackwell Tensor Core (mma.m16n8k16) Dual-Path Cached MoE Kernels (B=2..8)
+//  - 9 warps (288 threads/CTA), ~5.2-5.8 KiB SMEM -> high occupancy on 26-SM RTX 5060!
+//  - Single-pass Tensor Core MMA over all active tokens in B=2..8 (exact FP16 act, FP32 accum)
+//  - Coalesced SMEM scale preload + streaming uint4 loads on cslot < 0 PCIe misses
+//  - Selective L2::evict_first on prelude/coda (STREAM_W=true) vs L2-cached loop core (STREAM_W=false)
+//  - Full Blackwell PDL chaining!
+// ============================================================================
+template <int B_CONST, bool STREAM_W>
+__global__ void __launch_bounds__(288)
+moe_gate_up_nvfp4_tc_cached_kernel(
+    const uint8_t* __restrict__ cache_pool,
+    const uint8_t* __restrict__ host_pool,
+    const int32_t* __restrict__ slot_map,
+    uint32_t* __restrict__ touch_counts,
+    const float* __restrict__ exp_scales,
+    const __half* __restrict__ x_h,
+    const ExpertGroups* __restrict__ grp,
+    const CpuMoeDevState* __restrict__ cpu_state,
+    __half* __restrict__ out_act_h) {
+    constexpr int WARPS = 9; // 9 * 256 = 2304 = HIDDEN (U=2 chunks of 128 cols/warp)
+    constexpr int CB = HIDDEN >> 1; // 1152
+    constexpr int SB = HIDDEN >> 4; // 144
+    __shared__ float red[WARPS][32][4];
+    __shared__ float tile_out[MOE_TILE][MOE_MAXM + 1];
+    __shared__ __align__(16) uint8_t s_sc[MOE_TILE * SB]; // 2,304 B = 144 x uint4 (used when cslot < 0)
+
+    pdl_wait();
+    pdl_trigger();
+
+    const int u = blockIdx.y;
+    if (u >= grp->num_unique) return;
+    const int expert = grp->expert_id[u];
+    const int tid = threadIdx.x;
+
+    if (blockIdx.x == 0 && tid == 0 && touch_counts) {
+        atomicAdd(&touch_counts[expert], 1u);
+    }
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> u) & 1ULL)) return;
+
+    const uint32_t mask = grp->token_mask[u];
+    const int cslot = __ldg(slot_map + expert);
+    const uint8_t* exp_base = (cslot >= 0)
+        ? (cache_pool + (size_t)cslot * EXPERT_SLOT_BYTES)
+        : (host_pool  + (size_t)expert * EXPERT_SLOT_BYTES);
+
+    const int row_base = blockIdx.x * MOE_TILE;
+    if (cslot < 0) {
+        if (tid < 144) {
+            const uint4* sc_g = reinterpret_cast<const uint4*>(exp_base + EXPERT_W13_SCALE_OFF + (size_t)row_base * SB);
+            reinterpret_cast<uint4*>(s_sc)[tid] = __ldg(sc_g + tid);
+        }
+        __syncthreads();
+    }
+
+    const int lane = tid & 31;
+    const int warp = tid >> 5; // 0..8
+    const int g = lane >> 2;   // 0..7
+    const int t = lane & 3;    // 0..3
+
+    const uint8_t* w0 = exp_base + EXPERT_W13_DATA_OFF + (size_t)(row_base + g) * CB;
+    const uint8_t* w1 = w0 + (size_t)8 * CB;
+    const uint8_t* s0 = (cslot >= 0) ? (exp_base + EXPERT_W13_SCALE_OFF + (size_t)(row_base + g) * SB) : (s_sc + (size_t)g * SB);
+    const uint8_t* s1 = s0 + (size_t)8 * SB;
+
+    const bool on = (g < B_CONST) && ((mask & (1u << g)) != 0);
+    const __half* xrow = on ? (x_h + (size_t)g * HIDDEN) : nullptr;
+
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    Nvfp4Chunk32 r0[2], r1[2];
+    #pragma unroll
+    for (int step = 0; step < 2; ++step) {
+        const int c = (warp * 2 + step) * 4 + t; // 0..71 (72 * 32 = 2304 = HIDDEN)
+        if (cslot >= 0) {
+            r0[step].q = ld_moe_u4<STREAM_W>(w0 + (size_t)c * 16);
+            r1[step].q = ld_moe_u4<STREAM_W>(w1 + (size_t)c * 16);
+            r0[step].s = ld_scale_u16(s0 + (size_t)c * 2);
+            r1[step].s = ld_scale_u16(s1 + (size_t)c * 2);
+        } else {
+            r0[step].q = ld_stream_u4(w0 + (size_t)c * 16);
+            r1[step].q = ld_stream_u4(w1 + (size_t)c * 16);
+            r0[step].s = *reinterpret_cast<const uint16_t*>(s0 + (size_t)c * 2);
+            r1[step].s = *reinterpret_cast<const uint16_t*>(s1 + (size_t)c * 2);
+        }
+    }
+    #pragma unroll
+    for (int step = 0; step < 2; ++step) {
+        const int c = (warp * 2 + step) * 4 + t;
+        uint32_t xv[16];
+        if (xrow) {
+            const __half* xp = xrow + c * 32;
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                uint4 q = ld_dep_u4(xp + v * 8);
+                xv[4 * v + 0] = q.x; xv[4 * v + 1] = q.y;
+                xv[4 * v + 2] = q.z; xv[4 * v + 3] = q.w;
+            }
+        } else {
+            #pragma unroll
+            for (int v = 0; v < 16; ++v) xv[v] = 0;
+        }
+        uint32_t a[16], b[16];
+        decode_nvfp4_chunk32_f16(r0[step], a);
+        decode_nvfp4_chunk32_f16(r1[step], b);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                 a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
+                                 xv[2 * i], xv[2 * i + 1],
+                                 d[0], d[1], d[2], d[3]);
+        }
+    }
+
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+    __syncthreads();
+
+    if (tid < 32) {
+        float s[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int ww = 0; ww < WARPS; ++ww) {
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
+        }
+        const float es = exp_scales[expert];
+        tile_out[g][2 * t]         = s[0] * es;
+        tile_out[g][2 * t + 1]     = s[1] * es;
+        tile_out[g + 8][2 * t]     = s[2] * es;
+        tile_out[g + 8][2 * t + 1] = s[3] * es;
+    }
+    __syncthreads();
+
+    if (tid < 8 * B_CONST) {
+        const int p = tid & 7;
+        const int b = tid >> 3;
+        if (mask & (1u << b)) {
+            const float gate = tile_out[2 * p][b];
+            const float up   = tile_out[2 * p + 1][b];
+            const float g_cap = fast_tanh(gate * (1.0f / GATE_SOFTCAP)) * GATE_SOFTCAP;
+            const float u_cap = fast_tanh(up * (1.0f / UP_SOFTCAP)) * UP_SOFTCAP;
+            const int slot = grp->slot_idx[u][b];
+            out_act_h[((size_t)b * TOP_K + slot) * INTERMEDIATE + blockIdx.x * 8 + p] =
+                __float2half((g_cap * fast_sigmoid(gate)) * u_cap);
+        }
+    }
+}
+
+template <int B_CONST, bool STREAM_W>
+__global__ void __launch_bounds__(288)
+moe_down_nvfp4_tc_cached_kernel(
+    const uint8_t* __restrict__ cache_pool,
+    const uint8_t* __restrict__ host_pool,
+    const int32_t* __restrict__ slot_map,
+    const float* __restrict__ exp_scales,
+    const __half* __restrict__ act_h,
+    const ExpertGroups* __restrict__ grp,
+    const CpuMoeDevState* __restrict__ cpu_state,
+    float* __restrict__ out_slots) {
+    constexpr int WARPS = 9; // 9 * 128 = 1152 = INTERMEDIATE (exact 1 pass!)
+    constexpr int CB = INTERMEDIATE >> 1; // 576
+    constexpr int SB = INTERMEDIATE >> 4; // 72
+    __shared__ float red[WARPS][32][4];
+    __shared__ float tile_out[MOE_TILE][MOE_MAXM + 1];
+    __shared__ __align__(16) uint8_t s_sc[MOE_TILE * SB]; // 1,152 B = 144 x uint2
+
+    const int u = blockIdx.y;
+    if (u >= grp->num_unique) {
+        pdl_wait();
+        pdl_trigger();
+        return;
+    }
+    if (cpu_state != nullptr && ((cpu_state->skip_mask >> u) & 1ULL)) {
+        pdl_wait();
+        pdl_trigger();
+        return;
+    }
+
+    const int expert = grp->expert_id[u];
+    const uint32_t mask = grp->token_mask[u];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5; // 0..8
+    const int g = lane >> 2;   // 0..7
+    const int t = lane & 3;    // 0..3
+    const int row_base = blockIdx.x * MOE_TILE;
+
+    const int cslot = __ldg(slot_map + expert);
+    const uint8_t* exp_base = (cslot >= 0)
+        ? (cache_pool + (size_t)cslot * EXPERT_SLOT_BYTES)
+        : (host_pool  + (size_t)expert * EXPERT_SLOT_BYTES);
+
+    // Prefetch W2 weights & scales BEFORE pdl_wait() -> hides moe_gate_up epilogue completely!
+    if (cslot < 0) {
+        if (tid < 144) {
+            const uint2* sc_g = reinterpret_cast<const uint2*>(exp_base + EXPERT_W2_SCALE_OFF + (size_t)row_base * SB);
+            reinterpret_cast<uint2*>(s_sc)[tid] = __ldg(sc_g + tid);
+        }
+        __syncthreads();
+    }
+
+    const int c = warp * 4 + t; // 0..35 (36 * 32 = 1152 = INTERMEDIATE)
+    const uint8_t* w0 = exp_base + EXPERT_W2_DATA_OFF + (size_t)(row_base + g) * CB;
+    const uint8_t* w1 = w0 + (size_t)8 * CB;
+    const uint8_t* s0 = (cslot >= 0) ? (exp_base + EXPERT_W2_SCALE_OFF + (size_t)(row_base + g) * SB) : (s_sc + (size_t)g * SB);
+    const uint8_t* s1 = s0 + (size_t)8 * SB;
+
+    Nvfp4Chunk32 r0, r1;
+    if (cslot >= 0) {
+        r0.q = ld_moe_u4<STREAM_W>(w0 + (size_t)c * 16);
+        r1.q = ld_moe_u4<STREAM_W>(w1 + (size_t)c * 16);
+        r0.s = ld_scale_u16(s0 + (size_t)c * 2);
+        r1.s = ld_scale_u16(s1 + (size_t)c * 2);
+    } else {
+        r0.q = ld_stream_u4(w0 + (size_t)c * 16);
+        r1.q = ld_stream_u4(w1 + (size_t)c * 16);
+        r0.s = *reinterpret_cast<const uint16_t*>(s0 + (size_t)c * 2);
+        r1.s = *reinterpret_cast<const uint16_t*>(s1 + (size_t)c * 2);
+    }
+
+    // Wait for moe_gate_up to finish writing act_h, then load act_h!
+    pdl_wait();
+    const bool on = (g < B_CONST) && ((mask & (1u << g)) != 0);
+    const __half* xrow = on ? (act_h + ((size_t)g * TOP_K + grp->slot_idx[u][g]) * INTERMEDIATE) : nullptr;
+    uint32_t xv[16];
+    if (xrow) {
+        const __half* xp = xrow + c * 32;
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            uint4 q = ld_dep_u4(xp + v * 8);
+            xv[4 * v + 0] = q.x; xv[4 * v + 1] = q.y;
+            xv[4 * v + 2] = q.z; xv[4 * v + 3] = q.w;
+        }
+    } else {
+        #pragma unroll
+        for (int v = 0; v < 16; ++v) xv[v] = 0;
+    }
+
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    uint32_t a[16], b[16];
+    decode_nvfp4_chunk32_f16(r0, a);
+    decode_nvfp4_chunk32_f16(r1, b);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                             a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
+                             xv[2 * i], xv[2 * i + 1],
+                             d[0], d[1], d[2], d[3]);
+    }
+
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+    __syncthreads();
+
+    if (tid < 32) {
+        float s[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int ww = 0; ww < WARPS; ++ww) {
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
+        }
+        const float es = exp_scales[expert];
+        tile_out[g][2 * t]         = s[0] * es;
+        tile_out[g][2 * t + 1]     = s[1] * es;
+        tile_out[g + 8][2 * t]     = s[2] * es;
+        tile_out[g + 8][2 * t + 1] = s[3] * es;
+    }
+    __syncthreads();
+    pdl_trigger();
+
+    if (tid < MOE_TILE * B_CONST) {
+        const int r = tid & (MOE_TILE - 1);
+        const int b = tid >> 4;
+        if (mask & (1u << b)) {
+            const int slot = grp->slot_idx[u][b];
+            out_slots[((size_t)b * TOP_K + slot) * HIDDEN + row_base + r] =
+                tile_out[r][b] * grp->route_w[u][b];
+        }
+    }
+}
+
+// HALF-WARP Dual-Path Grouped Cached MoE Gate+Up (B=2..8 MTP verify, PDL + selective L2::evict_first)
 static_assert(INTERMEDIATE % 8 == 0 && HIDDEN % 16 == 0, "Cached MoE grids require exact tile division before __syncthreads");
-template <int B_CONST>
+template <int B_CONST, bool STREAM_W>
 __global__ void __launch_bounds__(128)
 moe_gate_up_nvfp4_grouped_cached_kernel(
     const uint8_t* __restrict__ cache_pool,
@@ -2845,6 +3158,8 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
     const ExpertGroups* __restrict__ g,
     const CpuMoeDevState* __restrict__ cpu_state,
     __half* __restrict__ out_act_h) {
+    pdl_wait();
+    pdl_trigger();
     int u = blockIdx.y;
     if (u >= g->num_unique) return;
     uint32_t mask = g->token_mask[u];
@@ -2897,7 +3212,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
                 const __half2* p1 = reinterpret_cast<const __half2*>(&xv1);
                 xh[0] = p0[0]; xh[1] = p0[1]; xh[2] = p0[2]; xh[3] = p0[3];
                 xh[4] = p1[0]; xh[5] = p1[1]; xh[6] = p1[2]; xh[7] = p1[3];
-                uint2 w8g = __ldg(wg + blk), w8u = __ldg(wu + blk);
+                uint2 w8g = ld_moe_u2<STREAM_W>(wg + blk), w8u = ld_moe_u2<STREAM_W>(wu + blk);
                 float scg = cvt_e4m3_to_float(__ldg(sg + blk));
                 float scu = cvt_e4m3_to_float(__ldg(su + blk));
                 ag = fmaf(nvfp4_block16_dot(w8g, xh), scg, ag);
@@ -2910,8 +3225,8 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
             const uint16_t* su = reinterpret_cast<const uint16_t*>(s_sc + (2 * hw + 1) * (HIDDEN >> 4));
             #pragma unroll
             for (int v = lane; v < (HIDDEN >> 5); v += 16) {
-                ag += nvfp4_block32_dot_u4_h(__ldg(wg + v), sg[v], xb + (v << 5));
-                au += nvfp4_block32_dot_u4_h(__ldg(wu + v), su[v], xb + (v << 5));
+                ag += nvfp4_block32_dot_u4_h(ld_stream_u4(wg + v), sg[v], xb + (v << 5));
+                au += nvfp4_block32_dot_u4_h(ld_stream_u4(wu + v), su[v], xb + (v << 5));
             }
         }
         float es = exp_scales[expert];
@@ -2940,7 +3255,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
         #pragma unroll
         for (int iter = 0; iter < 9; ++iter) {
             int blk = lane + iter * 16;
-            uint2 w8g = __ldg(wg + blk), w8u = __ldg(wu + blk);
+            uint2 w8g = ld_moe_u2<STREAM_W>(wg + blk), w8u = ld_moe_u2<STREAM_W>(wu + blk);
             float scg = cvt_e4m3_to_float(__ldg(sg + blk));
             float scu = cvt_e4m3_to_float(__ldg(su + blk));
             __half2 gh[8], uh[8];
@@ -2978,7 +3293,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
         const uint16_t* su = reinterpret_cast<const uint16_t*>(s_sc + (2 * hw + 1) * (HIDDEN >> 4));
         #pragma unroll
         for (int v = lane; v < (HIDDEN >> 5); v += 16) {
-            uint4 w16g = __ldg(wg + v), w16u = __ldg(wu + v);
+            uint4 w16g = ld_stream_u4(wg + v), w16u = ld_stream_u4(wu + v);
             uint16_t scg2 = sg[v], scu2 = su[v];
             float scg0 = cvt_e4m3_to_float(uint8_t(scg2 & 0xFFu));
             float scg1 = cvt_e4m3_to_float(uint8_t(scg2 >> 8));
@@ -3049,7 +3364,7 @@ moe_gate_up_nvfp4_grouped_cached_kernel(
     }
 }
 
-template <int B_CONST>
+template <int B_CONST, bool STREAM_W>
 __global__ void __launch_bounds__(128)
 moe_down_nvfp4_grouped_cached_kernel(
     const uint8_t* __restrict__ cache_pool,
@@ -3060,6 +3375,8 @@ moe_down_nvfp4_grouped_cached_kernel(
     const ExpertGroups* __restrict__ g,
     const CpuMoeDevState* __restrict__ cpu_state,
     float* __restrict__ out_down) {
+    pdl_wait();
+    pdl_trigger();
     int u = blockIdx.y;
     if (u >= g->num_unique) return;
     if (cpu_state != nullptr && ((cpu_state->skip_mask >> u) & 1ULL)) return;
@@ -3107,7 +3424,7 @@ moe_down_nvfp4_grouped_cached_kernel(
                 const __half2* p1 = reinterpret_cast<const __half2*>(&xv1);
                 xh[0] = p0[0]; xh[1] = p0[1]; xh[2] = p0[2]; xh[3] = p0[3];
                 xh[4] = p1[0]; xh[5] = p1[1]; xh[6] = p1[2]; xh[7] = p1[3];
-                uint2 w8 = __ldg(wr + blk);
+                uint2 w8 = ld_moe_u2<STREAM_W>(wr + blk);
                 float sc = cvt_e4m3_to_float(__ldg(sr + blk));
                 acc = fmaf(nvfp4_block16_dot(w8, xh), sc, acc);
             }
@@ -3116,7 +3433,7 @@ moe_down_nvfp4_grouped_cached_kernel(
             const uint16_t* sr = reinterpret_cast<const uint16_t*>(s_sc + qw * (INTERMEDIATE >> 4));
             #pragma unroll
             for (int v = lane; v < (INTERMEDIATE >> 5); v += 8) {
-                acc += nvfp4_block32_dot_u4_h(__ldg(wr + v), sr[v], ah + (v << 5));
+                acc += nvfp4_block32_dot_u4_h(ld_stream_u4(wr + v), sr[v], ah + (v << 5));
             }
         }
         float val = quarter_warp_sum(acc) * exp_scales[expert];
@@ -3136,7 +3453,7 @@ moe_down_nvfp4_grouped_cached_kernel(
         #pragma unroll
         for (int iter = 0; iter < 9; ++iter) {
             int blk = lane + iter * 8;
-            uint2 w8 = __ldg(wr + blk);
+            uint2 w8 = ld_moe_u2<STREAM_W>(wr + blk);
             float sc = cvt_e4m3_to_float(__ldg(sr + blk));
             __half2 wh[8];
             cvt_e2m1x8_to_half2x4(w8.x, wh[0], wh[1], wh[2], wh[3]);
@@ -3164,7 +3481,7 @@ moe_down_nvfp4_grouped_cached_kernel(
         const uint16_t* sr = reinterpret_cast<const uint16_t*>(s_sc + qw * (INTERMEDIATE >> 4));
         #pragma unroll
         for (int v = lane; v < (INTERMEDIATE >> 5); v += 8) {
-            uint4 w16 = __ldg(wr + v);
+            uint4 w16 = ld_stream_u4(wr + v);
             uint16_t sc2 = sr[v];
             float sc0 = cvt_e4m3_to_float(uint8_t(sc2 & 0xFFu));
             float sc1 = cvt_e4m3_to_float(uint8_t(sc2 >> 8));
@@ -3215,22 +3532,132 @@ moe_down_nvfp4_grouped_cached_kernel(
     }
 }
 
+static inline int moe_tc_min_b() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* ev_en = std::getenv("SQUID_MOE_TC_CACHED");
+        if (ev_en && ev_en[0] == '0') {
+            cached = 99;
+        } else {
+            const char* ev_b = std::getenv("SQUID_MOE_TC_MIN_B");
+            int mb = ev_b ? std::atoi(ev_b) : 4;
+            if (mb < 2) mb = 2;
+            cached = mb;
+        }
+    }
+    return cached;
+}
+
+static inline bool moe_pdl_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* ev = std::getenv("SQUID_MOE_PDL");
+        cached = (ev && ev[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static inline bool moe_l2_evict_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* ev = std::getenv("SQUID_MOE_L2_EVICT");
+        cached = (ev && ev[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 template <int B_CONST>
 static void dispatch_moe_gu_cached(
     const ExpertBank& w13, const __half* x_h, const ExpertGroups* groups,
-    const CpuMoeDevState* cpu_state, __half* out_act_h, cudaStream_t stream) {
+    const CpuMoeDevState* cpu_state, __half* out_act_h, bool is_loop_layer, cudaStream_t stream) {
     dim3 grid((INTERMEDIATE + 7) / 8, B_CONST * TOP_K);
-    moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST><<<grid, 128, 0, stream>>>(
-        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+    const bool use_tc = (B_CONST >= moe_tc_min_b());
+    const bool use_pdl = moe_pdl_enabled();
+    const bool stream_w = (!is_loop_layer) && moe_l2_evict_enabled();
+    if (use_tc) {
+        if (stream_w) {
+            if (use_pdl) {
+                launch_pdl(moe_gate_up_nvfp4_tc_cached_kernel<B_CONST, true>, grid, 288, stream,
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            } else {
+                moe_gate_up_nvfp4_tc_cached_kernel<B_CONST, true><<<grid, 288, 0, stream>>>(
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            }
+        } else {
+            if (use_pdl) {
+                launch_pdl(moe_gate_up_nvfp4_tc_cached_kernel<B_CONST, false>, grid, 288, stream,
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            } else {
+                moe_gate_up_nvfp4_tc_cached_kernel<B_CONST, false><<<grid, 288, 0, stream>>>(
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            }
+        }
+    } else {
+        if (stream_w) {
+            if (use_pdl) {
+                launch_pdl(moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST, true>, grid, 128, stream,
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            } else {
+                moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST, true><<<grid, 128, 0, stream>>>(
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            }
+        } else {
+            if (use_pdl) {
+                launch_pdl(moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST, false>, grid, 128, stream,
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            } else {
+                moe_gate_up_nvfp4_grouped_cached_kernel<B_CONST, false><<<grid, 128, 0, stream>>>(
+                    w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, groups, cpu_state, out_act_h);
+            }
+        }
+    }
 }
 
 template <int B_CONST>
 static void dispatch_moe_dn_cached(
     const ExpertBank& w2, const __half* act_h, const ExpertGroups* groups,
-    const CpuMoeDevState* cpu_state, float* out_down, cudaStream_t stream) {
+    const CpuMoeDevState* cpu_state, float* out_down, bool is_loop_layer, cudaStream_t stream) {
     dim3 grid((HIDDEN + 15) / 16, B_CONST * TOP_K);
-    moe_down_nvfp4_grouped_cached_kernel<B_CONST><<<grid, 128, 0, stream>>>(
-        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+    const bool use_tc = (B_CONST >= moe_tc_min_b());
+    const bool use_pdl = moe_pdl_enabled();
+    const bool stream_w = (!is_loop_layer) && moe_l2_evict_enabled();
+    if (use_tc) {
+        if (stream_w) {
+            if (use_pdl) {
+                launch_pdl(moe_down_nvfp4_tc_cached_kernel<B_CONST, true>, grid, 288, stream,
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            } else {
+                moe_down_nvfp4_tc_cached_kernel<B_CONST, true><<<grid, 288, 0, stream>>>(
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            }
+        } else {
+            if (use_pdl) {
+                launch_pdl(moe_down_nvfp4_tc_cached_kernel<B_CONST, false>, grid, 288, stream,
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            } else {
+                moe_down_nvfp4_tc_cached_kernel<B_CONST, false><<<grid, 288, 0, stream>>>(
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            }
+        }
+    } else {
+        if (stream_w) {
+            if (use_pdl) {
+                launch_pdl(moe_down_nvfp4_grouped_cached_kernel<B_CONST, true>, grid, 128, stream,
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            } else {
+                moe_down_nvfp4_grouped_cached_kernel<B_CONST, true><<<grid, 128, 0, stream>>>(
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            }
+        } else {
+            if (use_pdl) {
+                launch_pdl(moe_down_nvfp4_grouped_cached_kernel<B_CONST, false>, grid, 128, stream,
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            } else {
+                moe_down_nvfp4_grouped_cached_kernel<B_CONST, false><<<grid, 128, 0, stream>>>(
+                    w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, groups, cpu_state, out_down);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -3446,26 +3873,43 @@ void launch_moe_cpu_dispatch(
 void launch_moe_cpu_merge(
     const CpuMoeBell* d_bell, const CpuMoeDevState* d_state, float* out_slots, cudaStream_t stream) {
     if (d_bell == nullptr || d_state == nullptr) return;
-    moe_cpu_merge_kernel<<<1, 256, 0, stream>>>(d_bell, d_state, out_slots);
+    launch_pdl(moe_cpu_merge_kernel, dim3(1), 256, stream, d_bell, d_state, out_slots);
 }
 
 void launch_moe_gate_up_h(
     const ExpertBank& w13, const __half* x_h, const int32_t* route_ids,
-    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, __half* out_act_h, int B, cudaStream_t stream) {
+    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, __half* out_act_h, int B, bool is_loop_layer, cudaStream_t stream) {
     if (w13.cache_pool != nullptr) {
         if (B == 1) {
             dim3 grid((INTERMEDIATE + 7) / 8, TOP_K);
-            moe_gate_up_nvfp4_b1_cached_kernel<<<grid, 128, 0, stream>>>(
-                w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
+            const bool use_pdl = moe_pdl_enabled();
+            const bool stream_w = (!is_loop_layer) && moe_l2_evict_enabled();
+            if (stream_w) {
+                if (use_pdl) {
+                    launch_pdl(moe_gate_up_nvfp4_b1_cached_kernel<true>, grid, 128, stream,
+                        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
+                } else {
+                    moe_gate_up_nvfp4_b1_cached_kernel<true><<<grid, 128, 0, stream>>>(
+                        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
+                }
+            } else {
+                if (use_pdl) {
+                    launch_pdl(moe_gate_up_nvfp4_b1_cached_kernel<false>, grid, 128, stream,
+                        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
+                } else {
+                    moe_gate_up_nvfp4_b1_cached_kernel<false><<<grid, 128, 0, stream>>>(
+                        w13.cache_pool, w13.host_pool, w13.slot_map, w13.touch_counts, w13.expert_scale, x_h, route_ids, cpu_state, out_act_h);
+                }
+            }
         } else {
             switch (B) {
-                case 2: dispatch_moe_gu_cached<2>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 3: dispatch_moe_gu_cached<3>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 4: dispatch_moe_gu_cached<4>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 5: dispatch_moe_gu_cached<5>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 6: dispatch_moe_gu_cached<6>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 7: dispatch_moe_gu_cached<7>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
-                case 8: dispatch_moe_gu_cached<8>(w13, x_h, groups, cpu_state, out_act_h, stream); break;
+                case 2: dispatch_moe_gu_cached<2>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 3: dispatch_moe_gu_cached<3>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 4: dispatch_moe_gu_cached<4>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 5: dispatch_moe_gu_cached<5>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 6: dispatch_moe_gu_cached<6>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 7: dispatch_moe_gu_cached<7>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
+                case 8: dispatch_moe_gu_cached<8>(w13, x_h, groups, cpu_state, out_act_h, is_loop_layer, stream); break;
             }
         }
         return;
@@ -3482,21 +3926,38 @@ void launch_moe_gate_up_h(
 
 void launch_moe_down_h(
     const ExpertBank& w2, const __half* act_h, const int32_t* route_ids, const float* route_w,
-    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, float* out_down, int B, cudaStream_t stream, bool /*already_zeroed*/) {
+    const ExpertGroups* groups, const CpuMoeDevState* cpu_state, float* out_down, int B, bool is_loop_layer, cudaStream_t stream, bool /*already_zeroed*/) {
     if (w2.cache_pool != nullptr) {
         if (B == 1) {
             dim3 grid((HIDDEN + 15) / 16, TOP_K);
-            moe_down_nvfp4_b1_cached_kernel<<<grid, 128, 0, stream>>>(
-                w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
+            const bool use_pdl = moe_pdl_enabled();
+            const bool stream_w = (!is_loop_layer) && moe_l2_evict_enabled();
+            if (stream_w) {
+                if (use_pdl) {
+                    launch_pdl(moe_down_nvfp4_b1_cached_kernel<true>, grid, 128, stream,
+                        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
+                } else {
+                    moe_down_nvfp4_b1_cached_kernel<true><<<grid, 128, 0, stream>>>(
+                        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
+                }
+            } else {
+                if (use_pdl) {
+                    launch_pdl(moe_down_nvfp4_b1_cached_kernel<false>, grid, 128, stream,
+                        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
+                } else {
+                    moe_down_nvfp4_b1_cached_kernel<false><<<grid, 128, 0, stream>>>(
+                        w2.cache_pool, w2.host_pool, w2.slot_map, w2.expert_scale, act_h, route_ids, route_w, cpu_state, out_down);
+                }
+            }
         } else {
             switch (B) {
-                case 2: dispatch_moe_dn_cached<2>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 3: dispatch_moe_dn_cached<3>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 4: dispatch_moe_dn_cached<4>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 5: dispatch_moe_dn_cached<5>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 6: dispatch_moe_dn_cached<6>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 7: dispatch_moe_dn_cached<7>(w2, act_h, groups, cpu_state, out_down, stream); break;
-                case 8: dispatch_moe_dn_cached<8>(w2, act_h, groups, cpu_state, out_down, stream); break;
+                case 2: dispatch_moe_dn_cached<2>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 3: dispatch_moe_dn_cached<3>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 4: dispatch_moe_dn_cached<4>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 5: dispatch_moe_dn_cached<5>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 6: dispatch_moe_dn_cached<6>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 7: dispatch_moe_dn_cached<7>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
+                case 8: dispatch_moe_dn_cached<8>(w2, act_h, groups, cpu_state, out_down, is_loop_layer, stream); break;
             }
         }
         return;

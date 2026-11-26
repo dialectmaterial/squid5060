@@ -411,6 +411,10 @@ pub extern "c" fn squid_launch_route_topk_nvfp4(
     out_ids: [*]i32,
     out_weights: [*]f32,
     groups: ?*anyopaque,
+    slot_map: ?[*]const i32,
+    layer_idx: i32,
+    d_bell: ?*anyopaque,
+    d_cpu_state: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -423,6 +427,11 @@ pub extern "c" fn squid_launch_route_topk(
     out_ids: [*]i32,
     out_weights: [*]f32,
     groups: ?*anyopaque,
+    slot_map: ?[*]const i32,
+    layer_idx: i32,
+    x_h: ?*const anyopaque,
+    d_bell: ?*anyopaque,
+    d_cpu_state: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -437,7 +446,9 @@ pub const CCpuMoeDevState = extern struct {
     split_den: u32 = 3,
     max_batch: u32 = 8,
     skip_mask: u64 = 0,
-    _pad: [24]u8 = @splat(0),
+    hit_weight_b1_q8: u32 = 0,
+    hit_weight_bn_q8: u32 = 0,
+    _pad: [16]u8 = @splat(0),
 };
 
 pub const CVisionLayerPtrs = extern struct {
@@ -536,6 +547,7 @@ pub extern "c" fn squid_launch_moe_gate_up_h(
     cpu_state: ?*const anyopaque,
     out_act_h: *anyopaque,
     batch_size: i32,
+    is_loop_layer: u8,
     stream: ?*anyopaque,
 ) void;
 
@@ -548,6 +560,7 @@ pub extern "c" fn squid_launch_moe_down_h(
     cpu_state: ?*const anyopaque,
     out_down: [*]f32,
     batch_size: i32,
+    is_loop_layer: u8,
     stream: ?*anyopaque,
 ) void;
 

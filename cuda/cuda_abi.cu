@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 using namespace squid;
 
@@ -229,43 +230,40 @@ __global__ void z_adaptive_select_width_kernel(
     const float* __restrict__ d_draft_conf,
     const SampleConfig* __restrict__ d_sample_cfg,
     float threshold,
-    uint8_t is_cached_gpu,
+    float c2, float c3, float c4, float c8,
+    float gamma_base, float temp_slope,
     int32_t* __restrict__ d_tokens,
     int32_t* __restrict__ d_chosen_width,
     cudaGraphConditionalHandle cond_handle) {
     if (threadIdx.x != 0) return;
 
-    // Power-law calibrated expected-throughput optimizer: pick w in {1, 2, 4, 8} maximizing E[acc(w)] / cost(w).
+    // Power-law calibrated expected-throughput optimizer: pick w in {1, 2, 3, 4, 8} maximizing E[acc(w)] / cost(w).
     // Power-law p_k = conf_k^gamma preserves p -> 1 when DSpark is near-certain (conf > 0.98) while accurately
     // damping overconfident mid-range probabilities and stochastic T > 0 acceptance decay.
-    // On 8 GB PCIe-cached GPUs, larger verify batches trigger ~linearly more unique experts & RAM misses,
-    // so calibrated step costs are {1.00, 1.30, 2.45, 4.50} vs full-VRAM {1.00, 1.05, 1.15, 1.35}.
-    float gamma = (is_cached_gpu ? 1.50f : 1.15f) * (fmaxf(threshold, 0.25f) / 0.90f);
+    float gamma = gamma_base * (fmaxf(threshold, 0.25f) / 0.90f);
     if (d_sample_cfg != nullptr && d_sample_cfg->inv_temp > 0.0f) {
         float temp = 1.0f / d_sample_cfg->inv_temp;
-        gamma *= (1.0f + 0.45f * fminf(temp, 1.2f));
+        gamma *= (1.0f + temp_slope * fminf(temp, 1.2f));
     }
 
-    float c1 = 1.00f;
-    float c2 = is_cached_gpu ? 1.30f : 1.05f;
-    float c4 = is_cached_gpu ? 2.45f : 1.15f;
-    float c8 = is_cached_gpu ? 4.50f : 1.35f;
-
+    const float c1 = 1.00f;
     float e1 = 1.0f;
     float prod = 1.0f;
-    float e2 = 1.0f, e4 = 1.0f, e8 = 1.0f;
+    float e2 = 1.0f, e3 = 1.0f, e4 = 1.0f, e8 = 1.0f;
     #pragma unroll
     for (int k = 0; k < MTP_MAX_DRAFTS; ++k) {
         float ck = fminf(1.0f, fmaxf(0.0f, d_draft_conf[k]));
         float pk = __powf(ck, gamma);
         prod *= pk;
         if (k == 0) e2 = 1.0f + prod;
+        if (k < 2)  e3 += prod;
         if (k < 3)  e4 += prod;
         e8 += prod;
     }
 
     float r1 = e1 / c1;
     float r2 = e2 / c2;
+    float r3 = e3 / c3;
     float r4 = e4 / c4;
     float r8 = e8 / c8;
 
@@ -273,8 +271,9 @@ __global__ void z_adaptive_select_width_kernel(
     int width = 1;
     float best_r = r1;
     if (r2 > best_r) { best_r = r2; case_idx = 1u; width = 2; }
-    if (r4 > best_r) { best_r = r4; case_idx = 2u; width = 4; }
-    if (r8 > best_r) { best_r = r8; case_idx = 3u; width = 8; }
+    if (r3 > best_r) { best_r = r3; case_idx = 2u; width = 3; }
+    if (r4 > best_r) { best_r = r4; case_idx = 3u; width = 4; }
+    if (r8 > best_r) { best_r = r8; case_idx = 4u; width = 8; }
 
     d_tokens[0] = *d_anchor;
     for (int i = 0; i < width - 1; ++i) d_tokens[1 + i] = d_drafts[i];
@@ -286,7 +285,7 @@ struct CAdaptiveGraph {
     cudaGraph_t root_graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     cudaGraphConditionalHandle handle{};
-    cudaGraph_t bodies[4] = {nullptr, nullptr, nullptr, nullptr};
+    cudaGraph_t bodies[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
 };
 
 } // namespace
@@ -735,18 +734,27 @@ void squid_launch_mega_attn_post_mlp_in(
 
 void squid_launch_route_topk_nvfp4(
     const void* m_h, const CLinearWeight* router_nvfp4, const float* router_bias,
-    float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups, int32_t B, void* stream) {
+    float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups,
+    const int32_t* slot_map, int32_t layer_idx, void* d_bell, void* d_cpu_state,
+    int32_t B, void* stream) {
     launch_route_topk_nvfp4(
         static_cast<const __half*>(m_h), to_lw(*router_nvfp4), router_bias,
-        scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr, B, static_cast<cudaStream_t>(stream));
+        scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr,
+        slot_map, layer_idx, static_cast<CpuMoeBell*>(d_bell), static_cast<CpuMoeDevState*>(d_cpu_state),
+        B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_route_topk(
     const float* m, const void* router_w, const float* router_bias,
-    float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups, int32_t B, void* stream) {
+    float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups,
+    const int32_t* slot_map, int32_t layer_idx, const void* x_h, void* d_bell, void* d_cpu_state,
+    int32_t B, void* stream) {
     launch_route_topk(
         m, static_cast<const __nv_bfloat16*>(router_w), router_bias,
-        scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr, B, static_cast<cudaStream_t>(stream));
+        scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr,
+        slot_map, layer_idx, static_cast<const __half*>(x_h),
+        static_cast<CpuMoeBell*>(d_bell), static_cast<CpuMoeDevState*>(d_cpu_state),
+        B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_moe_cpu_dispatch(
@@ -767,20 +775,20 @@ void squid_launch_moe_cpu_merge(
 
 void squid_launch_moe_gate_up_h(
     const CExpertBank* w13, const void* x_h, const int32_t* route_ids, const void* groups,
-    const void* cpu_state, void* out_act_h, int32_t B, void* stream) {
+    const void* cpu_state, void* out_act_h, int32_t B, uint8_t is_loop_layer, void* stream) {
     launch_moe_gate_up_h(to_eb(*w13), static_cast<const __half*>(x_h), route_ids,
                          static_cast<const ExpertGroups*>(groups),
                          static_cast<const CpuMoeDevState*>(cpu_state),
-                         static_cast<__half*>(out_act_h), B, static_cast<cudaStream_t>(stream));
+                         static_cast<__half*>(out_act_h), B, is_loop_layer != 0, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_moe_down_h(
     const CExpertBank* w2, const void* act_h, const int32_t* route_ids, const float* route_w,
-    const void* groups, const void* cpu_state, float* out_down, int32_t B, void* stream) {
+    const void* groups, const void* cpu_state, float* out_down, int32_t B, uint8_t is_loop_layer, void* stream) {
     launch_moe_down_h(to_eb(*w2), static_cast<const __half*>(act_h), route_ids, route_w,
                       static_cast<const ExpertGroups*>(groups),
                       static_cast<const CpuMoeDevState*>(cpu_state),
-                      out_down, B, static_cast<cudaStream_t>(stream), true);
+                      out_down, B, is_loop_layer != 0, static_cast<cudaStream_t>(stream), true);
 }
 
 void squid_launch_mega_mlp_post_res(
@@ -881,8 +889,42 @@ int32_t squid_adaptive_graph_create(
     err = cudaStreamBeginCaptureToGraph(s, ag->root_graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal);
     if (err != cudaSuccess) { cudaGraphDestroy(ag->root_graph); delete ag; return (int32_t)err; }
 
+    // Phase 4: Calibrated 5-way {1, 2, 3, 4, 8} switch costs (verified via bracketed 6-prompt A/B on RTX 5060 8 GB!)
+    float c2 = is_cached_gpu ? 1.45f : 1.05f;
+    float c3 = is_cached_gpu ? 1.70f : 1.10f;
+    float c4 = is_cached_gpu ? 2.05f : 1.15f;
+    float c8 = is_cached_gpu ? 3.20f : 1.35f;
+    float gamma_base = is_cached_gpu ? 1.50f : 1.15f;
+    float temp_slope = 0.40f;
+    if (const char* ev = std::getenv("SQUID_ADAPT_LEGACY")) {
+        if (ev[0] == '1') {
+            c2 = is_cached_gpu ? 1.30f : 1.05f;
+            c3 = 999.0f; // disable B=3 branch -> exact 4-way legacy behavior
+            c4 = is_cached_gpu ? 2.45f : 1.15f;
+            c8 = is_cached_gpu ? 4.50f : 1.35f;
+            gamma_base = is_cached_gpu ? 1.50f : 1.15f;
+            temp_slope = 0.45f;
+        }
+    }
+    if (const char* ev = std::getenv("SQUID_ADAPT_COSTS")) {
+        float tc2 = c2, tc3 = c3, tc4 = c4, tc8 = c8;
+        if (std::sscanf(ev, "%f,%f,%f,%f", &tc2, &tc3, &tc4, &tc8) == 4) {
+            c2 = tc2; c3 = tc3; c4 = tc4; c8 = tc8;
+        }
+    }
+    if (const char* ev = std::getenv("SQUID_ADAPT_GAMMA")) {
+        float g = std::strtof(ev, nullptr);
+        if (g >= 0.25f && g <= 4.0f) gamma_base = g;
+    }
+    if (const char* ev = std::getenv("SQUID_ADAPT_TSLOPE")) {
+        float ts = std::strtof(ev, nullptr);
+        if (ts >= 0.0f && ts <= 2.0f) temp_slope = ts;
+    }
+
     z_adaptive_select_width_kernel<<<1, 1, 0, s>>>(
-        d_anchor, d_drafts, d_draft_conf, d_sample_cfg, threshold, is_cached_gpu, d_tokens, d_chosen_width, ag->handle);
+        d_anchor, d_drafts, d_draft_conf, d_sample_cfg, threshold,
+        c2, c3, c4, c8, gamma_base, temp_slope,
+        d_tokens, d_chosen_width, ag->handle);
 
     cudaStreamCaptureStatus status;
     cudaGraph_t g = nullptr;
@@ -899,7 +941,7 @@ int32_t squid_adaptive_graph_create(
     p.type = cudaGraphNodeTypeConditional;
     p.conditional.handle = ag->handle;
     p.conditional.type = cudaGraphCondTypeSwitch;
-    p.conditional.size = 4;
+    p.conditional.size = 5;
     cudaGraphNode_t sw_node = nullptr;
     err = cudaGraphAddNode(&sw_node, g, deps, edges, ndeps, &p);
     if (err != cudaSuccess) {
@@ -910,6 +952,7 @@ int32_t squid_adaptive_graph_create(
     ag->bodies[1] = p.conditional.phGraph_out[1];
     ag->bodies[2] = p.conditional.phGraph_out[2];
     ag->bodies[3] = p.conditional.phGraph_out[3];
+    ag->bodies[4] = p.conditional.phGraph_out[4];
 
     err = cudaStreamUpdateCaptureDependencies(s, &sw_node, nullptr, 1, cudaStreamSetCaptureDependencies);
     if (err != cudaSuccess) {
