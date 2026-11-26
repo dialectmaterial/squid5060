@@ -49,9 +49,9 @@ pub const GenerateStats = struct {
 /// On a >=16-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
 /// bypassing the DSpark neural pass completely (~5 ns CPU lookup vs ~400 us GPU draft).
 const PromptLookupIndex = struct {
-    const hist_cap: usize = 8_192;
+    const hist_cap: usize = 65_536;
     const hist_mask: usize = hist_cap - 1;
-    const table_cap: usize = 16_384;
+    const table_cap: usize = 65_536;
     const table_mask: usize = table_cap - 1;
     const min_match_len: u32 = 16;
 
@@ -130,7 +130,9 @@ const PromptLookupIndex = struct {
     }
 };
 
-const prefix_checkpoint_count: usize = 4;
+const prefix_checkpoint_count: usize = 8; // 0=system, 1=rolling 512/2K grid, 2=prefill_end, 3=post_decode, 4..7=turn boundaries
+const turn_checkpoint_first: usize = 4;
+const turn_checkpoint_count: usize = 4;
 const parked_slots_max: usize = 8;
 const side_shield_max_tokens: u32 = 4096;
 const prefill_batch_max: u32 = 2048;
@@ -141,6 +143,10 @@ inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
     const bytes: [*]u8 = @ptrCast(base);
     return @ptrCast(bytes + elem_offset * 2);
 }
+
+const lazy_kv_base_cap: u32 = 32_768;
+const dspark_global_kv_cap_8gb: u32 = 32_768;
+const lazy_global_visits = [4]u32{ 5, 35, 41, 47 };
 
 const LocalStateCheckpoint = struct {
     pos: u32 = 0,
@@ -230,6 +236,12 @@ pub const Engine = struct {
     prefill_dyn_tail: bool = true,
     prefill_aliased: bool = false,
     share_loop_kv: bool = false,
+    lazy_kv_enabled: bool = false,
+    active_global_cap: u32 = 0,
+    base_global_k: [4]?*anyopaque = @splat(null),
+    base_global_v: [4]?*anyopaque = @splat(null),
+    base_global_ks: [4]?*anyopaque = @splat(null),
+    base_global_vs: [4]?*anyopaque = @splat(null),
     active_images: []vision_mod.ImageSpan = &.{},
     prefill_cur_prompt_pos: u32 = std.math.maxInt(u32),
     pending_post_decode_ckpt: bool = false,
@@ -373,6 +385,13 @@ pub const Engine = struct {
             if (std.mem.eql(u8, s, "0")) share_loop_kv = false else if (std.mem.eql(u8, s, "1")) share_loop_kv = (context_tokens_max > constants.swa_window_tokens + 64);
         }
         self.share_loop_kv = share_loop_kv;
+        var lazy_kv: bool = weights.use_expert_cache and share_loop_kv and (context_tokens_max > lazy_kv_base_cap);
+        if (tiger.getenv("SQUID_LAZY_KV")) |lkv| {
+            const s = std.mem.span(lkv);
+            if (std.mem.eql(u8, s, "0")) lazy_kv = false;
+        }
+        self.lazy_kv_enabled = lazy_kv;
+        self.active_global_cap = if (lazy_kv) lazy_kv_base_cap else context_tokens_max;
         self.schedule = constants.build_visit_schedule();
 
         tiger.assert_cuda(cuda.squid_cuda_stream_create(&self.stream));
@@ -408,8 +427,8 @@ pub const Engine = struct {
 
         const rt_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[engine] Initialized max_ctx={d} | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices, prefill_alias={d}) | graphs={s}\n",
-            .{ context_tokens_max, kv_format.name(), rt_gib, self.arena.allocation_count, @as(u8, if (alias_prefill) 1 else 0), if (use_graphs) "on" else "off" },
+            "[engine] Initialized max_ctx={d} (active_kv={d}, lazy_kv={d}) | kv={s} | runtime VRAM={d:.2} GiB (1 arena, {d} slices, prefill_alias={d}) | graphs={s}\n",
+            .{ context_tokens_max, self.active_global_cap, @as(u8, if (self.lazy_kv_enabled) 1 else 0), kv_format.name(), rt_gib, self.arena.allocation_count, @as(u8, if (alias_prefill) 1 else 0), if (use_graphs) "on" else "off" },
         );
         self.reset();
     }
@@ -418,6 +437,9 @@ pub const Engine = struct {
         tiger.assert(self.arena.base_ptr == null);
         const weights = self.weights.?;
         const context_tokens_max = self.context_tokens_max;
+        const init_global_cap: u32 = if (self.lazy_kv_enabled) lazy_kv_base_cap else context_tokens_max;
+        const dspark_global_cap: u32 = compute_dspark_global_kv_cap(context_tokens_max, weights.use_expert_cache);
+        self.active_global_cap = init_global_cap;
         const kv_format = self.kv_format;
         const alias_prefill = self.prefill_aliased;
 
@@ -434,7 +456,8 @@ pub const Engine = struct {
         // Pass 1: compute exact aligned runtime VRAM requirement -> 1 single cudaMalloc!
         const runtime_bytes: u64 = compute_runtime_vram_bytes(
             &self.schedule,
-            context_tokens_max,
+            init_global_cap,
+            dspark_global_cap,
             kv_format,
             self.local_kv_format,
             self.share_loop_kv,
@@ -450,7 +473,7 @@ pub const Engine = struct {
         var vi: u32 = 0;
         while (vi < constants.visit_count) : (vi += 1) {
             const is_glob: bool = self.schedule[vi].is_global;
-            const cap: u32 = visit_kv_cap(&self.schedule, vi, context_tokens_max, self.share_loop_kv);
+            const cap: u32 = visit_kv_cap(&self.schedule, vi, init_global_cap, self.share_loop_kv);
             const vfmt: constants.KVFormat = if (is_glob) kv_format else self.local_kv_format;
             self.kv_cap[vi] = @intCast(cap);
             self.alloc_kv_pair(cap, vfmt, &self.k_cache[vi], &self.v_cache[vi], &self.k_scale[vi], &self.v_scale[vi]);
@@ -459,6 +482,12 @@ pub const Engine = struct {
             self.attn_ring[vi] = self.arena.alloc_many(f32, constants.sconv_ring_slots * constants.hidden_dim);
             self.mlp_ring[vi] = self.arena.alloc_many(f32, constants.sconv_ring_slots * constants.hidden_dim);
         }
+        for (lazy_global_visits, 0..) |gvi, gi| {
+            self.base_global_k[gi] = self.k_cache[gvi];
+            self.base_global_v[gi] = self.v_cache[gvi];
+            self.base_global_ks[gi] = self.k_scale[gvi];
+            self.base_global_vs[gi] = self.v_scale[gvi];
+        }
 
         if (has_dspark) {
             var ml: u32 = 0;
@@ -466,10 +495,8 @@ pub const Engine = struct {
                 const is_loc: bool = constants.is_mtp_local_layer(ml);
                 const cap: u32 = if (is_loc)
                     (constants.swa_window_tokens + constants.mtp_block_size_max)
-                else if (context_tokens_max > 524_288)
-                    65_536
                 else
-                    context_tokens_max;
+                    dspark_global_cap;
                 const lfmt: constants.KVFormat = if (is_loc) .bf16 else kv_format;
                 self.ds_kv_cap[ml] = @intCast(cap);
                 self.alloc_kv_pair(cap, lfmt, &self.ds_k_cache[ml], &self.ds_v_cache[ml], &self.ds_k_scale[ml], &self.ds_v_scale[ml]);
@@ -783,6 +810,131 @@ pub const Engine = struct {
         self.p_ctrl_g = self.p_qrgs + pb * constants.hidden_dim;
 
         tiger.assert(off == compute_prefill_scratch_bytes(pb_u32));
+    }
+
+    fn lazy_kv_tier_for(self: *const Engine, required_tokens: u32) u32 {
+        if (required_tokens <= lazy_kv_base_cap) return lazy_kv_base_cap;
+        if (required_tokens <= 65_536) return @min(self.context_tokens_max, 65_536);
+        if (required_tokens <= 131_072) return @min(self.context_tokens_max, 131_072);
+        return self.context_tokens_max;
+    }
+
+    /// Grow or shrink the 4 target global KV visits lazily using tail slots of `d_cache_pool`.
+    /// When `preserve_tokens > 0`, never shrinks and losslessly preserves existing global KV contents!
+    pub fn ensure_global_kv_cap(self: *Engine, required_tokens: u32, preserve_tokens: u32) void {
+        if (!self.lazy_kv_enabled or !self.expert_cache.enabled) return;
+        const clamped_req: u32 = @min(required_tokens, self.context_tokens_max);
+        var target: u32 = self.lazy_kv_tier_for(clamped_req);
+        if (preserve_tokens > 0 and target < self.active_global_cap) return;
+        if (target == self.active_global_cap) return;
+
+        const w = self.weights.?;
+        const a: u64 = constants.vram_alignment_bytes;
+        const slot_bytes: u64 = constants.expert_slot_bytes;
+        const pair_bytes: u64 = constants.kv_cache_pair_vram_bytes(target, self.kv_format);
+        const need_kv_slots: u32 = if (target <= lazy_kv_base_cap)
+            0
+        else
+            @intCast((4 * pair_bytes + slot_bytes - 1) / slot_bytes);
+
+        // Guard: ensure enough VRAM slots exist for both KV tail and minimum prefill/decode headroom.
+        if (need_kv_slots + 48 >= self.expert_cache.num_slots) {
+            tiger.print_stderr(
+                "[kv-lazy] ERROR: cannot grow global KV to {d} ({d} slots needed, only {d} total cache slots)\n",
+                .{ target, need_kv_slots, self.expert_cache.num_slots },
+            );
+            return;
+        }
+
+        // Release any borrowed prefill scratch before resizing the KV tail.
+        if (self.prefill_aliased and self.expert_cache.prefill_reserved_tail > 0) {
+            self.expert_cache.release_prefill_scratch(self.stream, false);
+            self.prefill_bound_cap = 0;
+        }
+
+        // Preserve existing live target global KV across pointer rebind (host bounce avoids any overlap!).
+        var saved_buf: []u8 = &.{};
+        defer if (saved_buf.len > 0) tiger.free_host_slice(u8, saved_buf);
+        const keep_toks: u32 = @min(preserve_tokens, self.active_global_cap);
+        if (keep_toks > 0) {
+            const sz = global_kv_bytes_for_tokens(self.kv_format, keep_toks);
+            const per_visit: usize = 2 * sz.data + 2 * sz.scale;
+            saved_buf = tiger.alloc_host_zeroed(u8, 4 * per_visit);
+            var off: usize = 0;
+            for (lazy_global_visits) |gvi| {
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(saved_buf[off..].ptr), self.k_cache[gvi].?, sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(saved_buf[off..].ptr), self.v_cache[gvi].?, sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(saved_buf[off..].ptr), self.k_scale[gvi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(saved_buf[off..].ptr), self.v_scale[gvi].?, sz.scale, self.stream));
+                    off += sz.scale;
+                }
+            }
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
+
+        const old_cap = self.active_global_cap;
+        const tail_ptr_opt = self.expert_cache.set_kv_reserved_tail(need_kv_slots, w, self.stream);
+        if (target <= lazy_kv_base_cap) {
+            for (lazy_global_visits, 0..) |gvi, gi| {
+                self.k_cache[gvi] = self.base_global_k[gi];
+                self.v_cache[gvi] = self.base_global_v[gi];
+                self.k_scale[gvi] = self.base_global_ks[gi];
+                self.v_scale[gvi] = self.base_global_vs[gi];
+                self.kv_cap[gvi] = @intCast(lazy_kv_base_cap);
+            }
+            target = lazy_kv_base_cap;
+        } else {
+            const base: [*]u8 = tail_ptr_opt.?;
+            const sz_t = global_kv_bytes_for_tokens(self.kv_format, target);
+            var off: u64 = 0;
+            for (lazy_global_visits) |gvi| {
+                self.k_cache[gvi] = @ptrCast(base + @as(usize, @intCast(off)));
+                off += tiger.align_up_u64(sz_t.data, a);
+                self.v_cache[gvi] = @ptrCast(base + @as(usize, @intCast(off)));
+                off += tiger.align_up_u64(sz_t.data, a);
+                if (sz_t.scale > 0) {
+                    self.k_scale[gvi] = @ptrCast(base + @as(usize, @intCast(off)));
+                    off += tiger.align_up_u64(sz_t.scale, a);
+                    self.v_scale[gvi] = @ptrCast(base + @as(usize, @intCast(off)));
+                    off += tiger.align_up_u64(sz_t.scale, a);
+                } else {
+                    self.k_scale[gvi] = null;
+                    self.v_scale[gvi] = null;
+                }
+                self.kv_cap[gvi] = @intCast(target);
+            }
+            tiger.assert(off == 4 * pair_bytes);
+        }
+        self.active_global_cap = target;
+
+        if (keep_toks > 0) {
+            const sz = global_kv_bytes_for_tokens(self.kv_format, keep_toks);
+            var off: usize = 0;
+            for (lazy_global_visits) |gvi| {
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_cache[gvi].?, @ptrCast(saved_buf[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_cache[gvi].?, @ptrCast(saved_buf[off..].ptr), sz.data, self.stream));
+                off += sz.data;
+                if (sz.scale > 0) {
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.k_scale[gvi].?, @ptrCast(saved_buf[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                    tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(self.v_scale[gvi].?, @ptrCast(saved_buf[off..].ptr), sz.scale, self.stream));
+                    off += sz.scale;
+                }
+            }
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
+
+        // Global KV pointers & kv_cap changed: invalidate cached CUDA Graphs (they lazily recapture!).
+        self.destroy_graphs();
+        tiger.print_stdout(
+            "[kv-lazy] Global KV resized {d}K -> {d}K (kv_tail_slots={d}, active_experts={d}, preserved={d} tok)\n",
+            .{ old_cap / 1024, target / 1024, need_kv_slots, self.expert_cache.usable_slots(), keep_toks },
+        );
     }
 
     fn destroy_graphs(self: *Engine) void {
@@ -1104,7 +1256,9 @@ pub const Engine = struct {
             }
         }
         if (self.ds_f_ring != null) {
-            total += 2 * sz.data + 2 * sz.scale; // DSpark layer 1 (global)
+            const ds_tokens: u32 = @min(token_count, @as(u32, @intCast(self.ds_kv_cap[1])));
+            const dsz = global_kv_bytes_for_tokens(self.kv_format, ds_tokens);
+            total += 2 * dsz.data + 2 * dsz.scale; // DSpark layer 1 (global)
         }
         return total;
     }
@@ -1354,8 +1508,9 @@ pub const Engine = struct {
             if (sl.local_state.len > 0) tiger.free_host_slice(u8, sl.local_state);
             sl.local_state = tiger.alloc_host_zeroed(u8, pc.local_state_bytes);
         }
-        if (sl.cap_tokens < park_len) {
-            const aligned: u32 = @intCast(@min(@as(u64, self.context_tokens_max), tiger.align_up_u64(park_len, 2048)));
+        const aligned: u32 = @intCast(@min(@as(u64, self.context_tokens_max), tiger.align_up_u64(park_len, 2048)));
+        const should_shrink: bool = (sl.cap_tokens > 32_768 and aligned * 2 < sl.cap_tokens);
+        if (sl.cap_tokens < park_len or should_shrink) {
             if (sl.tokens.len > 0) tiger.free_host_slice(i32, sl.tokens);
             if (sl.global_kv.len > 0) tiger.free_host_slice(u8, sl.global_kv);
             sl.tokens = tiger.alloc_host_zeroed(i32, aligned);
@@ -1408,6 +1563,7 @@ pub const Engine = struct {
         const local_src: []const u8 = if (use_prefill_ckpt) sl.prefill_local_state else sl.local_state;
         tiger.assert(restore_len >= 128 and local_src.len == pc.local_state_bytes);
 
+        self.ensure_global_kv_cap(restore_len + 2048, 0);
         self.restore_local_state_buf(local_src);
         self.copy_global_kv_buf(sl.global_kv, restore_len, false);
 
@@ -1449,6 +1605,20 @@ pub const Engine = struct {
         self: *Engine,
         prompt: []const i32,
         system_prefix_hint: u32,
+        max_new_tokens_in: u32,
+        num_drafts_in: u32,
+        out_tokens: []i32,
+        on_token: ?TokenCallbackFn,
+        callback_context: ?*anyopaque,
+    ) GenerateStats {
+        return self.generate_with_hints(prompt, system_prefix_hint, &.{}, max_new_tokens_in, num_drafts_in, out_tokens, on_token, callback_context);
+    }
+
+    pub fn generate_with_hints(
+        self: *Engine,
+        prompt: []const i32,
+        system_prefix_hint: u32,
+        turn_hints: []const u32,
         max_new_tokens_in: u32,
         num_drafts_in: u32,
         out_tokens: []i32,
@@ -1620,6 +1790,12 @@ pub const Engine = struct {
             }
         }
 
+        // Ensure lazy global KV tier fits this request (shrink back to 32K on fresh short sessions!).
+        if (self.lazy_kv_enabled and shield_tokens == 0) {
+            const need_kv: u32 = @min(self.context_tokens_max, prompt_len + @min(max_new_tokens, 2048));
+            self.ensure_global_kv_cap(need_kv, start_pos);
+        }
+
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
         // Invalidate any stale checkpoints past the branch point `start_pos` BEFORE prefill writes new KV!
         if (self.prefix_cache.enabled and shield_tokens == 0) {
@@ -1632,26 +1808,111 @@ pub const Engine = struct {
             self.ensure_prefill_b8_graph(use_mtp);
         }
 
-        // Intermediate checkpoint targets (only when updating main session, not shielded side requests)
-        var target_sys: u32 = 0;
-        var target_2k: u32 = 0;
+        // Intermediate checkpoint targets (system + rolling 512/2K grid + up to 4 recent turn boundaries)
+        const CkptTarget = struct { pos: u32 = 0, slot: usize = 0 };
+        var targets: [6]CkptTarget = @splat(.{});
+        var n_targets: usize = 0;
+
         if (self.prefix_cache.enabled and shield_tokens == 0) {
-            if (system_prefix_hint >= 128 and system_prefix_hint > start_pos and system_prefix_hint < prompt_len) {
-                target_sys = system_prefix_hint;
+            // Preserve prior prefill_end (slot 2) into a rolling turn slot (4..7) if it sits at/before start_pos!
+            if (self.prefix_cache.checkpoints[2].valid and self.prefix_cache.checkpoints[2].pos >= 128 and self.prefix_cache.checkpoints[2].pos <= start_pos) {
+                const p2_pos = self.prefix_cache.checkpoints[2].pos;
+                var already_saved: bool = false;
+                var ts: usize = turn_checkpoint_first;
+                while (ts < prefix_checkpoint_count) : (ts += 1) {
+                    if (self.prefix_cache.checkpoints[ts].valid and self.prefix_cache.checkpoints[ts].pos == p2_pos) {
+                        already_saved = true;
+                        break;
+                    }
+                }
+                if (!already_saved) {
+                    // Pick an invalid slot in 4..7, else the slot with the smallest (oldest) pos
+                    var dst_ts: usize = turn_checkpoint_first;
+                    var min_pos: u32 = std.math.maxInt(u32);
+                    ts = turn_checkpoint_first;
+                    while (ts < prefix_checkpoint_count) : (ts += 1) {
+                        if (!self.prefix_cache.checkpoints[ts].valid) {
+                            dst_ts = ts;
+                            break;
+                        }
+                        if (self.prefix_cache.checkpoints[ts].pos < min_pos) {
+                            min_pos = self.prefix_cache.checkpoints[ts].pos;
+                            dst_ts = ts;
+                        }
+                    }
+                    @memcpy(self.prefix_cache.checkpoints[dst_ts].data, self.prefix_cache.checkpoints[2].data);
+                    self.prefix_cache.checkpoints[dst_ts].pos = p2_pos;
+                    self.prefix_cache.checkpoints[dst_ts].valid = true;
+                }
             }
-            const p2k: u32 = ((prompt_len - 1) / 2048) * 2048;
-            if (p2k >= 2048 and p2k > start_pos and p2k < prompt_len and p2k != target_sys) {
-                target_2k = p2k;
+
+            if (system_prefix_hint >= 128 and system_prefix_hint > start_pos and system_prefix_hint < prompt_len) {
+                targets[n_targets] = .{ .pos = system_prefix_hint, .slot = 0 };
+                n_targets += 1;
+            }
+            // Rolling sub-2K (512-tok grid for <4K prompts) or 2K grid for >=4K prompts!
+            const grid_step: u32 = if (prompt_len < 4096) 512 else 2048;
+            const pgrid: u32 = ((prompt_len - 1) / grid_step) * grid_step;
+            if (pgrid >= grid_step and pgrid > start_pos and pgrid < prompt_len and pgrid != system_prefix_hint) {
+                targets[n_targets] = .{ .pos = pgrid, .slot = 1 };
+                n_targets += 1;
+            }
+            // Up to 4 turn-boundary checkpoints (last 4 messages inside (start_pos .. prompt_len))
+            var next_turn_slot: usize = turn_checkpoint_first;
+            for (turn_hints) |th| {
+                if (n_targets >= targets.len) break;
+                if (th < 128 or th <= start_pos or th >= prompt_len) continue;
+                var dup: bool = false;
+                for (targets[0..n_targets]) |ex| {
+                    if (ex.pos == th) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                // Choose an invalid or oldest turn slot (4..7)
+                var chosen: usize = next_turn_slot;
+                var min_p: u32 = std.math.maxInt(u32);
+                var ts: usize = turn_checkpoint_first;
+                while (ts < prefix_checkpoint_count) : (ts += 1) {
+                    if (!self.prefix_cache.checkpoints[ts].valid) {
+                        chosen = ts;
+                        break;
+                    }
+                    if (self.prefix_cache.checkpoints[ts].pos < min_p) {
+                        min_p = self.prefix_cache.checkpoints[ts].pos;
+                        chosen = ts;
+                    }
+                }
+                // Avoid colliding with another pending target in this batch
+                var bump: usize = 0;
+                while (bump < turn_checkpoint_count) : (bump += 1) {
+                    var in_use: bool = false;
+                    for (targets[0..n_targets]) |ex| {
+                        if (ex.slot == chosen) in_use = true;
+                    }
+                    if (!in_use) break;
+                    chosen = turn_checkpoint_first + ((chosen - turn_checkpoint_first + 1) % turn_checkpoint_count);
+                }
+                targets[n_targets] = .{ .pos = th, .slot = chosen };
+                n_targets += 1;
+                next_turn_slot = turn_checkpoint_first + ((chosen - turn_checkpoint_first + 1) % turn_checkpoint_count);
+            }
+            // Insertion sort targets ascending by pos
+            var ti: usize = 1;
+            while (ti < n_targets) : (ti += 1) {
+                const key = targets[ti];
+                var tj: usize = ti;
+                while (tj > 0 and targets[tj - 1].pos > key.pos) : (tj -= 1) {
+                    targets[tj] = targets[tj - 1];
+                }
+                targets[tj] = key;
             }
         }
 
-        // Run prefill segment helper up to `seg_end` (strictly < prompt_len for intermediate checkpoints)
+        // Run prefill segment helper up to each intermediate checkpoint in ascending order
         var i: u32 = start_pos;
-        const targets = [_]struct { pos: u32, slot: usize }{
-            if (target_sys > 0 and (target_2k == 0 or target_sys < target_2k)) .{ .pos = target_sys, .slot = 0 } else .{ .pos = target_2k, .slot = 1 },
-            if (target_sys > 0 and target_2k > 0) (if (target_sys < target_2k) .{ .pos = target_2k, .slot = 1 } else .{ .pos = target_sys, .slot = 0 }) else .{ .pos = 0, .slot = 0 },
-        };
-        for (targets) |tgt| {
+        for (targets[0..n_targets]) |tgt| {
             if (tgt.pos > i and tgt.pos < prompt_len) {
                 i = self.prefill_range(prompt, i, tgt.pos, use_mtp, false);
                 self.save_local_state_checkpoint(tgt.slot, i);
@@ -1720,6 +1981,10 @@ pub const Engine = struct {
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
         if (!use_mtp) {
             while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
+                if (self.lazy_kv_enabled and @as(u32, @intCast(self.current_position)) + 16 >= self.active_global_cap and self.active_global_cap < self.context_tokens_max) {
+                    self.ensure_global_kv_cap(self.active_global_cap + 1, @intCast(self.current_position));
+                    if (self.use_graphs) self.ensure_b1_graph();
+                }
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
@@ -1754,9 +2019,17 @@ pub const Engine = struct {
                 }
             }
         } else if (use_adaptive) {
-            // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {1, 2, 4, 8} DSpark Speculative Decode!
-            // Disable Prompt-Lookup for stochastic sampling (T > 0, top_k != 1) to eliminate the rejection-sampling cliff!
-            const lookup_active: bool = self.use_prompt_lookup and !(self.sample_params.temperature >= 1e-4 and self.sample_params.top_k != 1);
+            // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {1, 2, 3, 4, 8} DSpark Speculative Decode!
+            // At T=0 (greedy): always active. At T>0 (stochastic, e.g. pi T=1.0): enabled for long contexts
+            // (>= 8192 tok, matching knapcio's DFLASH_PCOPY_MIN_CTX) with exact point-mass q=1 verification
+            // and 16-token match gating so verbatim code/doc edits accelerate with zero distribution bias!
+            const is_stochastic: bool = (self.sample_params.temperature >= 1e-4 and self.sample_params.top_k != 1);
+            var pcopy_min_ctx: usize = 8_192;
+            if (tiger.getenv("SQUID_PCOPY_MIN_CTX")) |ev| {
+                const parsed = std.fmt.parseInt(usize, std.mem.span(ev), 10) catch 8_192;
+                pcopy_min_ctx = parsed;
+            }
+            const lookup_active: bool = self.use_prompt_lookup and (!is_stochastic or (pcopy_min_ctx > 0 and prompt.len >= pcopy_min_ctx));
             if (lookup_active) {
                 self.prompt_lookup.reset();
                 const seed_start: usize = if (prompt.len > PromptLookupIndex.hist_cap) (prompt.len - PromptLookupIndex.hist_cap) else 0;
@@ -1766,6 +2039,14 @@ pub const Engine = struct {
 
             var draft_in_flight: bool = false;
             while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + constants.mtp_block_size_max <= self.context_tokens_max) {
+                if (self.lazy_kv_enabled and @as(u32, @intCast(self.current_position)) + 32 >= self.active_global_cap and self.active_global_cap < self.context_tokens_max) {
+                    if (draft_in_flight) {
+                        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                        draft_in_flight = false;
+                    }
+                    self.ensure_global_kv_cap(self.active_global_cap + 1, @intCast(self.current_position));
+                    self.ensure_adaptive_graphs();
+                }
                 var lookup_hit: bool = false;
                 if (lookup_active) {
                     const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
@@ -1853,6 +2134,10 @@ pub const Engine = struct {
         } else {
             const batch: i32 = @intCast(num_drafts + 1);
             while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + @as(u32, @intCast(batch)) <= self.context_tokens_max) {
+                if (self.lazy_kv_enabled and @as(u32, @intCast(self.current_position)) + 32 >= self.active_global_cap and self.active_global_cap < self.context_tokens_max) {
+                    self.ensure_global_kv_cap(self.active_global_cap + 1, @intCast(self.current_position));
+                    if (self.use_graphs) self.ensure_spec_graph(num_drafts);
+                }
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.spec_graph_exec[num_drafts].?, self.stream));
                 } else {
@@ -2097,8 +2382,17 @@ pub const Engine = struct {
             }
             if (self.expert_cache.prefill_reserved_tail == 0) {
                 const slot_bytes: u64 = constants.expert_slot_bytes;
-                const need_bytes: u64 = compute_prefill_scratch_bytes(eff_pb);
-                const need_slots: u32 = @min(self.prefill_tail_slots, @as(u32, @intCast((need_bytes + slot_bytes - 1) / slot_bytes)));
+                const avail_for_pf: u32 = if (self.expert_cache.num_slots > self.expert_cache.kv_reserved_tail + 24)
+                    (self.expert_cache.num_slots - self.expert_cache.kv_reserved_tail - 24)
+                else
+                    16;
+                var need_bytes: u64 = compute_prefill_scratch_bytes(eff_pb);
+                var need_slots: u32 = @min(self.prefill_tail_slots, @as(u32, @intCast((need_bytes + slot_bytes - 1) / slot_bytes)));
+                while (need_slots > avail_for_pf and eff_pb > chunk_len and eff_pb > 64) {
+                    eff_pb = @max(chunk_len, eff_pb / 2);
+                    need_bytes = compute_prefill_scratch_bytes(eff_pb);
+                    need_slots = @min(self.prefill_tail_slots, @as(u32, @intCast((need_bytes + slot_bytes - 1) / slot_bytes)));
+                }
                 const tail_base = self.expert_cache.acquire_prefill_scratch(need_slots, self.stream);
                 self.bind_prefill_scratch_from_base(tail_base, eff_pb);
                 self.prefill_bound_cap = eff_pb;
@@ -2723,6 +3017,9 @@ pub const Engine = struct {
         if (sim_pos > max_allowed) sim_pos = tiger.max_i32(0, max_allowed);
 
         self.reset();
+        if (self.lazy_kv_enabled) {
+            self.ensure_global_kv_cap(@as(u32, @intCast(sim_pos)) + 256, 0);
+        }
 
         // Zero-init all KV caches (global + local) so synthetic longctx reads are strictly finite (zero NaN)
         var vi: u32 = 0;
@@ -3682,9 +3979,20 @@ fn visit_kv_cap(
     return context_tokens_max;
 }
 
+fn compute_dspark_global_kv_cap(context_tokens_max: u32, use_expert_cache: bool) u32 {
+    if (tiger.getenv("SQUID_DSPARK_KV_CAP")) |ev| {
+        const parsed = std.fmt.parseInt(u32, std.mem.span(ev), 10) catch 0;
+        if (parsed >= 1024) return @min(context_tokens_max, parsed);
+    }
+    if (use_expert_cache) return @min(context_tokens_max, dspark_global_kv_cap_8gb);
+    if (context_tokens_max > 524_288) return 65_536;
+    return context_tokens_max;
+}
+
 fn compute_runtime_vram_bytes(
     schedule: *const [constants.visit_count]constants.VisitInfo,
-    context_tokens_max: u32,
+    init_global_cap: u32,
+    dspark_global_cap: u32,
     kv_format: constants.KVFormat,
     local_kv_format: constants.KVFormat,
     share_loop_kv: bool,
@@ -3700,7 +4008,7 @@ fn compute_runtime_vram_bytes(
     var vi: u32 = 0;
     while (vi < constants.visit_count) : (vi += 1) {
         const is_glob = schedule[vi].is_global;
-        const cap: u32 = visit_kv_cap(schedule, vi, context_tokens_max, share_loop_kv);
+        const cap: u32 = visit_kv_cap(schedule, vi, init_global_cap, share_loop_kv);
         const vfmt: constants.KVFormat = if (is_glob) kv_format else local_kv_format;
         total += constants.kv_cache_pair_vram_bytes(cap, vfmt);
         total += 2 * tiger.align_up_u64(constants.sconv_ring_slots * constants.kv_dim * 4, a);
@@ -3713,10 +4021,8 @@ fn compute_runtime_vram_bytes(
             const is_loc = constants.is_mtp_local_layer(ml);
             const cap: u32 = if (is_loc)
                 (constants.swa_window_tokens + constants.mtp_block_size_max)
-            else if (context_tokens_max > 524_288)
-                65_536
             else
-                context_tokens_max;
+                dspark_global_cap;
             const lfmt: constants.KVFormat = if (is_loc) .bf16 else kv_format;
             total += constants.kv_cache_pair_vram_bytes(cap, lfmt);
         }

@@ -1762,6 +1762,10 @@ struct LmSampleScratch {
     float tau[8];
     float z_sum[8];
     int32_t accepted[8];
+    float bv_prefix[8];
+    float bv_rm[8];
+    int32_t bv_num_acc;
+    float bv_res_scale;
     unsigned long long hist_sum[8][256];
     uint32_t hist_cnt[8][256];
     float part_val[8][SAMP_PARTS];
@@ -1818,6 +1822,8 @@ lm_head_stage2_argmax_kernel(
             g_lm_samp.max_idx[b] = bi;
             g_lm_samp.z_sum[b] = 0.0f;
             g_lm_samp.accepted[b] = 0;
+            g_lm_samp.bv_prefix[b] = 0.0f;
+            g_lm_samp.bv_rm[b] = 0.0f;
         }
     }
 }
@@ -1990,6 +1996,167 @@ lm_head_sample_tau_z_gumbel_kernel(
     }
 }
 
+// Sun et al. (ICLR 2025, Algorithm 2) Exact Block Verification — Stage 1:
+// Compute clamped cumulative likelihood ratios prefix[step] = min(prefix[step-1] * p(x)/q(x), 1) in FP64.
+__global__ void __launch_bounds__(32)
+lm_head_bv_prefix_kernel(
+    const float* __restrict__ out_logits,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_draft_tokens,
+    const float* __restrict__ d_draft_q_sel,
+    const int32_t* __restrict__ d_draft_is_delta,
+    int V,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    if (threadIdx.x != 0) return;
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    if (!do_sample || d_draft_tokens == nullptr || B < 2) return;
+
+    const int g = B - 1;
+    const float inv_temp = sample_cfg->inv_temp;
+    const int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
+    double prefix = 1.0;
+    g_lm_samp.bv_prefix[0] = 1.0f;
+    for (int s = 0; s < g; ++s) {
+        const int32_t x = d_draft_tokens[s];
+        const float max_l = g_lm_samp.max_val[s];
+        const float tau_s = g_lm_samp.tau[s];
+        const float z_s = g_lm_samp.z_sum[s];
+        const float inv_z = (z_s > 0.0f) ? (1.0f / z_s) : 0.0f;
+        const float* logits = out_logits + (size_t)s * V;
+        const float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
+        const float px = (lx >= tau_s) ? (__expf((lx - max_l) * inv_temp) * inv_z) : 0.0f;
+        const float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[s] : 1.0f);
+        if (qx > 0.0f && qx <= 1.0f && px > 0.0f) {
+            double r = prefix * ((double)px / (double)qx);
+            prefix = (r < 1.0) ? r : 1.0;
+        } else {
+            prefix = 0.0;
+        }
+        g_lm_samp.bv_prefix[s + 1] = (float)prefix;
+    }
+}
+
+// Sun et al. (ICLR 2025, Algorithm 2) Exact Block Verification — Stage 2:
+// Compute residual mass rm[step] = sum_v max(prefix[step] * P_step(v) - Q_step(v), 0) for interior levels 1..g-1.
+__global__ void __launch_bounds__(256)
+lm_head_bv_rm_kernel(
+    const float* __restrict__ out_logits,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_draft_tokens,
+    const float* __restrict__ d_draft_probs,
+    const int32_t* __restrict__ d_draft_is_delta,
+    const int32_t* __restrict__ inv_draft_vocab,
+    int draft_vocab_size,
+    int V,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    const int step = blockIdx.y + 1; // 1 .. B-2
+    if (!do_sample || d_draft_tokens == nullptr || step >= B - 1) return;
+
+    const float pp = g_lm_samp.bv_prefix[step];
+    if (!(pp > 0.0f && pp < 1.0f)) return;
+
+    const int p = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float max_logit = g_lm_samp.max_val[step];
+    const float tau = g_lm_samp.tau[step];
+    const float tot_z = g_lm_samp.z_sum[step];
+    const float inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
+    const float inv_temp = sample_cfg->inv_temp;
+    const float* logits = out_logits + (size_t)step * V;
+    const int32_t x = d_draft_tokens[step];
+    const int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
+
+    const int per = (V + SAMP_PARTS - 1) / SAMP_PARTS;
+    const int start = p * per;
+    const int end = min(V, start + per);
+    float local_rm = 0.0f;
+    for (int row = start + tid; row < end; row += 256) {
+        float l = ld_dep_f32(logits + row);
+        if (l >= tau) {
+            float pv = __expf((l - max_logit) * inv_temp) * inv_z;
+            float qv = 0.0f;
+            if (is_d) {
+                qv = (row == x) ? 1.0f : 0.0f;
+            } else if (d_draft_probs != nullptr) {
+                int32_t didx = inv_draft_vocab ? inv_draft_vocab[row] : row;
+                if (didx >= 0 && didx < draft_vocab_size) {
+                    qv = d_draft_probs[(size_t)step * draft_vocab_size + didx];
+                }
+            }
+            float diff = pp * pv - qv;
+            if (diff > 0.0f) local_rm += diff;
+        }
+    }
+    local_rm = warp_sum(local_rm);
+    __shared__ float sv[8];
+    if ((tid & 31) == 0) sv[tid >> 5] = local_rm;
+    __syncthreads();
+    if (tid == 0) {
+        float tot_rm = 0.0f;
+        for (int w = 0; w < 8; ++w) tot_rm += sv[w];
+        if (tot_rm > 0.0f) atomicAdd(&g_lm_samp.bv_rm[step], tot_rm);
+    }
+}
+
+// Sun et al. (ICLR 2025, Algorithm 2) Exact Block Verification — Stage 3:
+// Backward walk selecting exact accepted prefix length `num_accept` and `res_scale`.
+__global__ void __launch_bounds__(32)
+lm_head_bv_decide_kernel(
+    const float* __restrict__ out_logits,
+    int32_t* __restrict__ out_tokens,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ d_draft_tokens,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    if (threadIdx.x != 0) return;
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    if (!do_sample || d_draft_tokens == nullptr || B < 2) return;
+
+    const int g = B - 1;
+    const uint64_t seed = sample_cfg->seed;
+    const int32_t base_pos = d_pos ? *d_pos : 0;
+    int num_accept = 0;
+    float res_scale = 1.0f;
+    for (int step = g; step >= 1; --step) {
+        const float pp = g_lm_samp.bv_prefix[step];
+        const float coin = hash_u01(seed ^ 0x517CC1B727220A95ULL, base_pos + (step - 1), 0x5A5A5A5A);
+        if (coin < pp) {
+            float acc_prob = pp;
+            if (step < g && pp > 0.0f && pp < 1.0f) {
+                float rm = g_lm_samp.bv_rm[step];
+                float denom = rm + (1.0f - pp);
+                acc_prob = (denom > 0.0f) ? (rm / denom) : pp;
+            }
+            if (coin < acc_prob) {
+                num_accept = step;
+                res_scale = pp;
+                break;
+            }
+        }
+    }
+    g_lm_samp.bv_num_acc = num_accept;
+    g_lm_samp.bv_res_scale = res_scale;
+    for (int b = 0; b < g; ++b) {
+        if (b < num_accept) {
+            g_lm_samp.accepted[b] = 1;
+            out_tokens[b] = d_draft_tokens[b];
+        } else if (b == num_accept) {
+            g_lm_samp.accepted[b] = 0;
+        } else {
+            // Rows strictly past num_accept are never emitted; skip finish_kernel work!
+            g_lm_samp.accepted[b] = 1;
+            out_tokens[b] = d_draft_tokens[b];
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256)
 lm_head_sample_verify_resid_kernel(
     const float* __restrict__ out_logits,
@@ -2003,7 +2170,8 @@ lm_head_sample_verify_resid_kernel(
     const int32_t* __restrict__ inv_draft_vocab,
     int draft_vocab_size,
     int V,
-    int B) {
+    int B,
+    int use_bv) {
     pdl_wait_fenced(0u);
     pdl_trigger();
     const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
@@ -2023,18 +2191,24 @@ lm_head_sample_verify_resid_kernel(
 
     const int32_t x = d_draft_tokens[b];
     const int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
-    const float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
-    const float px = (lx >= tau) ? (__expf((lx - max_logit) * inv_temp) * inv_z) : 0.0f;
-    const float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[b] : 1.0f);
-    const float u_acc = hash_u01(seed ^ 0x517CC1B727220A95ULL, pos, 0x5A5A5A5A);
-    const int32_t acc = (px > 0.0f && (qx <= 0.0f || (u_acc * qx <= px))) ? 1 : 0;
-
-    if (acc) {
-        if (p == 0 && tid == 0) {
-            g_lm_samp.accepted[b] = 1;
-            out_tokens[b] = x;
+    float res_scale = 1.0f;
+    if (use_bv) {
+        // Block Verification already decided exact `bv_num_acc`; only sample residual on the single rejected row!
+        if (b != g_lm_samp.bv_num_acc) return;
+        res_scale = g_lm_samp.bv_res_scale;
+    } else {
+        const float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
+        const float px = (lx >= tau) ? (__expf((lx - max_logit) * inv_temp) * inv_z) : 0.0f;
+        const float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[b] : 1.0f);
+        const float u_acc = hash_u01(seed ^ 0x517CC1B727220A95ULL, pos, 0x5A5A5A5A);
+        const int32_t acc = (px > 0.0f && (qx <= 0.0f || (u_acc * qx <= px))) ? 1 : 0;
+        if (acc) {
+            if (p == 0 && tid == 0) {
+                g_lm_samp.accepted[b] = 1;
+                out_tokens[b] = x;
+            }
+            return;
         }
-        return;
     }
 
     const int per = (V + SAMP_PARTS - 1) / SAMP_PARTS;
@@ -2042,6 +2216,9 @@ lm_head_sample_verify_resid_kernel(
     const int end = min(V, start + per);
     float best_s = -1e30f;
     int32_t best_t = -1;
+    // RSFIX fallback: track best strictly-positive target token != x in case FP32 rounding leaves no diff > 0
+    float fb_s = -1e30f;
+    int32_t fb_t = -1;
     for (int row = start + tid; row < end; row += 256) {
         float l = ld_dep_f32(logits + row);
         if (l >= tau) {
@@ -2055,15 +2232,26 @@ lm_head_sample_verify_resid_kernel(
                     qv = d_draft_probs[(size_t)b * draft_vocab_size + didx];
                 }
             }
-            float diff = pv - qv;
-            if (diff > 0.0f) {
+            float diff = res_scale * pv - qv;
+            if (row != x && diff > 0.0f) {
                 float sc = __logf(diff) + hash_gumbel(seed, pos, row);
                 if (sc > best_s || (sc == best_s && (best_t < 0 || row < best_t))) {
                     best_s = sc;
                     best_t = row;
                 }
+            } else if (row != x && pv > 0.0f) {
+                float fsc = (l - max_logit) * inv_temp + hash_gumbel(seed, pos, row);
+                if (fsc > fb_s || (fsc == fb_s && (fb_t < 0 || row < fb_t))) {
+                    fb_s = fsc;
+                    fb_t = row;
+                }
             }
         }
+    }
+    if (best_t < 0 && fb_t >= 0) {
+        // Only used when no lane in this partition had diff > 0 (shifted by -1e6 so any true diff > 0 always wins!)
+        best_s = fb_s - 1e6f;
+        best_t = fb_t;
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -3819,10 +4007,28 @@ static void dispatch_lm_head(
             out_logits, sample_cfg, d_pos, d_draft_tokens, u.rows, B_CONST);
         if constexpr (B_CONST > 1) {
             if (d_draft_tokens != nullptr) {
+                static int use_bv = -1;
+                if (use_bv < 0) {
+                    const char* ev = std::getenv("SQUID_BLOCK_VERIFY");
+                    // Opt-in via SQUID_BLOCK_VERIFY=1: at mtp=3 on 8 GB GPUs the extra 204K-vocab
+                    // residual-mass pass costs ~8% tok/s for <1% acceptance delta (RSFIX stays always on).
+                    use_bv = (ev != nullptr && ev[0] == '1') ? 1 : 0;
+                }
+                if (use_bv) {
+                    launch_pdl(lm_head_bv_prefix_kernel, dim3(1), 32, stream,
+                        out_logits, sample_cfg, d_draft_tokens, d_draft_q_sel, d_draft_is_delta, u.rows, B_CONST);
+                    if constexpr (B_CONST >= 3) {
+                        launch_pdl(lm_head_bv_rm_kernel, dim3(SAMP_PARTS, B_CONST - 2), 256, stream,
+                            out_logits, sample_cfg, d_draft_tokens, d_draft_probs, d_draft_is_delta,
+                            inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+                    }
+                    launch_pdl(lm_head_bv_decide_kernel, dim3(1), 32, stream,
+                        out_logits, out_toks, sample_cfg, d_pos, d_draft_tokens, B_CONST);
+                }
                 launch_pdl(lm_head_sample_verify_resid_kernel, dim3(SAMP_PARTS, B_CONST), 256, stream,
                     out_logits, out_toks, sample_cfg, d_pos,
                     d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta,
-                    inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+                    inv_draft_vocab, draft_vocab_size, u.rows, B_CONST, use_bv);
             }
         }
         launch_pdl(lm_head_sample_finish_kernel, dim3(B_CONST), SAMP_PARTS, stream,

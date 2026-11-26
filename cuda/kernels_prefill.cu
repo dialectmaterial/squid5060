@@ -1668,7 +1668,7 @@ p_dspark_store_ctx_kv_kernel(
 
 // BLACKWELL TENSOR CORE FLASHATTENTION PREFILL (Global & Local BF16/FP8/Q4 + Shared-Loop Global KV!)
 template <int KV_FMT, int Q_TOK>
-__global__ void __launch_bounds__((Q_TOK * GQA_RATIO / 16) * 32, 2)
+__global__ void __launch_bounds__((Q_TOK * GQA_RATIO / 16) * 32, (Q_TOK >= 64) ? 1 : 2)
 p_flash_attn_prefill_tc_kernel(
     const float* __restrict__ qrgs,
     const __nv_bfloat16* __restrict__ rel_proj,
@@ -1716,7 +1716,7 @@ p_flash_attn_prefill_tc_kernel(
     __shared__ __align__(16) uint16_t s_k[KV_STAGES][32][HEAD_DIM + 8];
     __shared__ __align__(16) uint16_t s_v[KV_STAGES][32][HEAD_DIM + 8];
     __shared__ __align__(16) __half s_r[Q_MAX][D_REL];
-    __shared__ __align__(16) __half s_rp[64][D_REL + 8];
+    __shared__ __align__(16) __half s_rp[Q_TOK + 32][D_REL + 8];
 
     for (int i = tid; i < q_cnt * D_REL; i += THREADS) {
         int qi = i >> 4;
@@ -2307,15 +2307,34 @@ void launch_prefill_flash_attn_tc(
                 qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, out_gated_h, kv_cap, window, B, d_pos);
         }
     } else {
-        if (kv_fmt == KVFormat::FP8) {
-            p_flash_attn_prefill_tc_kernel<1, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
-        } else if (kv_fmt == KVFormat::Q4) {
-            p_flash_attn_prefill_tc_kernel<2, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+        static int use_q64 = -1;
+        if (use_q64 < 0) {
+            const char* ev = std::getenv("SQUID_PREFILL_Q64");
+            use_q64 = (ev != nullptr && ev[0] == '1') ? 1 : 0;
+        }
+        if (use_q64 && B >= 64) {
+            dim3 grid64(NUM_KV_HEADS, (B + 63) / 64);
+            if (kv_fmt == KVFormat::FP8) {
+                p_flash_attn_prefill_tc_kernel<1, 64><<<grid64, 384, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            } else if (kv_fmt == KVFormat::Q4) {
+                p_flash_attn_prefill_tc_kernel<2, 64><<<grid64, 384, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            } else {
+                p_flash_attn_prefill_tc_kernel<0, 64><<<grid64, 384, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            }
         } else {
-            p_flash_attn_prefill_tc_kernel<0, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            if (kv_fmt == KVFormat::FP8) {
+                p_flash_attn_prefill_tc_kernel<1, 32><<<grid, 192, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            } else if (kv_fmt == KVFormat::Q4) {
+                p_flash_attn_prefill_tc_kernel<2, 32><<<grid, 192, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            } else {
+                p_flash_attn_prefill_tc_kernel<0, 32><<<grid, 192, 0, stream>>>(
+                    qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, k_bulk_cache, v_bulk_cache, k_bulk_scale, v_bulk_scale, bulk_kv_cap, out_gated_h, kv_cap, 0, B, d_pos);
+            }
         }
     }
 }

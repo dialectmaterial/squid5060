@@ -83,6 +83,75 @@ const ToolCallRecord = struct {
     name_len: usize = 0,
     args_offset: usize = 0,
     args_len: usize = 0,
+    streamed: bool = false,
+};
+
+const ToolRawEntry = struct {
+    valid: bool = false,
+    id_hex: [12]u8 = undefined,
+    name_hash: u64 = 0,
+    offset: usize = 0,
+    len: usize = 0,
+};
+
+/// Zero-malloc ring cache mapping server-minted tool call IDs (`call_<12hex>`) back to the
+/// exact raw JSON emitted by Inkling inside `<|content_invoke_tool_json|>...<|end_message|>`.
+/// Replaying the exact raw bytes on the next agent turn prevents whitespace/key-order drift
+/// from invalidating the `post_decode` KV prefix cache!
+const ToolRawHistoryCache = struct {
+    const entry_cap: usize = 64;
+    const storage_bytes: usize = 2 * 1024 * 1024;
+    entries: [entry_cap]ToolRawEntry = @splat(.{}),
+    next_slot: usize = 0,
+    storage: []u8,
+    write_head: usize = 0,
+
+    fn init() ToolRawHistoryCache {
+        return .{ .storage = tiger.alloc_host_zeroed(u8, storage_bytes) };
+    }
+
+    fn deinit(self: *ToolRawHistoryCache) void {
+        tiger.free_host_slice(u8, self.storage);
+    }
+
+    fn put(self: *ToolRawHistoryCache, id_hex: [12]u8, name: []const u8, raw_json: []const u8) void {
+        if (raw_json.len == 0 or raw_json.len > self.storage.len) return;
+        if (self.write_head + raw_json.len > self.storage.len) {
+            self.write_head = 0;
+        }
+        const dst = self.write_head;
+        const dst_end = dst + raw_json.len;
+        // Invalidate any prior ring entry whose storage slice overlaps [dst, dst_end).
+        for (&self.entries) |*e| {
+            if (e.valid and !(e.offset + e.len <= dst or e.offset >= dst_end)) {
+                e.valid = false;
+            }
+        }
+        @memcpy(self.storage[dst..dst_end], raw_json);
+        self.write_head = dst_end;
+        self.entries[self.next_slot] = .{
+            .valid = true,
+            .id_hex = id_hex,
+            .name_hash = tiger.hash_bytes_u64(name),
+            .offset = dst,
+            .len = raw_json.len,
+        };
+        self.next_slot = (self.next_slot + 1) & (entry_cap - 1);
+    }
+
+    fn lookup(self: *const ToolRawHistoryCache, id_str: []const u8, name: []const u8) ?[]const u8 {
+        if (id_str.len != 17 or !std.mem.startsWith(u8, id_str, "call_")) return null;
+        const id_hex = id_str[5..17];
+        const nh = tiger.hash_bytes_u64(name);
+        var i: usize = 0;
+        while (i < entry_cap) : (i += 1) {
+            const e = self.entries[i];
+            if (e.valid and e.name_hash == nh and std.mem.eql(u8, &e.id_hex, id_hex)) {
+                return self.storage[e.offset .. e.offset + e.len];
+            }
+        }
+        return null;
+    }
 };
 
 const ToolCallIdEntry = struct {
@@ -176,6 +245,7 @@ const ServerBuffers = struct {
     sse_buf: []u8,
     prompt_tokens: []i32,
     tool_id_map: ToolCallIdMap,
+    tool_raw_history: ToolRawHistoryCache,
     tok_scratch: tokenizer_mod.TokenizerScratch,
     image_decode_buf: []u8 = &.{},
     image_embeds_buf: []f32 = &.{},
@@ -193,6 +263,7 @@ const ServerBuffers = struct {
             .sse_buf = tiger.alloc_host_zeroed(u8, sse_frame_bytes),
             .prompt_tokens = tiger.alloc_host_zeroed(i32, prompt_tokens_max),
             .tool_id_map = ToolCallIdMap.init(),
+            .tool_raw_history = ToolRawHistoryCache.init(),
             .tok_scratch = tokenizer_mod.TokenizerScratch.init(),
         };
     }
@@ -219,6 +290,7 @@ const ServerBuffers = struct {
         tiger.free_host_slice(u8, self.sse_buf);
         tiger.free_host_slice(i32, self.prompt_tokens);
         self.tool_id_map.deinit();
+        self.tool_raw_history.deinit();
         if (self.image_decode_buf.len > 0) tiger.free_host_slice(u8, self.image_decode_buf);
         if (self.image_embeds_buf.len > 0) tiger.free_host_slice(f32, self.image_embeds_buf);
         self.tok_scratch.deinit();
@@ -226,10 +298,57 @@ const ServerBuffers = struct {
 };
 
 const InklingSection = enum(u8) { none, header, thinking, text, tool };
+const ToolStreamState = enum(u8) { idle, scanning, streaming_args, done_args, fallback };
+
+const ToolHeaderMatch = struct {
+    name: []const u8,
+    args_open_pos: usize,
+};
+
+fn try_match_tool_header(raw: []const u8, name_buf: []u8) ?ToolHeaderMatch {
+    var pos: usize = 0;
+    tokenizer_mod.skip_ws(raw, &pos);
+    if (pos >= raw.len or raw[pos] != '{') return null;
+    pos += 1;
+
+    var key_buf: [128]u8 = undefined;
+    var name_slice: []const u8 = "";
+    var iter: u32 = 0;
+    while (pos < raw.len and iter < 16) : (iter += 1) {
+        tokenizer_mod.skip_ws(raw, &pos);
+        if (pos >= raw.len or raw[pos] == '}') return null;
+        if (raw[pos] != '"') return null;
+        const k = tokenizer_mod.parse_json_string(raw, &pos, &key_buf) orelse return null;
+        tokenizer_mod.skip_ws(raw, &pos);
+        if (pos >= raw.len or raw[pos] != ':') return null;
+        pos += 1;
+        tokenizer_mod.skip_ws(raw, &pos);
+        if (pos >= raw.len) return null;
+
+        if (std.mem.eql(u8, k, "name")) {
+            name_slice = tokenizer_mod.parse_json_string(raw, &pos, name_buf) orelse return null;
+        } else if (std.mem.eql(u8, k, "args") or std.mem.eql(u8, k, "arguments")) {
+            if (raw[pos] == '{' and name_slice.len > 0) {
+                return .{ .name = name_slice, .args_open_pos = pos };
+            }
+            return null;
+        } else {
+            const before = pos;
+            tokenizer_mod.skip_json_value(raw, &pos);
+            if (pos >= raw.len or pos == before) return null;
+        }
+        tokenizer_mod.skip_ws(raw, &pos);
+        if (pos >= raw.len) return null;
+        if (raw[pos] == ',') pos += 1;
+    }
+    return null;
+}
 
 const InklingStreamParser = struct {
     tokenizer: *const tokenizer_mod.Tokenizer,
     raw_thinking: bool,
+    stream_tools: bool = false,
+    tool_raw_history: ?*ToolRawHistoryCache = null,
     section: InklingSection = .none,
     pending_utf8: [16]u8 = undefined,
     pending_utf8_len: usize = 0,
@@ -240,6 +359,17 @@ const InklingStreamParser = struct {
     tool_calls: [tool_calls_max]ToolCallRecord = undefined,
     tool_call_count: usize = 0,
     prng_state: u64,
+    // Live SSE tool_calls streaming state (active only when stream_tools == true)
+    tool_stream_state: ToolStreamState = .idle,
+    tool_stream_id: [12]u8 = @splat(0),
+    tool_stream_name_buf: [256]u8 = undefined,
+    tool_stream_name_len: usize = 0,
+    tool_stream_index: usize = 0,
+    tool_args_cursor: usize = 0,
+    tool_args_depth: i32 = 0,
+    tool_args_in_str: bool = false,
+    tool_args_escape: bool = false,
+    tool_stream_emitted_any: bool = false,
 
     fn init(
         tokenizer: *const tokenizer_mod.Tokenizer,
@@ -250,6 +380,7 @@ const InklingStreamParser = struct {
         return .{
             .tokenizer = tokenizer,
             .raw_thinking = raw_thinking,
+            .tool_raw_history = &buffers.tool_raw_history,
             .content_writer = tiger.ByteWriter.init(buffers.content_buf),
             .reasoning_writer = tiger.ByteWriter.init(buffers.reasoning_buf),
             .tool_raw_writer = tiger.ByteWriter.init(buffers.tool_raw_buf),
@@ -261,7 +392,57 @@ const InklingStreamParser = struct {
     const FeedDelta = struct {
         reasoning: []const u8 = &.{},
         content: []const u8 = &.{},
+        tool_header: bool = false,
+        tool_index: usize = 0,
+        tool_id: [12]u8 = @splat(0),
+        tool_name: []const u8 = &.{},
+        tool_args_delta: []const u8 = &.{},
     };
+
+    fn reset_tool_stream(self: *InklingStreamParser, start_scan: bool) void {
+        self.tool_stream_state = if (start_scan and self.stream_tools and self.tool_call_count < tool_calls_max) .scanning else .idle;
+        self.tool_stream_emitted_any = false;
+        self.tool_stream_name_len = 0;
+        self.tool_args_cursor = 0;
+        self.tool_args_depth = 0;
+        self.tool_args_in_str = false;
+        self.tool_args_escape = false;
+    }
+
+    fn advance_tool_args_stream(self: *InklingStreamParser) []const u8 {
+        const raw = self.tool_raw_writer.slice();
+        const scan_start = self.tool_args_cursor;
+        if (scan_start >= raw.len) return &.{};
+        const valid_end = scan_start + valid_utf8_prefix_len(raw[scan_start..raw.len]);
+        var i: usize = scan_start;
+        while (i < valid_end) : (i += 1) {
+            const c = raw[i];
+            if (self.tool_args_in_str) {
+                if (self.tool_args_escape) {
+                    self.tool_args_escape = false;
+                } else if (c == '\\') {
+                    self.tool_args_escape = true;
+                } else if (c == '"') {
+                    self.tool_args_in_str = false;
+                }
+            } else {
+                if (c == '"') {
+                    self.tool_args_in_str = true;
+                } else if (c == '{') {
+                    self.tool_args_depth += 1;
+                } else if (c == '}') {
+                    self.tool_args_depth -= 1;
+                    if (self.tool_args_depth == 0) {
+                        i += 1;
+                        self.tool_stream_state = .done_args;
+                        break;
+                    }
+                }
+            }
+        }
+        self.tool_args_cursor = i;
+        return raw[scan_start..i];
+    }
 
     fn feed(self: *InklingStreamParser, token_id: i32) FeedDelta {
         if (token_id == self.tokenizer.id_eos) return .{};
@@ -275,6 +456,7 @@ const InklingStreamParser = struct {
             self.section = .header;
             self.pending_utf8_len = 0;
             self.tool_raw_writer.reset();
+            self.reset_tool_stream(false);
             return .{};
         }
         if (token_id == self.tokenizer.id_thinking) {
@@ -290,6 +472,7 @@ const InklingStreamParser = struct {
         if (self.tokenizer.id_tool_json >= 0 and token_id == self.tokenizer.id_tool_json) {
             self.section = .tool;
             self.tool_raw_writer.reset();
+            self.reset_tool_stream(true);
             return .{};
         }
         if (token_id == self.tokenizer.id_end_message) {
@@ -297,6 +480,7 @@ const InklingStreamParser = struct {
                 self.parse_and_record_tool_call();
                 self.tool_raw_writer.reset();
             }
+            self.reset_tool_stream(false);
             self.section = .none;
             self.pending_utf8_len = 0;
             return .{};
@@ -306,6 +490,38 @@ const InklingStreamParser = struct {
         if (self.section == .tool) {
             const bytes = self.tokenizer.decode_token_bytes(token_id, true);
             _ = self.tool_raw_writer.try_append_slice(bytes);
+            if (self.tool_stream_state == .scanning) {
+                const raw = self.tool_raw_writer.slice();
+                if (try_match_tool_header(raw, &self.tool_stream_name_buf)) |hdr| {
+                    fill_random_hex(&self.prng_state, &self.tool_stream_id);
+                    self.tool_stream_name_len = hdr.name.len;
+                    self.tool_stream_index = self.tool_call_count;
+                    self.tool_args_cursor = hdr.args_open_pos;
+                    self.tool_args_depth = 0;
+                    self.tool_args_in_str = false;
+                    self.tool_args_escape = false;
+                    self.tool_stream_state = .streaming_args;
+                    self.tool_stream_emitted_any = true;
+                    const init_args = self.advance_tool_args_stream();
+                    return .{
+                        .tool_header = true,
+                        .tool_index = self.tool_stream_index,
+                        .tool_id = self.tool_stream_id,
+                        .tool_name = self.tool_stream_name_buf[0..self.tool_stream_name_len],
+                        .tool_args_delta = init_args,
+                    };
+                } else if (raw.len > 512) {
+                    self.tool_stream_state = .fallback;
+                }
+            } else if (self.tool_stream_state == .streaming_args) {
+                const chunk = self.advance_tool_args_stream();
+                if (chunk.len > 0) {
+                    return .{
+                        .tool_index = self.tool_stream_index,
+                        .tool_args_delta = chunk,
+                    };
+                }
+            }
             return .{};
         }
 
@@ -395,8 +611,16 @@ const InklingStreamParser = struct {
             .name_len = name_slice.len,
             .args_offset = args_off,
             .args_len = args_slice.len,
+            .streamed = self.tool_stream_emitted_any,
         };
-        fill_random_hex(&self.prng_state, &rec.id_hex);
+        if (self.tool_stream_emitted_any) {
+            rec.id_hex = self.tool_stream_id;
+        } else {
+            fill_random_hex(&self.prng_state, &rec.id_hex);
+        }
+        if (self.tool_raw_history) |hist| {
+            hist.put(rec.id_hex, name_slice, raw);
+        }
         self.tool_calls[self.tool_call_count] = rec;
         self.tool_call_count += 1;
     }
@@ -946,7 +1170,9 @@ fn handle_chat_completions(
     const created: i64 = tiger.epoch_seconds();
 
     var parser = InklingStreamParser.init(tokenizer, config.raw_thinking, buffers, prng_state.*);
+    parser.stream_tools = stream;
     if (!enable_thinking) parser.section = .text;
+    const turn_hints = enc_res.turn_checkpoints[0..enc_res.turn_checkpoint_count];
     prng_state.* = prng_state.* *% 6364136223846793005 +% 1;
     if (!has_seed) {
         req_seed = prng_state.* ^ tiger.clock_monotonic_ns();
@@ -991,9 +1217,10 @@ fn handle_chat_completions(
             }
         };
         var ctx: NonStreamCtx = .{ .parser = &parser, .stops = &stops };
-        const stats = engine.generate_with_hint(
+        const stats = engine.generate_with_hints(
             buffers.prompt_tokens[0..prompt_len],
             system_prefix_tokens,
+            turn_hints,
             gen_limit,
             @intCast(req_mtp),
             &.{},
@@ -1105,6 +1332,23 @@ fn handle_chat_completions(
                     return false;
                 }
             }
+            if (delta.tool_header or delta.tool_args_delta.len > 0) {
+                if (!send_chat_sse_tool_call_delta(
+                    self.fd,
+                    self.sse_buf,
+                    self.req_id,
+                    self.created,
+                    self.req_model,
+                    delta.tool_index,
+                    delta.tool_header,
+                    delta.tool_id,
+                    delta.tool_name,
+                    delta.tool_args_delta,
+                )) {
+                    self.conn_ok = false;
+                    return false;
+                }
+            }
             if (delta.content.len > 0) {
                 if (self.stops.count > 0) {
                     const full = self.parser.content_writer.slice();
@@ -1150,9 +1394,10 @@ fn handle_chat_completions(
         .stops = &stops,
     };
 
-    const stats = engine.generate_with_hint(
+    const stats = engine.generate_with_hints(
         buffers.prompt_tokens[0..prompt_len],
         system_prefix_tokens,
+        turn_hints,
         gen_limit,
         @intCast(req_mtp),
         &.{},
@@ -1497,6 +1742,40 @@ fn send_chat_sse_delta(
     return send_all(fd, bw.slice());
 }
 
+fn send_chat_sse_tool_call_delta(
+    fd: i32,
+    sse_buf: []u8,
+    req_id: []const u8,
+    created: i64,
+    req_model: []const u8,
+    tool_index: usize,
+    is_header: bool,
+    tool_id: [12]u8,
+    tool_name: []const u8,
+    args_delta: []const u8,
+) bool {
+    var bw = tiger.ByteWriter.init(sse_buf);
+    var ok: bool = true;
+    ok = ok and bw.try_append_slice("data: {\"id\":");
+    ok = ok and bw.try_append_json_escaped(req_id);
+    ok = ok and bw.try_append_fmt(",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":", .{created});
+    ok = ok and bw.try_append_json_escaped(req_model);
+    if (is_header) {
+        ok = ok and bw.try_append_fmt(",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"id\":\"call_", .{tool_index});
+        ok = ok and bw.try_append_slice(&tool_id);
+        ok = ok and bw.try_append_slice("\",\"type\":\"function\",\"function\":{\"name\":");
+        ok = ok and bw.try_append_json_escaped(tool_name);
+        ok = ok and bw.try_append_slice(",\"arguments\":");
+        ok = ok and bw.try_append_json_escaped(args_delta);
+        ok = ok and bw.try_append_slice("}}]},\"finish_reason\":null}]}\n\n");
+    } else {
+        ok = ok and bw.try_append_fmt(",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"function\":{{\"arguments\":", .{tool_index});
+        ok = ok and bw.try_append_json_escaped(args_delta);
+        ok = ok and bw.try_append_slice("}}]},\"finish_reason\":null}]}\n\n");
+    }
+    return ok and send_all(fd, bw.slice());
+}
+
 fn send_chat_sse_tool_calls(
     fd: i32,
     sse_buf: []u8,
@@ -1509,6 +1788,7 @@ fn send_chat_sse_tool_calls(
     var ti: usize = 0;
     while (ti < parser.tool_call_count) : (ti += 1) {
         const tc = parser.tool_calls[ti];
+        if (tc.streamed) continue;
         const tname = parser.tool_store_writer.buffer[tc.name_offset .. tc.name_offset + tc.name_len];
         const targs = parser.tool_store_writer.buffer[tc.args_offset .. tc.args_offset + tc.args_len];
 
@@ -1560,6 +1840,8 @@ fn send_chat_sse_tool_calls(
 const ChatEncodeResult = struct {
     prompt_len: usize = 0,
     system_prefix_tokens: u32 = 0,
+    turn_checkpoints: [4]u32 = @splat(0),
+    turn_checkpoint_count: usize = 0,
     overflow: bool = false,
     vision_error: bool = false,
     images: [vision_mod.max_images_per_req]vision_mod.ImageSpan = @splat(.{}),
@@ -1662,6 +1944,8 @@ fn encode_chat_template_zero_alloc(
     }
 
     var system_prefix_tokens: u32 = @intCast(@min(out_len, std.math.maxInt(u32)));
+    var turn_ring: [5]u32 = @splat(0);
+    var turn_ring_count: usize = 0;
     var effort_emitted: bool = false;
     var effort_render: [128]u8 = undefined;
     var pos: usize = 1; // skip '['
@@ -1870,41 +2154,47 @@ fn encode_chat_template_zero_alloc(
                     if (extract_raw_field(fn_obj, "name")) |fname_raw| {
                         var fnp: usize = 0;
                         if (tokenizer_mod.parse_json_string(fname_raw, &fnp, &fname_buf)) |fname| {
+                            var id_buf: [128]u8 = undefined;
+                            var tc_id_val: []const u8 = "";
                             if (extract_raw_field(tc_obj, "id")) |id_raw| {
-                                var id_buf: [128]u8 = undefined;
                                 var idp: usize = 0;
                                 if (tokenizer_mod.parse_json_string(id_raw, &idp, &id_buf)) |id_val| {
                                     buffers.tool_id_map.insert(id_val, id_raw, fname_raw);
+                                    tc_id_val = id_val;
                                 }
                             }
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, "<|message_model|>", true, buffers, &out_len, &overflow);
                             append_encoded_segment(tokenizer, fname, false, buffers, &out_len, &overflow);
                             append_encoded_segment(tokenizer, "<|content_invoke_tool_json|>", true, buffers, &out_len, &overflow);
-                            var tw = tiger.ByteWriter.init(buffers.render_buf);
-                            var tok_ok: bool = tw.try_append_slice("{\"name\":");
-                            tok_ok = tok_ok and tw.try_append_json_escaped(fname);
-                            tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
-                            if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
-                                if (args_raw.len > 0 and args_raw[0] == '"') {
-                                    var ap2: usize = 0;
-                                    if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
-                                        const trimmed = trim_ascii_ws(args_str);
-                                        tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                            if (buffers.tool_raw_history.lookup(tc_id_val, fname)) |cached_raw| {
+                                append_encoded_segment(tokenizer, cached_raw, false, buffers, &out_len, &overflow);
+                            } else {
+                                var tw = tiger.ByteWriter.init(buffers.render_buf);
+                                var tok_ok: bool = tw.try_append_slice("{\"name\":");
+                                tok_ok = tok_ok and tw.try_append_json_escaped(fname);
+                                tok_ok = tok_ok and tw.try_append_slice(",\"args\":");
+                                if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
+                                    if (args_raw.len > 0 and args_raw[0] == '"') {
+                                        var ap2: usize = 0;
+                                        if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
+                                            const trimmed = trim_ascii_ws(args_str);
+                                            tok_ok = tok_ok and tw.try_append_slice(if (trimmed.len > 0) trimmed else "{}");
+                                        } else {
+                                            tok_ok = tok_ok and tw.try_append_slice("{}");
+                                        }
                                     } else {
-                                        tok_ok = tok_ok and tw.try_append_slice("{}");
+                                        tok_ok = tok_ok and tw.try_append_slice(args_raw);
                                     }
                                 } else {
-                                    tok_ok = tok_ok and tw.try_append_slice(args_raw);
+                                    tok_ok = tok_ok and tw.try_append_slice("{}");
                                 }
-                            } else {
-                                tok_ok = tok_ok and tw.try_append_slice("{}");
-                            }
-                            tok_ok = tok_ok and tw.try_append_byte('}');
-                            if (!tok_ok) {
-                                overflow = true;
-                            } else {
-                                append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
+                                tok_ok = tok_ok and tw.try_append_byte('}');
+                                if (!tok_ok) {
+                                    overflow = true;
+                                } else {
+                                    append_encoded_segment(tokenizer, tw.slice(), false, buffers, &out_len, &overflow);
+                                }
                             }
                             append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
                         }
@@ -1920,6 +2210,19 @@ fn encode_chat_template_zero_alloc(
         }
         if (is_sys and !effort_emitted) {
             system_prefix_tokens = @intCast(@min(out_len, std.math.maxInt(u32)));
+        } else if (!is_sys and !overflow and out_len > system_prefix_tokens and out_len <= std.math.maxInt(u32)) {
+            const tp_u32: u32 = @intCast(out_len);
+            const dup = (turn_ring_count > 0 and turn_ring[turn_ring_count - 1] == tp_u32);
+            if (!dup) {
+                if (turn_ring_count < turn_ring.len) {
+                    turn_ring[turn_ring_count] = tp_u32;
+                    turn_ring_count += 1;
+                } else {
+                    var ri: usize = 0;
+                    while (ri + 1 < turn_ring.len) : (ri += 1) turn_ring[ri] = turn_ring[ri + 1];
+                    turn_ring[turn_ring.len - 1] = tp_u32;
+                }
+            }
         }
 
         tokenizer_mod.skip_ws(messages_json, &pos);
@@ -1941,9 +2244,31 @@ fn encode_chat_template_zero_alloc(
     if (!enable_thinking and !overflow) {
         append_encoded_segment(tokenizer, "<|message_model|><|content_text|>", true, buffers, &out_len, &overflow);
     }
+
+    // Keep up to the last 4 strictly-interior turn boundaries (< out_len); out_len itself
+    // is always checkpointed in slot 2 (prefill_end).
+    var turn_checkpoints: [4]u32 = @splat(0);
+    var turn_checkpoint_count: usize = 0;
+    var tri: usize = 0;
+    while (tri < turn_ring_count) : (tri += 1) {
+        if (turn_ring[tri] > 0 and @as(usize, turn_ring[tri]) < out_len) {
+            if (turn_checkpoint_count < 4) {
+                turn_checkpoints[turn_checkpoint_count] = turn_ring[tri];
+                turn_checkpoint_count += 1;
+            } else {
+                turn_checkpoints[0] = turn_checkpoints[1];
+                turn_checkpoints[1] = turn_checkpoints[2];
+                turn_checkpoints[2] = turn_checkpoints[3];
+                turn_checkpoints[3] = turn_ring[tri];
+            }
+        }
+    }
+
     return .{
         .prompt_len = out_len,
         .system_prefix_tokens = system_prefix_tokens,
+        .turn_checkpoints = turn_checkpoints,
+        .turn_checkpoint_count = turn_checkpoint_count,
         .overflow = overflow,
         .vision_error = vision_error,
         .images = images,
