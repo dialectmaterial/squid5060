@@ -1,5 +1,9 @@
-squid5090
+squid5060
+Copyright (c) 2026 dialectmaterial
+
+Derived from squid5090
 Copyright (c) 2026 tensorfish
+https://github.com/tensorfish/squid5090
 
 This project includes kernel designs and inference features adapted from the
 following open-source projects:

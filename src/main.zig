@@ -1,4 +1,4 @@
-// squid5090-zig — TigerStyle Zig + Blackwell sm_120a CUDA Inference Engine & OpenAI Server.
+// squid5060 — TigerStyle Zig + Blackwell sm_120a CUDA Inference Engine & OpenAI Server.
 // Zero dynamic allocations post-init(), single-arena VRAM weights & runtime, always-on assertions.
 
 const std = @import("std");
@@ -16,6 +16,17 @@ const cli_tokens_max: usize = 1_048_576;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
+    if (argv.len >= 2) {
+        const arg1 = std.mem.span(argv[1]);
+        if (std.mem.eql(u8, arg1, "--version") or std.mem.eql(u8, arg1, "-V") or std.mem.eql(u8, arg1, "version")) {
+            tiger.print_stdout("squid5060 {s}\n", .{constants.engine_version});
+            return 0;
+        }
+        if (std.mem.eql(u8, arg1, "--help") or std.mem.eql(u8, arg1, "-h") or std.mem.eql(u8, arg1, "help")) {
+            print_usage();
+            return 0;
+        }
+    }
     if (argv.len < 3) {
         print_usage();
         return 1;
@@ -424,7 +435,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (std.mem.eql(u8, command, "logits")) {
         if (out_path.len == 0 or prompt_len < 2) {
-            tiger.print_stderr("Usage: squid5090 logits <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out <file.bin> [--mode exact] [--kv bf16]\n", .{});
+            tiger.print_stderr("Usage: squid5060 logits <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out <file.bin> [--mode exact] [--kv bf16]\n", .{});
             return 1;
         }
         const vocab: usize = constants.vocab_unpadded_count;
@@ -474,7 +485,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (std.mem.eql(u8, command, "kld")) {
         if (ref_path.len == 0 or prompt_len < 2) {
-            tiger.print_stderr("Usage: squid5090 kld <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref <ref_logits.bin> [--mode nvfp4] [--kv q4]\n", .{});
+            tiger.print_stderr("Usage: squid5060 kld <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref <ref_logits.bin> [--mode nvfp4] [--kv q4]\n", .{});
             return 1;
         }
         const vocab: usize = constants.vocab_unpadded_count;
@@ -851,9 +862,10 @@ fn print_decoded(tok: *const tokenizer_mod.Tokenizer, tokens: []const i32) void 
 
 fn print_usage() void {
     tiger.write_fd_all(2,
-        "squid5060 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini (8 GB RTX 5060 Edition)\n\n" ++
+        "squid5060 v" ++ constants.engine_version ++ " — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini (8 GB RTX 5060 Edition)\n\n" ++
             "Usage:\n" ++
-            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 32768] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
+            "  squid5060 --version\n" ++
+            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 262144] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
             "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
             "  squid5060 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5060 longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv q4|fp8|bf16] [--ctx 131072]\n" ++

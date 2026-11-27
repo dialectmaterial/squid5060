@@ -10,16 +10,16 @@ Environment="LD_LIBRARY_PATH=/opt/cuda/lib64:/usr/local/cuda/lib64"
 # Optional: require Authorization: Bearer <key> (or pass --api-key-file /path/to/key)
 # Environment="SQUID_API_KEY=your-secret-key"
 
-# Default 8 GB RTX 5060 v3.0 profile: native NVFP4 + Hybrid AVX2 FP32 CPU+GPU miss execution +
-# Q4 global / FP8 local SWA KV + tail-aliased B=1024 TC prefill + unified VRAM expert cache +
-# temperature-aware 4-way {1, 2, 4, 8} adaptive DSpark MTP + Prompt-Lookup +
-# auto idle-sleep (300s -> 222 MiB VRAM) + 4 host-RAM parked conversations + on-demand vision.
+# Default 8 GB RTX 5060 v3.8.0 profile: native NVFP4 + Hybrid AVX-VNNI CPU+GPU MoE +
+# Blackwell TC MoE + lazy 32K->256K Q4 global / FP8 local SWA KV (full 1,470 hot experts at 32K) +
+# 5-way {1, 2, 3, 4, 8} adaptive DSpark MTP + sampled-safe prompt-copy + 8-slot rolling prefix cache +
+# live SSE tool_calls streaming + auto idle-sleep (300s -> 0.22 GiB VRAM) + 4 parked sessions + 0-VRAM vision.
 ExecStart=/opt/squid5060/zig-out/bin/squid5060 serve /opt/models/inkling-2-mini \
     --host 127.0.0.1 \
     --port 8000 \
     --mode nvfp4 \
     --kv q4 \
-    --ctx 32768 \
+    --ctx 262144 \
     --mtp 7 \
     --spec-threshold 0.90 \
     --idle-sleep 300 \

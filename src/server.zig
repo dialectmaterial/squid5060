@@ -902,11 +902,12 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"sleeping\":{s},\"parked_slots\":{d},\"engine\":\"squid5060\"}}", .{
+        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"sleeping\":{s},\"parked_slots\":{d},\"engine\":\"squid5060\",\"version\":\"{s}\"}}", .{
             config.context_tokens_max,
             config.default_mtp,
             if (engine.sleeping) "true" else "false",
             engine.parked_slot_count(),
+            constants.engine_version,
         });
         send_json_response(fd, 200, bw.slice());
         return;

@@ -3,6 +3,8 @@
 
 const tiger = @import("tiger.zig");
 
+pub const engine_version: []const u8 = "3.8.0";
+
 pub const hidden_dim: u32 = 2304;
 pub const layer_count: u32 = 24;
 pub const visit_count: u32 = 48;
