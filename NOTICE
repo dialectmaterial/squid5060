@@ -50,3 +50,13 @@ following open-source projects:
      attention, embedded corpus-frequency 32K draft shortlist (`src/draft_shortlist.bin`),
      post-`[DONE]` deferred checkpointing, and content-addressed negative synthetic image token
      IDs adapted for 8 GB RTX 5060 GPUs.
+
+6. Benchmarking & Evaluation Credits
+   - knapcio/inkling-2-mini-spark-bench (https://github.com/knapcio/inkling-2-mini-spark-bench):
+     Frozen 295-item quality evaluation suite (`inkqc`: GSM8K, qeval, long-context) and
+     128K DGX Spark comparison benchmark.
+   - sybil-solutions/inference-optimisation-skill & local-ai-registry
+     (https://github.com/sybil-solutions/local-ai-registry):
+     Single-stream OpenAI-SSE `bench.py` harness and lab verification gates.
+   - adishik/llama.cpp (`moe-cache-shared-experts`, llama.cpp issue #32744):
+     Looped MoE-cache expert deduplication fix used in the tuned llama.cpp baseline.

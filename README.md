@@ -15,7 +15,7 @@
 | :---: | :---: | :---: | :---: |
 | Single-stream decode (`136 tok/s` peak, `2.9–3.9×` vs `llama.cpp`) | Grows lazily `32K → 256K` in `< 7.5 GiB` (`240K` needle PASS) | Spark-Bench quality (`195/200` GSM8K, `20/20` long-ctx) | Auto-sleeps when idle, wakes in `~330 ms` |
 
-![squid5060 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp](assets/benchmark-5060.png)
+![squid5060 v3.8 RTX 5060 Laptop 8 GB Benchmarks vs llama.cpp](assets/benchmark-5060-v3.8.png)
 
 ---
 
@@ -82,7 +82,7 @@ curl -X POST http://127.0.0.1:8000/v1/vram -H 'Content-Type: application/json' -
 
 ## Benchmarks & Quality
 
-Measured strictly single-stream (`c=1`, zero multi-user batching) on an **RTX 5060 Laptop 8 GB** (`sm_120a`, 26 SMs, 7.8 GiB usable VRAM, PCIe Gen5 x8) + **Intel Core Ultra 7 255H** (16 cores, DDR5, AC power), using the same OpenAI-SSE `bench.py` harness and continuous `nvidia-smi` peak VRAM monitoring:
+Measured strictly single-stream (`c=1`, zero multi-user batching) on an **RTX 5060 Laptop 8 GB** (`sm_120a`, 26 SMs, 7.8 GiB usable VRAM, PCIe Gen5 x8) + **Intel Core Ultra 7 255H** (16 cores, DDR5, AC power), using the [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill) OpenAI-SSE `bench.py` harness & [`local-ai-registry`](https://github.com/sybil-solutions/local-ai-registry) gates against tuned `llama.cpp` (with [`adishik`](https://github.com/adishik/llama.cpp)'s looped MoE-cache dedup fix, [baseline write-up](https://github.com/dialectmaterial/inkling2-mini-8gb)), plus [`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/inkling-2-mini-spark-bench) for full quality & 128K evaluation:
 
 | Benchmark (`c=1`, RTX 5060 Laptop 8 GB) | `llama.cpp` (`UD-Q3_K_XL`) | `squid5060` v3.1 | **`squid5060` v3.8** | **Gain vs `llama.cpp`** |
 |---|---:|---:|---:|---:|
@@ -96,7 +96,7 @@ Measured strictly single-stream (`c=1`, zero multi-user batching) on an **RTX 50
 | **Peak / Idle-Sleep VRAM** | `7.35 GiB` / — | `7.47` / `0.22 GiB` | **`7.47 GiB` / `0.22 GiB`** *(~329 ms wake)* | **7.25 GiB freed** |
 
 ### Quality Verified — Not Quantized to Mush
-- **Spark-Bench (`knapcio/inkling-2-mini-spark-bench`, 295 items):** **`286 / 295`** (`GSM8K 195/200`, `qeval 71/75`, `long-context 20/20` — median **`127.2 tok/s`**, peak **`161.9 tok/s`**).
+- **Spark-Bench ([`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/inkling-2-mini-spark-bench), 295 items):** **`286 / 295`** (`GSM8K 195/200`, `qeval 71/75` tied #1 overall, `long-context 20/20` — median **`127.2 tok/s`**, peak **`161.9 tok/s`**), matching 128 GB BF16 DGX Spark stacks within noise while decoding **128K context `+28%` faster** (`63.2` vs `49.2 tok/s`).
 - **Multi-depth Needle-in-a-Haystack:** `18.8K` (`3/3`), `29.9K` at `10% / 50% / 90%` depths (`3/3`), `128K` (`PASS @ 63.2 tok/s`), and `240K` (`PASS @ 45.5 tok/s`, lossless mid-session `32K → 64K` grow).
 - **Exact FP64 KLD (`7,784` tokens):** `0.000000` self-determinism; **`mean_KLD = 0.009136`**, **`top1 = 96.97%`**, **`ΔPPL = -0.0088`** for full NVFP4 + Q4 KV + Hybrid AVX-VNNI + Blackwell TC MoE (actually slightly closer to BF16 reference perplexity than legacy FP16-accum GPU-only).
 
@@ -186,5 +186,5 @@ On GPUs with `< 15 GiB` VRAM, `squid5060` automatically enables the 8 GB Unified
 ## Deep Dives, Attribution & License
 
 - **Documentation:** [`THEORY.md`](THEORY.md) (RTX 5060 roofline & Phases 1–8 audit) · [`LITE.md`](LITE.md) (visual explainer) · [`LEARNINGS.md`](LEARNINGS.md) (optimization log) · [`CHANGELOG.md`](CHANGELOG.md) · [`deploy/squid5060.service`](deploy/squid5060.service) (systemd unit)
-- **Attribution:** `squid5060` is forked from and tracks [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), which builds on [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine), and [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill). Training-free last-loop KV sharing was inspired by [2DSD (SqueezeAILab)](https://github.com/SqueezeAILab/2DSD). Full attributions live in [`NOTICE`](NOTICE).
+- **Attribution & Benchmarks:** `squid5060` is forked from and tracks [`tensorfish/squid5090`](https://github.com/tensorfish/squid5090), which builds on [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine), [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine), and [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill). Quality and 128K evaluations use [`knapcio/inkling-2-mini-spark-bench`](https://github.com/knapcio/inkling-2-mini-spark-bench) by [`knapcio`](https://github.com/knapcio); single-stream speed/prefill/needle baselines use `bench.py` from [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill) / [`local-ai-registry`](https://github.com/sybil-solutions/local-ai-registry) and [`adishik`](https://github.com/adishik/llama.cpp)'s looped MoE-cache dedup fix ([`llama.cpp#32744`](https://github.com/ggml-org/llama.cpp/issues/32744)). Training-free last-loop KV sharing was inspired by [2DSD (SqueezeAILab)](https://github.com/SqueezeAILab/2DSD). Full attributions live in [`NOTICE`](NOTICE).
 - **License:** Licensed under the **[Apache License, Version 2.0](LICENSE)**.

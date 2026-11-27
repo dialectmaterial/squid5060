@@ -29,10 +29,10 @@
   <!-- Legend Row -->
   <g transform="translate(36, 94)">
     <rect x="0" y="0" width="12" height="12" rx="3" fill="#4b5563"/>
-    <text x="20" y="10.5" class="sans legend-text">llama.cpp (tuned + loop fix, UD-Q3_K_XL)</text>
+    <text x="20" y="10.5" class="sans legend-text">llama.cpp (tuned + loop fix)</text>
 
-    <rect x="305" y="0" width="12" height="12" rx="3" fill="#34d399"/>
-    <text x="325" y="10.5" class="sans legend-text">squid5060 v3.8 (NVFP4 + Q4 KV, 93.5% physical roofline)</text>
+    <rect x="215" y="0" width="12" height="12" rx="3" fill="#34d399"/>
+    <text x="235" y="10.5" class="sans legend-text">squid5060 v3.8 (AVX-VNNI + Blackwell TC MoE, 5-Way DSpark, Lazy 256K KV)</text>
   </g>
 
   <!-- ====================================================================== -->
@@ -46,7 +46,7 @@
 
   <!-- Vertical Gridlines (0, 25, 50, 75, 100, 125, 150 tok/s) -->
   <g stroke="#1c232e" stroke-width="1">
-    <line x1="64"    y1="184" x2="64"    y2="572"/>
+    <line x1="64"     y1="184" x2="64"     y2="572"/>
     <line x1="120.25" y1="184" x2="120.25" y2="572" stroke-dasharray="3 4"/>
     <line x1="176.5"  y1="184" x2="176.5"  y2="572" stroke-dasharray="3 4"/>
     <line x1="232.75" y1="184" x2="232.75" y2="572" stroke-dasharray="3 4"/>
@@ -62,26 +62,10 @@
   <text x="345.25" y="590" text-anchor="middle" class="mono axis-label">125</text>
   <text x="401.5"  y="590" text-anchor="middle" class="mono axis-label">150</text>
 
-  <!-- Group D1: Peak Single-Prompt Decode (c=1) -->
+  <!-- Group D1: Long-Context Decode (18.8K, 3/3 Needle PASS) -->
   <g transform="translate(0, 198)">
-    <text x="64" y="0" class="sans group-label">Peak Decode (c=1)</text>
-    <text x="198" y="0" class="sans group-sub">best SSE prompt · 161.9 Spark-Bench peak</text>
-
-    <!-- llama.cpp: 37.9 -> 85.3px -->
-    <rect x="64" y="14" width="85.3" height="20" rx="4" fill="#4b5563"/>
-    <text x="157" y="28.5" class="mono val-muted">37.9</text>
-
-    <!-- v3.8: 136.2 -> 306.5px -->
-    <rect x="64" y="40" width="306.5" height="22" rx="4" fill="#34d399"/>
-    <text x="379" y="55.5" class="mono val-v38">136.2 tok/s</text>
-    <rect x="490" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
-    <text x="520" y="55" text-anchor="middle" class="mono pill-text">3.59×</text>
-  </g>
-
-  <!-- Group D2: Long-Context Needle Decode (18.8K–30K) -->
-  <g transform="translate(0, 326)">
-    <text x="64" y="0" class="sans group-label">Long-Context Decode</text>
-    <text x="215" y="0" class="sans group-sub">18.8K needle 3/3 · 117.7 tok/s @ 30K 3-depth</text>
+    <text x="64" y="0" class="sans group-label">Long-Context Decode (18.8K)</text>
+    <text x="266" y="0" class="sans group-sub">3/3 needle · 117.7 tok/s @ 30K 3-depth</text>
 
     <!-- llama.cpp: 32.1 -> 72.2px -->
     <rect x="64" y="14" width="72.2" height="20" rx="4" fill="#4b5563"/>
@@ -92,6 +76,22 @@
     <text x="356" y="55.5" class="mono val-v38">125.9 tok/s</text>
     <rect x="467" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
     <text x="497" y="55" text-anchor="middle" class="mono pill-text">3.92×</text>
+  </g>
+
+  <!-- Group D2: Peak Single-Prompt Decode (c=1) -->
+  <g transform="translate(0, 326)">
+    <text x="64" y="0" class="sans group-label">Peak Decode (c=1)</text>
+    <text x="198" y="0" class="sans group-sub">best bench.py prompt (161.9 Spark-Bench)</text>
+
+    <!-- llama.cpp: 37.9 -> 85.3px -->
+    <rect x="64" y="14" width="85.3" height="20" rx="4" fill="#4b5563"/>
+    <text x="157" y="28.5" class="mono val-muted">37.9</text>
+
+    <!-- v3.8: 136.2 -> 306.5px -->
+    <rect x="64" y="40" width="306.5" height="22" rx="4" fill="#34d399"/>
+    <text x="379" y="55.5" class="mono val-v38">136.2 tok/s</text>
+    <rect x="490" y="41" width="60" height="20" rx="10" fill="#064e3b" stroke="#065f46" stroke-width="1"/>
+    <text x="520" y="55" text-anchor="middle" class="mono pill-text">3.59×</text>
   </g>
 
   <!-- Group D3: 6-Prompt Median (c=1) -->
@@ -152,7 +152,7 @@
   <!-- Group P2: 12.9K Cold Prefill -->
   <g transform="translate(0, 326)">
     <text x="640" y="0" class="sans group-label">12.9K Random Prompt</text>
-    <text x="800" y="0" class="sans group-sub">sm_120a block-scaled TC · 77s → 6.9s</text>
+    <text x="800" y="0" class="sans group-sub">BK=256 block-scaled TC · 77s → 6.9s</text>
 
     <!-- llama.cpp: 168 -> 25.2px -->
     <rect x="640" y="14" width="25.2" height="20" rx="4" fill="#4b5563"/>
@@ -184,8 +184,8 @@
   <!-- Footer Strip -->
   <rect x="36" y="622" width="1128" height="36" rx="8" fill="#11161d" stroke="#1f2937" stroke-width="1"/>
   <text x="600" y="644" text-anchor="middle" class="sans footer-text">
-    <tspan class="footer-strong">Spark-Bench:</tspan> 286/295 (GSM8K 97.5% · LC 100%)  ·
-    <tspan class="footer-strong">Lazy Context:</tspan> 32K → 256K (240K needle PASS)  ·
+    <tspan class="footer-strong">Spark-Bench (knapcio):</tspan> 286/295 (GSM8K 97.5% · LC 100%)  ·
+    <tspan class="footer-strong">Lazy Context:</tspan> 32K → 256K (240K PASS)  ·
     <tspan class="footer-strong">Idle-Sleep:</tspan> 7.47 → 0.22 GiB  ·
     <tspan class="footer-strong">Vision:</tspan> 0 MiB
   </text>
