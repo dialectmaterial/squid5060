@@ -770,6 +770,10 @@ struct Loader {
 };
 
 
+// fp16 activation scratch for the tensor-core linear kernels (see launch_linear_rows).
+static __half* g_xh = nullptr;
+constexpr int XH_MAX_COLS = FC_IN;
+
 static size_t qbytes(size_t rows, size_t cols, int q) {
     if (q == 0) return rows * cols * 2;
     if (q == 1) return rows * cols + rows * 4 + 512;
@@ -830,6 +834,7 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
     DFL_CHECK(cudaMalloc(&c->vram, c->vram_bytes));
     DFL_CHECK(cudaMemset(c->vram, 0, c->vram_bytes));
 
+    if (!g_xh) DFL_CHECK(cudaMalloc(&g_xh, (size_t)8 * XH_MAX_COLS * sizeof(__half)));
     Loader L{c, &f};
     if (q != 0) {
         DFL_CHECK(cudaMalloc(&L.stage, (size_t)2 * FF * DH * 2));
@@ -984,7 +989,20 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
     return true;
 }
 
+// fp16 copy of the activations for the tensor-core NVFP4/FP8 kernels the target uses.
+
+__global__ void dfl_f32_to_f16_kernel(const float* __restrict__ x, __half* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(x[i]);
+}
+
 static void launch_linear_rows(const LinearWeight& w, const float* x, float* y, int B, cudaStream_t s) {
+    if (w.kind != WeightKind::BF16 && g_xh && B >= 1 && B <= 8 && w.cols <= XH_MAX_COLS) {
+        const int n = B * w.cols;
+        dfl_f32_to_f16_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, g_xh, n);
+        launch_linear_h(w, g_xh, y, B, false, s);
+        return;
+    }
     launch_linear(w, x, y, B, false, s);
 }
 
