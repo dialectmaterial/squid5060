@@ -499,7 +499,10 @@ __global__ void __launch_bounds__(256) dfl_topk_stage1_kernel(const float* __res
     const int row = blockIdx.x, p = blockIdx.y;
     const int start = p * TOPK_PER;
     const int n = min(TOPK_PER, V - start);
-    for (int e = threadIdx.x; e < TOPK_PER; e += 256) vals[e] = (e < n) ? logits[(size_t)row * V + start + e] : -INFINITY;
+    for (int e = threadIdx.x; e < TOPK_PER; e += 256) {
+        float x = (e < n) ? logits[(size_t)row * V + start + e] : -INFINITY;
+        vals[e] = isnan(x) ? -INFINITY : x; // a NaN row must not yield out-of-range winners
+    }
     __syncthreads();
     for (int r = 0; r < TOPK; ++r) {
         float bv = -INFINITY;
@@ -537,9 +540,14 @@ __global__ void __launch_bounds__(256) dfl_topk_stage2_kernel(const float* __res
         }
         block_argmax_256(bv, bi, rv, ri);
         if (threadIdx.x == 0) {
-            cv[row * TOPK + r] = bv;
-            ci[row * TOPK + r] = ii[(size_t)row * N + bi];
-            vals[bi] = -INFINITY;
+            if (bi < N) {
+                cv[row * TOPK + r] = bv;
+                ci[row * TOPK + r] = ii[(size_t)row * N + bi];
+                vals[bi] = -INFINITY;
+            } else {
+                cv[row * TOPK + r] = -INFINITY;
+                ci[row * TOPK + r] = 0;
+            }
         }
         __syncthreads();
     }
@@ -991,16 +999,28 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
 
 // fp16 copy of the activations for the tensor-core NVFP4/FP8 kernels the target uses.
 
-__global__ void dfl_f32_to_f16_kernel(const float* __restrict__ x, __half* __restrict__ y, int n) {
+__global__ void dfl_f32_to_f16_kernel(const float* __restrict__ x, __half* __restrict__ y, int n, float scale) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __float2half_rn(x[i]);
+    if (i < n) y[i] = __float2half_rn(x[i] * scale);
 }
 
-static void launch_linear_rows(const LinearWeight& w, const float* x, float* y, int B, cudaStream_t s) {
+__global__ void dfl_scale_kernel(float* __restrict__ y, int n, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] *= scale;
+}
+
+// in_scale (a power of two) keeps un-normalized inputs, such as the raw target taps, inside the
+// fp16 range; the output is scaled back so the result is unchanged.
+static void launch_linear_rows(const LinearWeight& w, const float* x, float* y, int B, cudaStream_t s,
+                               float in_scale = 1.0f) {
     if (w.kind != WeightKind::BF16 && g_xh && B >= 1 && B <= 8 && w.cols <= XH_MAX_COLS) {
         const int n = B * w.cols;
-        dfl_f32_to_f16_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, g_xh, n);
+        dfl_f32_to_f16_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, g_xh, n, in_scale);
         launch_linear_h(w, g_xh, y, B, false, s);
+        if (in_scale != 1.0f) {
+            const int m = B * w.rows;
+            dfl_scale_kernel<<<(m + 255) / 256, 256, 0, s>>>(y, m, 1.0f / in_scale);
+        }
         return;
     }
     launch_linear(w, x, y, B, false, s);
@@ -1051,7 +1071,7 @@ static void draft(Ctx* c, const void* embed, const void* embed_norm, const Linea
 static void commit(Ctx* c, const float* taps, int B, const int32_t* d_pos, cudaStream_t s) {
     const size_t total = (size_t)B * FC_IN;
     dfl_gather_taps_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(taps, B, 0, B, c->c_cat, nullptr);
-    launch_linear_rows(c->w_fc_q, c->c_cat, c->c_ctx, B, s);
+    launch_linear_rows(c->w_fc_q, c->c_cat, c->c_ctx, B, s, 1.0f / 64.0f); // raw residual taps
     dfl_rmsnorm_kernel<<<B, 256, 0, s>>>(c->c_ctx, c->hidden_norm, c->c_ctxn, DH);
     launch_linear_rows(c->w_kv_all_q, c->c_ctxn, c->c_kv, B, s);
     dfl_ctx_store_kernel<<<dim3(B, NL * 2 * NKV), 64, 0, s>>>(c->c_kv, c->knorms, d_pos, 0, c->ring);
@@ -1059,9 +1079,14 @@ static void commit(Ctx* c, const float* taps, int B, const int32_t* d_pos, cudaS
 
 static void gemm_bf16(cublasHandle_t h, const LinearWeight& w, const __nv_bfloat16* x, float* y, int B) {
     const float alpha = 1.0f, beta = 0.0f;
-    cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, B, w.cols, &alpha,
+    cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, B, w.cols, &alpha,
                  w.data, CUDA_R_16BF, w.cols, x, CUDA_R_16BF, w.cols, &beta,
                  y, CUDA_R_32F, w.rows, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    static bool reported = false;
+    if (st != CUBLAS_STATUS_SUCCESS && !reported) {
+        reported = true;
+        fprintf(stderr, "[dflash2] cublasGemmEx failed (status %d); prefill context not committed\n", (int)st);
+    }
 }
 
 static void commit_prefill(Ctx* c, const float* taps, int B, const int32_t* d_pos, cudaStream_t s) {
@@ -1083,9 +1108,15 @@ static void commit_prefill(Ctx* c, const float* taps, int B, const int32_t* d_po
 using squid::dflash::Ctx;
 
 static int g_dump_seq = 0;
+static bool stream_capturing(void* stream) {
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &st);
+    return st != cudaStreamCaptureStatusNone;
+}
+
 static void dump_taps(const float* taps, int32_t B, const int32_t* d_pos, void* stream) {
     const char* dump = getenv("SQUID_DFLASH_DUMP");
-    if (!dump) return;
+    if (!dump || stream_capturing(stream)) return; // debug hooks sync and copy; never inside a graph
     cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
     int32_t pos0 = 0;
     cudaMemcpy(&pos0, d_pos, 4, cudaMemcpyDeviceToHost);
@@ -1138,7 +1169,7 @@ void squid_dflash_draft(void* h, const void* embed, const void* embed_norm, cons
     squid::dflash::draft(static_cast<Ctx*>(h), embed, embed_norm, *unembed, d_anchor, d_pos, cfg,
                          out_drafts, out_conf, out_q_sel, out_is_delta, static_cast<cudaStream_t>(stream));
     static int dbg = getenv("SQUID_DFLASH_DEBUG") ? atoi(getenv("SQUID_DFLASH_DEBUG")) : 0;
-    if (dbg > 0) {
+    if (dbg > 0 && !stream_capturing(stream)) {
         --dbg;
         Ctx* c = static_cast<Ctx*>(h);
         cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
