@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_gemv.cu", .obj = "kernels_gemv.o" },
         .{ .src = "cuda/kernels_inkling.cu", .obj = "kernels_inkling.o" },
         .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
+        .{ .src = "cuda/kernels_dflash.cu", .obj = "kernels_dflash.o" },
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
         .{ .src = "cuda/vision.cu", .obj = "vision.o" },

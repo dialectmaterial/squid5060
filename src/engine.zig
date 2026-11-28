@@ -258,6 +258,11 @@ pub const Engine = struct {
     attn_ring: [constants.visit_count][*]f32 = undefined,
     mlp_ring: [constants.visit_count][*]f32 = undefined,
 
+    // DFlash2 drafter (replaces DSpark when set; owns its own VRAM, see cuda/kernels_dflash.cu)
+    dflash_dir: []const u8 = "",
+    dflash_quant: u8 = 0,
+    dflash: ?*anyopaque = null,
+
     // DSpark KV caches and f_ring
     ds_kv_cap: [constants.mtp_layer_count]i32 = .{ 0, 0, 0 },
     ds_k_cache: [constants.mtp_layer_count]?*anyopaque = .{ null, null, null },
@@ -420,6 +425,23 @@ pub const Engine = struct {
         self.prefill_aliased = alias_prefill;
         self.prefill_batch_cap = if (alias_prefill) 1024 else prefill_batch_max;
 
+        if (self.dflash_dir.len > 0) {
+            var dir_buf: [1024]u8 = @splat(0);
+            tiger.assert(self.dflash_dir.len < dir_buf.len);
+            @memcpy(dir_buf[0..self.dflash_dir.len], self.dflash_dir);
+            const dir_z: [*:0]const u8 = @ptrCast(dir_buf[0..self.dflash_dir.len :0]);
+            const env_en = tiger.getenv("SQUID_DFLASH_EMBED_NORM");
+            // The draft was trained on the target's normalized input embeddings (embed_norm applied).
+            const embed_norm: u8 = if (env_en != null and env_en.?[0] == '0') 0 else 1;
+            const env_cb = tiger.getenv("SQUID_DFLASH_CODEBOOK_VRAM");
+            const cb_vram: u8 = if (env_cb != null and env_cb.?[0] == '1') 1 else 0;
+            self.dflash = cuda.squid_dflash_create(dir_z, self.dflash_quant, embed_norm, cb_vram);
+            if (self.dflash == null) {
+                tiger.print_stderr("[dflash2] Failed to load drafter from {s}\n", .{self.dflash_dir});
+                std.process.exit(1);
+            }
+        }
+
         self.alloc_and_bind_runtime_arena();
 
         // Pre-initialize cuBLAS handle during startup so Chunk 0 prefill pays 0ms cold handle creation.
@@ -448,6 +470,7 @@ pub const Engine = struct {
         const cpu_moe_state_bytes: u64 = cuda.squid_sizeof_cpu_moe_dev_state();
         tiger.assert(cpu_moe_state_bytes == @sizeOf(cuda.CCpuMoeDevState));
         const has_dspark: bool = (weights.dspark.loaded != 0);
+        const has_taps: bool = has_dspark or self.dflash != null;
         const draft_vocab_size: u32 = if (has_dspark and weights.dspark.draft_vocab_size > 0)
             @intCast(weights.dspark.draft_vocab_size)
         else
@@ -462,6 +485,7 @@ pub const Engine = struct {
             self.local_kv_format,
             self.share_loop_kv,
             has_dspark,
+            has_taps,
             draft_vocab_size,
             alias_prefill,
             expert_groups_bytes,
@@ -550,8 +574,8 @@ pub const Engine = struct {
         self.moe_act_h = self.arena.alloc_raw(b_max * constants.top_k_experts * constants.intermediate_dim * 2);
         self.moe_down = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.moe_slot_out = self.arena.alloc_many(f32, b_max * constants.top_k_experts * constants.hidden_dim);
+        if (has_taps) self.taps = self.arena.alloc_many(f32, 4 * b_max * constants.hidden_dim);
         if (has_dspark) {
-            self.taps = self.arena.alloc_many(f32, 4 * b_max * constants.hidden_dim);
             self.ds_mix = self.arena.alloc_many(f32, 3 * b_max * constants.hidden_dim);
             self.ds_kv = self.arena.alloc_many(f32, b_max * 2 * constants.kv_dim);
             self.ds_ws = self.arena.alloc_many(f32, constants.dspark_workspace_floats);
@@ -588,6 +612,8 @@ pub const Engine = struct {
 
         // Paired TigerStyle invariant: Pass 1 == Pass 2!
         self.arena.assert_exact_fill();
+        // DFlash2 writes dense q rows [7, VOCAB_UNPADDED] into its own buffer.
+        if (self.dflash) |d| self.d_draft_probs = cuda.squid_dflash_probs(d);
     }
 
     pub fn init_expert_cache(
@@ -1114,6 +1140,10 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         self.destroy_graphs();
+        if (self.dflash) |d| {
+            cuda.squid_dflash_destroy(d);
+            self.dflash = null;
+        }
         if (self.cpu_moe_pool) |p| {
             cuda.squid_cpu_moe_destroy(p);
             self.cpu_moe_pool = null;
@@ -1234,6 +1264,7 @@ pub const Engine = struct {
             }
             total += constants.sconv_ring_slots * constants.hidden_dim * 4;
         }
+        if (self.dflash) |d| total += cuda.squid_dflash_ring_bytes(d);
         return total;
     }
 
@@ -1310,6 +1341,11 @@ pub const Engine = struct {
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), @ptrCast(fr), fr_bytes, self.stream));
             off += fr_bytes;
         }
+        if (self.dflash) |d| {
+            const rb = cuda.squid_dflash_ring_bytes(d);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(dst[off..].ptr), cuda.squid_dflash_ring(d), rb, self.stream));
+            off += rb;
+        }
         tiger.assert(off == self.prefix_cache.local_state_bytes);
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
     }
@@ -1360,6 +1396,11 @@ pub const Engine = struct {
             const fr_bytes: usize = constants.sconv_ring_slots * constants.hidden_dim * 4;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(fr), @ptrCast(src[off..].ptr), fr_bytes, self.stream));
             off += fr_bytes;
+        }
+        if (self.dflash) |d| {
+            const rb = cuda.squid_dflash_ring_bytes(d);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(cuda.squid_dflash_ring(d), @ptrCast(src[off..].ptr), rb, self.stream));
+            off += rb;
         }
         tiger.assert(off == self.prefix_cache.local_state_bytes);
     }
@@ -1641,7 +1682,7 @@ pub const Engine = struct {
 
         const w = self.weights.?;
         const num_drafts: u32 = if (num_drafts_in > constants.mtp_draft_count_max) constants.mtp_draft_count_max else num_drafts_in;
-        const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
+        const use_mtp: bool = (num_drafts > 0 and self.has_drafter());
         const prompt_len: u32 = @intCast(prompt.len);
 
         // Upload per-request sampling + LoopCD-Hidden config to device (zero CUDA graph rebuild!).
@@ -2141,37 +2182,12 @@ pub const Engine = struct {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.spec_graph_exec[num_drafts].?, self.stream));
                 } else {
-                    const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
-                    const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
                     const prof_draft: bool = (tiger.getenv("SQUID_PROF_DECODE") != null);
                     const t_d0: u64 = if (prof_draft) blk: {
                         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
                         break :blk tiger.clock_monotonic_ns();
                     } else 0;
-                    cuda.squid_launch_dspark_draft(
-                        w.embed.?,
-                        w.embed_norm.?,
-                        &w.dspark,
-                        self.d_anchor,
-                        self.d_pos,
-                        @intCast(num_drafts),
-                        &self.ds_k_cache,
-                        &self.ds_v_cache,
-                        &ds_ks_const,
-                        &ds_vs_const,
-                        &self.ds_kv_cap,
-                        @intFromEnum(self.kv_format),
-                        self.split_buf,
-                        self.ds_f_ring.?,
-                        self.ds_ws,
-                        self.d_drafts,
-                        null,
-                        self.d_sample_cfg,
-                        self.d_draft_probs,
-                        self.d_draft_q_sel,
-                        self.d_draft_is_delta,
-                        self.stream,
-                    );
+                    self.launch_drafter(num_drafts, null, self.stream);
                     if (prof_draft) {
                         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
                         const t_d1 = tiger.clock_monotonic_ns();
@@ -2940,25 +2956,7 @@ pub const Engine = struct {
         );
         if (commit_dspark) {
             cuda.squid_launch_prefill_copy_taps(self.p_mlp_normed, self.p_taps, 3, b_i32, self.stream);
-            cuda.squid_launch_prefill_dspark_commit(
-                &w.dspark,
-                self.p_taps,
-                &self.ds_k_cache,
-                &self.ds_v_cache,
-                &self.ds_k_scale,
-                &self.ds_v_scale,
-                &self.ds_kv_cap,
-                @intFromEnum(self.kv_format),
-                self.ds_f_ring.?,
-                self.p_attn_in_h[0],
-                self.p_attn_in_h[1],
-                self.p_attn_in_h[2],
-                self.p_qrgs,
-                self.p_w_f16,
-                b_i32,
-                &self.p_pos_vec[0],
-                self.stream,
-            );
+            self.launch_draft_commit_prefill(b_i32);
         }
         if (compute_last_lm) {
             cuda.squid_launch_lm_head_argmax(
@@ -3011,7 +3009,7 @@ pub const Engine = struct {
     pub fn bench_step_at_pos(self: *Engine, sim_pos_in: i32, num_drafts: u32, iterations: u32) f64 {
         tiger.assert(iterations > 0 and iterations <= 256);
         const w = self.weights.?;
-        const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
+        const use_mtp: bool = (num_drafts > 0 and self.has_drafter());
         const max_allowed: i32 = @as(i32, @intCast(self.context_tokens_max)) - @as(i32, @intCast(iterations * constants.mtp_block_size_max)) - 32;
         var sim_pos: i32 = sim_pos_in;
         if (sim_pos > max_allowed) sim_pos = tiger.max_i32(0, max_allowed);
@@ -3042,7 +3040,7 @@ pub const Engine = struct {
                 tiger.assert_cuda(cuda.squid_cuda_memset_async(self.v_scale[vi].?, 0, scale_bytes, self.stream));
             }
         }
-        if (use_mtp) {
+        if (use_mtp and w.dspark.loaded != 0) {
             const cap: u64 = @intCast(self.ds_kv_cap[1]);
             const data_bytes: usize = @intCast(switch (self.kv_format) {
                 .bf16 => cap * constants.kv_dim * 2,
@@ -3697,42 +3695,12 @@ pub const Engine = struct {
         if (compute_lm_head) {
             if (commit_dspark) {
                 if (prof_dec) {
-                    cuda.squid_launch_dspark_commit(
-                        &w.dspark,
-                        self.taps,
-                        &self.ds_k_cache,
-                        &self.ds_v_cache,
-                        &self.ds_k_scale,
-                        &self.ds_v_scale,
-                        &self.ds_kv_cap,
-                        @intFromEnum(self.kv_format),
-                        self.ds_f_ring.?,
-                        self.ds_mix,
-                        self.ds_kv,
-                        batch_size,
-                        self.d_pos,
-                        self.stream,
-                    );
+                    self.launch_draft_commit(batch_size, self.stream);
                     pe.mark(self.stream, 10);
                 } else {
                     tiger.assert_cuda(cuda.squid_cuda_event_record(self.fork_event, self.stream));
                     tiger.assert_cuda(cuda.squid_cuda_stream_wait_event(self.aux_stream, self.fork_event));
-                    cuda.squid_launch_dspark_commit(
-                        &w.dspark,
-                        self.taps,
-                        &self.ds_k_cache,
-                        &self.ds_v_cache,
-                        &self.ds_k_scale,
-                        &self.ds_v_scale,
-                        &self.ds_kv_cap,
-                        @intFromEnum(self.kv_format),
-                        self.ds_f_ring.?,
-                        self.ds_mix,
-                        self.ds_kv,
-                        batch_size,
-                        self.d_pos,
-                        self.aux_stream,
-                    );
+                    self.launch_draft_commit(batch_size, self.aux_stream);
                     tiger.assert_cuda(cuda.squid_cuda_event_record(self.join_event, self.aux_stream));
                 }
             }
@@ -3750,7 +3718,7 @@ pub const Engine = struct {
                 if (is_verify) self.d_draft_q_sel else null,
                 if (is_verify) self.d_draft_is_delta else null,
                 if (is_verify) w.dspark.inv_draft_vocab_ids else null,
-                w.dspark.draft_vocab_size,
+                self.verify_q_vocab(),
                 batch_size,
                 self.stream,
             );
@@ -3762,23 +3730,105 @@ pub const Engine = struct {
                 pe.finish(self.stream, batch_size, self.current_position);
             }
         } else if (commit_dspark) {
-            cuda.squid_launch_dspark_commit(
-                &w.dspark,
-                self.taps,
-                &self.ds_k_cache,
-                &self.ds_v_cache,
-                &self.ds_k_scale,
-                &self.ds_v_scale,
-                &self.ds_kv_cap,
-                @intFromEnum(self.kv_format),
-                self.ds_f_ring.?,
-                self.ds_mix,
-                self.ds_kv,
-                batch_size,
-                self.d_pos,
-                self.stream,
-            );
+            self.launch_draft_commit(batch_size, self.stream);
         }
+    }
+
+    fn has_drafter(self: *const Engine) bool {
+        return self.weights.?.dspark.loaded != 0 or self.dflash != null;
+    }
+
+    /// Width of the dense q rows the verifier reads (inv vocab is null for DFlash2: identity).
+    fn verify_q_vocab(self: *const Engine) i32 {
+        return if (self.dflash != null) cuda.squid_dflash_q_vocab() else self.weights.?.dspark.draft_vocab_size;
+    }
+
+    /// Draft up to 7 tokens after d_anchor at d_pos into d_drafts (DSpark or DFlash2).
+    fn launch_drafter(self: *Engine, num_drafts: u32, conf: ?[*]f32, stream: ?*anyopaque) void {
+        const w = self.weights.?;
+        if (self.dflash) |d| {
+            // DFlash2 always drafts the full block of 7; shorter verify widths use the prefix.
+            cuda.squid_dflash_draft(d, w.embed.?, w.embed_norm.?, &w.unembed, self.d_anchor, self.d_pos, self.d_sample_cfg, self.d_drafts, conf, self.d_draft_q_sel, self.d_draft_is_delta, stream);
+            return;
+        }
+        const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
+        const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
+        cuda.squid_launch_dspark_draft(
+            w.embed.?,
+            w.embed_norm.?,
+            &w.dspark,
+            self.d_anchor,
+            self.d_pos,
+            @intCast(num_drafts),
+            &self.ds_k_cache,
+            &self.ds_v_cache,
+            &ds_ks_const,
+            &ds_vs_const,
+            &self.ds_kv_cap,
+            @intFromEnum(self.kv_format),
+            self.split_buf,
+            self.ds_f_ring.?,
+            self.ds_ws,
+            self.d_drafts,
+            conf,
+            self.d_sample_cfg,
+            self.d_draft_probs,
+            self.d_draft_q_sel,
+            self.d_draft_is_delta,
+            stream,
+        );
+    }
+
+    /// Commit the target taps of `batch_size` rows at d_pos into the drafter context.
+    fn launch_draft_commit(self: *Engine, batch_size: i32, stream: ?*anyopaque) void {
+        if (self.dflash) |d| {
+            cuda.squid_dflash_commit(d, self.taps, batch_size, self.d_pos, stream);
+            return;
+        }
+        const w = self.weights.?;
+        cuda.squid_launch_dspark_commit(
+            &w.dspark,
+            self.taps,
+            &self.ds_k_cache,
+            &self.ds_v_cache,
+            &self.ds_k_scale,
+            &self.ds_v_scale,
+            &self.ds_kv_cap,
+            @intFromEnum(self.kv_format),
+            self.ds_f_ring.?,
+            self.ds_mix,
+            self.ds_kv,
+            batch_size,
+            self.d_pos,
+            stream,
+        );
+    }
+
+    fn launch_draft_commit_prefill(self: *Engine, b_i32: i32) void {
+        if (self.dflash) |d| {
+            cuda.squid_dflash_commit_prefill(d, self.p_taps, b_i32, &self.p_pos_vec[0], self.stream);
+            return;
+        }
+        const w = self.weights.?;
+        cuda.squid_launch_prefill_dspark_commit(
+            &w.dspark,
+            self.p_taps,
+            &self.ds_k_cache,
+            &self.ds_v_cache,
+            &self.ds_k_scale,
+            &self.ds_v_scale,
+            &self.ds_kv_cap,
+            @intFromEnum(self.kv_format),
+            self.ds_f_ring.?,
+            self.p_attn_in_h[0],
+            self.p_attn_in_h[1],
+            self.p_attn_in_h[2],
+            self.p_qrgs,
+            self.p_w_f16,
+            b_i32,
+            &self.p_pos_vec[0],
+            self.stream,
+        );
     }
 
     fn ensure_b1_graph(self: *Engine) void {
@@ -3804,36 +3854,10 @@ pub const Engine = struct {
     fn ensure_spec_graph(self: *Engine, num_drafts: u32) void {
         tiger.assert(num_drafts >= 1 and num_drafts <= constants.mtp_draft_count_max);
         if (self.spec_graph_exec[num_drafts] != null or !self.use_graphs) return;
-        const w = self.weights.?;
         const batch: i32 = @intCast(num_drafts + 1);
-        const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
-        const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
 
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        cuda.squid_launch_dspark_draft(
-            w.embed.?,
-            w.embed_norm.?,
-            &w.dspark,
-            self.d_anchor,
-            self.d_pos,
-            @intCast(num_drafts),
-            &self.ds_k_cache,
-            &self.ds_v_cache,
-            &ds_ks_const,
-            &ds_vs_const,
-            &self.ds_kv_cap,
-            @intFromEnum(self.kv_format),
-            self.split_buf,
-            self.ds_f_ring.?,
-            self.ds_ws,
-            self.d_drafts,
-            null,
-            self.d_sample_cfg,
-            self.d_draft_probs,
-            self.d_draft_q_sel,
-            self.d_draft_is_delta,
-            self.stream,
-        );
+        self.launch_drafter(num_drafts, null, self.stream);
         cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
         self.expert_cache.record_zero_touches(self.stream);
         self.record_target_forward(batch, true, true, true, true);
@@ -3845,35 +3869,10 @@ pub const Engine = struct {
     fn ensure_adaptive_graphs(self: *Engine) void {
         if (!self.use_graphs) return;
         const w = self.weights.?;
-        const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
-        const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
 
         if (self.draft_graph_exec == null) {
             tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-            cuda.squid_launch_dspark_draft(
-                w.embed.?,
-                w.embed_norm.?,
-                &w.dspark,
-                self.d_anchor,
-                self.d_pos,
-                constants.mtp_draft_count_max,
-                &self.ds_k_cache,
-                &self.ds_v_cache,
-                &ds_ks_const,
-                &ds_vs_const,
-                &self.ds_kv_cap,
-                @intFromEnum(self.kv_format),
-                self.split_buf,
-                self.ds_f_ring.?,
-                self.ds_ws,
-                self.d_drafts,
-                self.d_draft_conf,
-                self.d_sample_cfg,
-                self.d_draft_probs,
-                self.d_draft_q_sel,
-                self.d_draft_is_delta,
-                self.stream,
-            );
+            self.launch_drafter(constants.mtp_draft_count_max, self.d_draft_conf, self.stream);
             tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.draft_graph_exec));
             tiger.assert(self.draft_graph_exec != null);
         }
@@ -3997,6 +3996,7 @@ fn compute_runtime_vram_bytes(
     local_kv_format: constants.KVFormat,
     share_loop_kv: bool,
     has_dspark: bool,
+    has_taps: bool,
     draft_vocab_size: u32,
     alias_prefill: bool,
     expert_groups_bytes: u64,
@@ -4062,8 +4062,8 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(b * constants.top_k_experts * constants.intermediate_dim * 2, a); // moe_act_h
     total += tiger.align_up_u64(b * constants.hidden_dim * 4, a); // moe_down
     total += tiger.align_up_u64(b * constants.top_k_experts * constants.hidden_dim * 4, a); // moe_slot_out
+    if (has_taps) total += tiger.align_up_u64(4 * b * constants.hidden_dim * 4, a); // taps
     if (has_dspark) {
-        total += tiger.align_up_u64(4 * b * constants.hidden_dim * 4, a); // taps
         total += tiger.align_up_u64(3 * b * constants.hidden_dim * 4, a); // ds_mix
         total += tiger.align_up_u64(b * 2 * constants.kv_dim * 4, a); // ds_kv
         total += tiger.align_up_u64(constants.dspark_workspace_floats * 4, a); // ds_ws

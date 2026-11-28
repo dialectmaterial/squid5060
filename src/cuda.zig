@@ -683,6 +683,31 @@ pub extern "c" fn squid_launch_dspark_draft(
     stream: ?*anyopaque,
 ) void;
 
+// --- DFlash2 block-diffusion drafter (cuda/kernels_dflash.cu) ---
+
+pub extern "c" fn squid_dflash_create(dir_z: [*:0]const u8, quant: u8, embed_norm: u8, codebook_vram: u8) ?*anyopaque;
+pub extern "c" fn squid_dflash_destroy(ctx: ?*anyopaque) void;
+pub extern "c" fn squid_dflash_probs(ctx: ?*anyopaque) [*]f32;
+pub extern "c" fn squid_dflash_q_vocab() i32;
+pub extern "c" fn squid_dflash_ring(ctx: ?*anyopaque) *anyopaque;
+pub extern "c" fn squid_dflash_ring_bytes(ctx: ?*anyopaque) usize;
+pub extern "c" fn squid_dflash_draft(
+    ctx: ?*anyopaque,
+    embed: *const anyopaque,
+    embed_norm: *const anyopaque,
+    unembed: *const CLinearWeight,
+    d_anchor: *const i32,
+    d_pos: *const i32,
+    sample_cfg: ?*const CSampleConfig,
+    out_drafts: [*]i32,
+    out_conf: ?[*]f32,
+    out_q_sel: ?[*]f32,
+    out_is_delta: ?*i32,
+    stream: ?*anyopaque,
+) void;
+pub extern "c" fn squid_dflash_commit(ctx: ?*anyopaque, taps: [*]const f32, batch_size: i32, d_pos: *const i32, stream: ?*anyopaque) void;
+pub extern "c" fn squid_dflash_commit_prefill(ctx: ?*anyopaque, taps: [*]const f32, batch_size: i32, d_pos: *const i32, stream: ?*anyopaque) void;
+
 pub extern "c" fn squid_adaptive_graph_create(
     d_anchor: *const i32,
     d_drafts: [*]const i32,

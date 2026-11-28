@@ -84,6 +84,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var raw_thinking: bool = false;
     var keep_history_thinking: bool = false;
     var has_tokens_arg: bool = false;
+    var dflash_dir: []const u8 = "";
+    var dflash_quant: u8 = 0; // 0 bf16, 1 fp8, 2 nvfp4
 
     var arg_i: usize = 3;
     while (arg_i < argv.len) : (arg_i += 1) {
@@ -218,6 +220,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             use_graphs = false;
         } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
             use_prompt_lookup = false;
+        } else if (std.mem.eql(u8, arg, "--dflash2") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            dflash_dir = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--dflash2-fp8")) {
+            dflash_quant = 1;
+        } else if (std.mem.eql(u8, arg, "--dflash2-quant") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            const q = std.mem.span(argv[arg_i]);
+            if (std.mem.eql(u8, q, "bf16")) {
+                dflash_quant = 0;
+            } else if (std.mem.eql(u8, q, "fp8")) {
+                dflash_quant = 1;
+            } else if (std.mem.eql(u8, q, "nvfp4")) {
+                dflash_quant = 2;
+            } else {
+                std.debug.print("--dflash2-quant expects bf16, fp8 or nvfp4\n", .{});
+                std.process.exit(2);
+            }
         } else if (std.mem.eql(u8, arg, "--raw")) {
             raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--raw-thinking")) {
@@ -376,14 +396,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
 
     var model_weights: weights_mod.ModelWeights = .{};
-    const load_mtp: bool = if (use_expert_cache)
+    // DFlash2 replaces DSpark: its weights, KV and Markov head are not loaded.
+    const load_mtp: bool = dflash_dir.len == 0 and (if (use_expert_cache)
         (mtp > 0 or std.mem.eql(u8, command, "longctx"))
     else
-        (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
+        (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve")));
     if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, use_expert_cache, ablation_path)) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
+    engine.dflash_dir = dflash_dir;
+    engine.dflash_quant = dflash_quant;
     engine.init(&model_weights, ctx, use_graphs, kv_format);
     engine.spec_threshold = spec_threshold;
     engine.use_prompt_lookup = use_prompt_lookup;
@@ -865,8 +888,8 @@ fn print_usage() void {
         "squid5060 v" ++ constants.engine_version ++ " — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini (8 GB RTX 5060 Edition)\n\n" ++
             "Usage:\n" ++
             "  squid5060 --version\n" ++
-            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 262144] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
-            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
+            "  squid5060 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|q4|fp8|bf16] [--ctx 262144] [--mtp 0|2|7] [--spec-threshold 0.90] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--keep-history-thinking] [--dflash2 DIR] [--dflash2-quant bf16|fp8|nvfp4] [--cache-mib 0] [--cache-headroom-mib 160] [--cache-file PATH] [--no-warm-cache] [--cpu-moe auto|on|off] [--idle-sleep SEC] [--slot-keep N] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY | --api-key-file PATH]\n" ++
+            "  squid5060 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH] [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.90] [--dflash2 DIR] [--dflash2-quant bf16|fp8|nvfp4] [--cpu-moe auto|on|off] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
             "  squid5060 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4|fp8|exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--loopcd-omega 0.0] [--loopcd-ref 1|2] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5060 longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv q4|fp8|bf16] [--ctx 131072]\n" ++
             "  squid5060 logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4|fp8|exact] [--kv bf16|q4] [--ctx 8192]\n" ++
