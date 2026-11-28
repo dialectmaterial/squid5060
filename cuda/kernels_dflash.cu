@@ -95,6 +95,8 @@ struct KNormSet {
 
 struct Ctx {
     int quant = 0; // 0 bf16, 1 fp8, 2 nvfp4 (draft layers and decode-commit matrices)
+    bool nvfp4_search = false;
+    bool hdiag_loaded = false;
     bool use_embed_norm = false;
     Layer layers[NL];
     LinearWeight w_fc;      // [DH, 9216] bf16
@@ -628,6 +630,90 @@ __global__ void __launch_bounds__(256) dfl_select_kernel(
     }
 }
 
+// NVFP4 packing with a per-block scale search (Four-over-Six generalized, optional local Hessian).
+// For each 16-weight block it tries every E4M3 scale code between the "block max -> 6" scale and the
+// "block max -> 4" scale (plus one code on each side), rounds the weights to the nearest e2m1 value
+// for that scale, and keeps the code with the lowest error sum_j h_j (w_j - deq_j)^2. h_j is the mean
+// squared input activation of column j (local-Hessian diagonal) or 1 without calibration.
+// The output uses the standard NVFP4 layout, so the existing kernels read it unchanged.
+__device__ __forceinline__ float dfl_e2m1_round(float a, uint8_t* code) {
+    float aa = fabsf(a);
+    uint8_t c;
+    float v;
+    if      (aa < 0.25f) { c = 0; v = 0.0f; }
+    else if (aa < 0.75f) { c = 1; v = 0.5f; }
+    else if (aa < 1.25f) { c = 2; v = 1.0f; }
+    else if (aa < 1.75f) { c = 3; v = 1.5f; }
+    else if (aa < 2.50f) { c = 4; v = 2.0f; }
+    else if (aa < 3.50f) { c = 5; v = 3.0f; }
+    else if (aa < 5.00f) { c = 6; v = 4.0f; }
+    else                 { c = 7; v = 6.0f; }
+    *code = (a < 0.0f ? 8u : 0u) | c;
+    return a < 0.0f ? -v : v;
+}
+
+__global__ void dfl_quant_nvfp4_search_kernel(const __nv_bfloat16* __restrict__ src, uint8_t* __restrict__ dst_w,
+                                              uint8_t* __restrict__ dst_s, int N, int K, float g,
+                                              const float* __restrict__ hdiag, int rows_per_h) {
+    const size_t total = (size_t)N * (K / 16);
+    const size_t bidx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (bidx >= total) return;
+    const int row = (int)(bidx / (K / 16));
+    const int col0 = (int)(bidx % (K / 16)) * 16;
+    const float* h = hdiag ? hdiag + (size_t)(row / rows_per_h) * K + col0 : nullptr;
+    float w[16], hw[16];
+    float bmax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        w[i] = __bfloat162float(src[bidx * 16 + i]);
+        hw[i] = h ? fmaxf(h[i], 1e-12f) : 1.0f;
+        bmax = fmaxf(bmax, fabsf(w[i]));
+    }
+    uint8_t best_code = 0;
+    if (bmax > 0.0f && g > 0.0f) {
+        __nv_fp8_e4m3 lo_s(fminf(bmax / (6.0f * g), 448.0f));
+        __nv_fp8_e4m3 hi_s(fminf(bmax / (4.0f * g), 448.0f));
+        int lo = (int)lo_s.__x - 1, hi = (int)hi_s.__x + 1;
+        lo = max(lo, 1);
+        hi = min(hi, 0x7E);
+        float best_err = INFINITY;
+        for (int code = lo; code <= hi; ++code) {
+            __nv_fp8_e4m3 sc;
+            sc.__x = (__nv_fp8_storage_t)code;
+            const float se = static_cast<float>(sc) * g;
+            const float inv = 1.0f / se;
+            float err = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                uint8_t qc;
+                const float d = dfl_e2m1_round(w[i] * inv, &qc) * se - w[i];
+                err = fmaf(hw[i] * d, d, err);
+            }
+            if (err < best_err) { best_err = err; best_code = (uint8_t)code; }
+        }
+    }
+    dst_s[bidx] = best_code;
+    __nv_fp8_e4m3 sc;
+    sc.__x = (__nv_fp8_storage_t)best_code;
+    const float se = static_cast<float>(sc) * g;
+    const float inv = se > 0.0f ? 1.0f / se : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint8_t a, b;
+        dfl_e2m1_round(w[2 * i] * inv, &a);
+        dfl_e2m1_round(w[2 * i + 1] * inv, &b);
+        dst_w[bidx * 8 + i] = a | (b << 4);
+    }
+}
+
+__global__ void dfl_bf16_amax_kernel(const __nv_bfloat16* __restrict__ x, size_t n, float* __restrict__ out) {
+    float m = 0.0f;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x)
+        m = fmaxf(m, fabsf(__bfloat162float(x[i])));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(reinterpret_cast<int*>(out), __float_as_int(m));
+}
+
 // ---------------------------------------------------------------------------
 // Host side: safetensors reader, upload, launches
 // ---------------------------------------------------------------------------
@@ -696,6 +782,9 @@ struct Loader {
     StFile* f;
     __nv_bfloat16* stage = nullptr; // device staging for FP8/NVFP4 packing
     float* amax = nullptr;
+    bool search = false;          // per-block NVFP4 scale search
+    const float* cur_h = nullptr; // device local-Hessian diagonal for the next pack, or null
+    int cur_rph = 1 << 30;        // rows per Hessian vector
     bool ok = true;
 
     void* carve(size_t bytes) {
@@ -741,7 +830,20 @@ struct Loader {
             void* d = carve((size_t)rows * cols / 2);
             uint8_t* sc = static_cast<uint8_t*>(carve((size_t)rows * cols / 16));
             if (!d || !sc) return w;
-            w.global_scale = squid_pack_bf16_to_nvfp4(dev_bf16, d, sc, amax, rows, cols);
+            if (!search) {
+                w.global_scale = squid_pack_bf16_to_nvfp4(dev_bf16, d, sc, amax, rows, cols);
+            } else {
+                // Global scale leaves room for the "max -> 4" block scale of the largest block.
+                cudaMemset(amax, 0, 4);
+                dfl_bf16_amax_kernel<<<1024, 256>>>(static_cast<const __nv_bfloat16*>(dev_bf16), (size_t)rows * cols, amax);
+                float h_amax = 0.0f;
+                cudaMemcpy(&h_amax, amax, 4, cudaMemcpyDeviceToHost);
+                const float g = fmaxf(h_amax / (448.0f * 4.0f), 1e-12f);
+                const size_t nb = (size_t)rows * (cols / 16);
+                dfl_quant_nvfp4_search_kernel<<<(unsigned)((nb + 127) / 128), 128>>>(
+                    static_cast<const __nv_bfloat16*>(dev_bf16), static_cast<uint8_t*>(d), sc, rows, cols, g, cur_h, cur_rph);
+                w.global_scale = g;
+            }
             w.kind = WeightKind::NVFP4;
             w.data = d;
             w.scales = sc;
@@ -838,7 +940,9 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
     snprintf(path, sizeof(path), "%s/model.safetensors", dir);
     if (!f.open(path)) { fprintf(stderr, "[dflash2] cannot open %s\n", path); return false; }
 
-    c->vram_bytes = ctx_vram_bytes(q, codebook_vram);
+    // FP8 matrices are larger than NVFP4 ones, so mixed precision sizes the arena as if all were FP8.
+    const bool mixed = (q == 2 && getenv("SQUID_DFLASH_FP8_KEEP") != nullptr);
+    c->vram_bytes = ctx_vram_bytes(mixed ? 1 : q, codebook_vram);
     DFL_CHECK(cudaMalloc(&c->vram, c->vram_bytes));
     DFL_CHECK(cudaMemset(c->vram, 0, c->vram_bytes));
 
@@ -848,6 +952,52 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
         DFL_CHECK(cudaMalloc(&L.stage, (size_t)2 * FF * DH * 2));
         L.amax = static_cast<float*>(L.carve(4));
     }
+    // NVFP4 scale search (SQUID_DFLASH_NVFP4_SEARCH=1) and optional local-Hessian diagonal
+    // (SQUID_DFLASH_HDIAG=file: f32, per layer attn_conv[DH] mlp_conv[DH] q[DH] o[QD] gu[DH] down[FF] kv[DH],
+    // then fc[FC_IN]; written by squid-bench/dflash2_hdiag.py).
+    const size_t H_LAYER = (size_t)DH * 5 + QD + FF;
+    const size_t H_TOTAL = H_LAYER * NL + FC_IN;
+    float* d_h = nullptr;
+    float* d_hkv = nullptr;
+    if (q == 2) {
+        const char* se = getenv("SQUID_DFLASH_NVFP4_SEARCH");
+        const char* hp = getenv("SQUID_DFLASH_HDIAG");
+        L.search = (se && se[0] == '1') || (hp && hp[0]);
+        if (hp && hp[0]) {
+            FILE* hf = fopen(hp, "rb");
+            float* hh = (float*)malloc(H_TOTAL * 4);
+            size_t got = hf ? fread(hh, 4, H_TOTAL, hf) : 0;
+            if (hf) fclose(hf);
+            if (got != H_TOTAL) {
+                fprintf(stderr, "[dflash2] %s: expected %zu floats, read %zu\n", hp, H_TOTAL, got);
+                free(hh);
+                return false;
+            }
+            DFL_CHECK(cudaMalloc(&d_h, H_TOTAL * 4));
+            cudaMemcpy(d_h, hh, H_TOTAL * 4, cudaMemcpyHostToDevice);
+            DFL_CHECK(cudaMalloc(&d_hkv, (size_t)2 * NL * DH * 4));
+            for (int l = 0; l < NL; ++l)
+                for (int r = 0; r < 2; ++r)
+                    cudaMemcpy(d_hkv + (size_t)(2 * l + r) * DH, d_h + l * H_LAYER + DH * 4 + QD + FF, DH * 4,
+                               cudaMemcpyDeviceToDevice);
+            free(hh);
+            c->hdiag_loaded = true;
+        }
+    }
+    c->nvfp4_search = L.search;
+    auto hl = [&](int l, size_t off) -> const float* { return d_h ? d_h + l * H_LAYER + off : nullptr; };
+    // Mixed precision: SQUID_DFLASH_FP8_KEEP=comma list of conv,q,o,gu,down,kv,fc keeps those
+    // matrices in FP8 while the rest use the chosen format (only with --dflash2-quant nvfp4).
+    const char* keep = getenv("SQUID_DFLASH_FP8_KEEP");
+    auto qf = [&](const char* name) -> int {
+        if (q != 2 || !keep) return q;
+        const char* p = strstr(keep, name);
+        if (!p) return q;
+        const size_t n = strlen(name);
+        const bool start_ok = (p == keep) || p[-1] == ',';
+        const bool end_ok = p[n] == 0 || p[n] == ',';
+        return (start_ok && end_ok) ? 1 : q;
+    };
 
     for (int l = 0; l < NL; ++l) {
         char n[16][128];
@@ -864,12 +1014,19 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
         ly.k_norm = L.vec(n[3], HD);
         ly.attn_base = L.vec(n[4], 2 * CK * DH);
         ly.mlp_base = L.vec(n[5], 2 * CK * DH);
-        ly.w_attn_conv = L.mat(n[6], CDYN, "", 0, DH, q);
-        ly.w_mlp_conv = L.mat(n[7], CDYN, "", 0, DH, q);
-        ly.w_q = L.mat(n[8], QD, "", 0, DH, q);
-        ly.w_o = L.mat(n[9], DH, "", 0, QD, q);
-        ly.w_gu = L.mat(n[10], FF, n[11], FF, DH, q);
-        ly.w_down = L.mat(n[12], DH, "", 0, FF, q);
+        L.cur_h = hl(l, 0);
+        ly.w_attn_conv = L.mat(n[6], CDYN, "", 0, DH, qf("conv"));
+        L.cur_h = hl(l, DH);
+        ly.w_mlp_conv = L.mat(n[7], CDYN, "", 0, DH, qf("conv"));
+        L.cur_h = hl(l, 2 * DH);
+        ly.w_q = L.mat(n[8], QD, "", 0, DH, qf("q"));
+        L.cur_h = hl(l, 3 * DH);
+        ly.w_o = L.mat(n[9], DH, "", 0, QD, qf("o"));
+        L.cur_h = hl(l, 3 * DH + QD);
+        ly.w_gu = L.mat(n[10], FF, n[11], FF, DH, qf("gu"));
+        L.cur_h = hl(l, 4 * DH + QD);
+        ly.w_down = L.mat(n[12], DH, "", 0, FF, qf("down"));
+        L.cur_h = nullptr;
         c->knorms.w[l] = ly.k_norm;
         if (!L.ok) break;
     }
@@ -900,12 +1057,17 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
         c->w_kv_all_q = c->w_kv_all;
         if (q != 0 && L.ok) {
             // Quantized copy for decode commit and the block k/v path (per-layer row views share one scale).
-            c->w_kv_all_q = L.pack_dev(kv, KV_ALL, DH, q);
+            L.cur_h = d_hkv;
+            L.cur_rph = KVD;
+            const int qkv = qf("kv");
+            c->w_kv_all_q = L.pack_dev(kv, KV_ALL, DH, qkv);
+            L.cur_h = nullptr;
+            L.cur_rph = 1 << 30;
             for (int l = 0; l < NL; ++l) {
                 LinearWeight w = c->w_kv_all_q;
                 const size_t r0 = (size_t)(2 * l) * KVD;
                 w.rows = 2 * KVD;
-                if (q == 1) {
+                if (qkv == 1) {
                     w.data = static_cast<uint8_t*>(c->w_kv_all_q.data) + r0 * DH;
                     w.row_scales = c->w_kv_all_q.row_scales + r0;
                 } else {
@@ -918,7 +1080,12 @@ static bool ctx_create(Ctx* c, const char* dir, int q, bool embed_norm, bool cod
     }
     if (L.ok) {
         c->w_fc = L.mat("fc.weight", DH, "", 0, FC_IN, 0);
-        c->w_fc_q = (q != 0) ? L.pack_dev(c->w_fc.data, DH, FC_IN, q) : c->w_fc;
+        L.cur_h = d_h ? d_h + H_LAYER * NL : nullptr;
+        c->w_fc_q = (q != 0) ? L.pack_dev(c->w_fc.data, DH, FC_IN, qf("fc")) : c->w_fc;
+        L.cur_h = nullptr;
+        cudaDeviceSynchronize();
+        if (d_h) cudaFree(d_h);
+        if (d_hkv) cudaFree(d_hkv);
         c->w_hproj = L.mat("candidate_selector.hidden_projection.weight", RANK, "", 0, DH, 0);
         c->hidden_norm = L.vec("hidden_norm.weight", DH);
         c->final_norm = L.vec("norm.weight", DH);
@@ -1141,9 +1308,10 @@ void* squid_dflash_create(const char* dir, uint8_t quant, uint8_t embed_norm, ui
         delete c;
         return nullptr;
     }
-    fprintf(stdout, "[dflash2] Loaded %s | weights=%s %.1f MiB | VRAM arena %.1f MiB | codebooks in %s | embed_norm=%d\n",
+    fprintf(stdout, "[dflash2] Loaded %s | weights=%s %.1f MiB | VRAM arena %.1f MiB | codebooks in %s | embed_norm=%d | nvfp4 scales=%s\n",
             dir, c->quant == 2 ? "nvfp4" : (c->quant == 1 ? "fp8" : "bf16"), c->weight_bytes / 1048576.0, c->vram_bytes / 1048576.0,
-            codebook_vram ? "VRAM" : "pinned host RAM", embed_norm ? 1 : 0);
+            codebook_vram ? "VRAM" : "pinned host RAM", embed_norm ? 1 : 0,
+            c->hdiag_loaded ? "search+hessian" : (c->nvfp4_search ? "search" : "max"));
     fflush(stdout);
     return c;
 }
